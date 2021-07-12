@@ -32,6 +32,7 @@ import org.agrona.concurrent.IdleStrategy;
 import org.agrona.concurrent.UnsafeBuffer;
 import org.agrona.concurrent.status.CountersReader;
 import uk.co.real_logic.artio.CommonConfiguration;
+import uk.co.real_logic.artio.DebugLogger;
 import uk.co.real_logic.artio.engine.logger.RecordingIdLookup;
 import uk.co.real_logic.artio.storage.messages.MessageHeaderDecoder;
 import uk.co.real_logic.artio.storage.messages.MessageHeaderEncoder;
@@ -41,6 +42,7 @@ import uk.co.real_logic.artio.storage.messages.PreviousRecordingDecoder.Outbound
 import uk.co.real_logic.artio.storage.messages.PreviousRecordingEncoder;
 import uk.co.real_logic.artio.storage.messages.PreviousRecordingEncoder.InboundRecordingsEncoder;
 import uk.co.real_logic.artio.storage.messages.PreviousRecordingEncoder.OutboundRecordingsEncoder;
+import uk.co.real_logic.artio.util.CharFormatter;
 
 import java.io.File;
 import java.nio.MappedByteBuffer;
@@ -60,6 +62,7 @@ import static io.aeron.driver.Configuration.publicationReservedSessionIdLow;
 import static java.nio.file.StandardCopyOption.ATOMIC_MOVE;
 import static java.nio.file.StandardCopyOption.REPLACE_EXISTING;
 import static org.agrona.concurrent.status.CountersReader.NULL_COUNTER_ID;
+import static uk.co.real_logic.artio.LogTag.STATE_CLEANUP;
 import static uk.co.real_logic.artio.storage.messages.MessageHeaderDecoder.ENCODED_LENGTH;
 
 /**
@@ -67,7 +70,25 @@ import static uk.co.real_logic.artio.storage.messages.MessageHeaderDecoder.ENCOD
  */
 public class RecordingCoordinator implements AutoCloseable, RecordingDescriptorConsumer
 {
+    private static volatile boolean saveOnShutdown = true;
+
+    // Used for testing the the resilience of this file loading / saving mechanism to the process being terminated.
+    public static void saveOnShutdownTesting(final boolean saveOnShutdown)
+    {
+        RecordingCoordinator.saveOnShutdown = saveOnShutdown;
+    }
+
     private static final String FILE_NAME = "recording_coordinator";
+
+    public static File recordingIdsFile(final EngineConfiguration configuration)
+    {
+        return new File(configuration.logFileDir(), FILE_NAME);
+    }
+
+    private final CharFormatter loadRecordings = new CharFormatter(
+        "RecordingCoordinator.loadRecordingIds: inbound=%s,outbound=%s");
+    private final CharFormatter recordingStarted = new CharFormatter(
+        "RecordingCoordinator.recordingStarted: recordingId=%s,direction=%s");
 
     // Only used on startup and shutdown
     private final IdleStrategy idleStrategy = CommonConfiguration.backoffIdleStrategy();
@@ -109,7 +130,7 @@ public class RecordingCoordinator implements AutoCloseable, RecordingDescriptorC
         this.configuration = configuration;
         this.channel = configuration.libraryAeronChannel();
 
-        recordingIdsFile = new File(configuration.logFileDir(), FILE_NAME);
+        recordingIdsFile = recordingIdsFile(configuration);
         this.errorHandler = errorHandler;
         outboundLocation = channel.equals(IPC_CHANNEL) ? LOCAL : REMOTE;
         loadRecordingIdsFile();
@@ -132,6 +153,7 @@ public class RecordingCoordinator implements AutoCloseable, RecordingDescriptorC
         }
     }
 
+    // constructor
     private void loadRecordingIdsFile()
     {
         if (recordingIdsFile.exists())
@@ -155,6 +177,14 @@ public class RecordingCoordinator implements AutoCloseable, RecordingDescriptorC
                 {
                     outboundRecordingIds.free.add(outboundRecording.recordingId());
                 }
+
+                if (DebugLogger.isEnabled(STATE_CLEANUP))
+                {
+                    DebugLogger.log(STATE_CLEANUP, loadRecordings
+                        .clear()
+                        .with(inboundRecordingIds.toString())
+                        .with(outboundRecordingIds.toString()));
+                }
             }
             finally
             {
@@ -165,12 +195,10 @@ public class RecordingCoordinator implements AutoCloseable, RecordingDescriptorC
 
     private void saveRecordingIdsFile()
     {
-        libraryIdToExtendPosition.values().forEach(pos -> outboundRecordingIds.free.add(pos.recordingId));
-
         try
         {
             final int inboundSize = inboundRecordingIds.size();
-            final int outboundSize = outboundRecordingIds.size();
+            final int outboundSize = outboundRecordingIds.size() + libraryIdToExtendPosition.size();
 
             final File saveFile = File.createTempFile(FILE_NAME, "tmp", new File(configuration.logFileDir()));
             final int requiredLength = MessageHeaderEncoder.ENCODED_LENGTH + PreviousRecordingEncoder.BLOCK_LENGTH +
@@ -192,6 +220,11 @@ public class RecordingCoordinator implements AutoCloseable, RecordingDescriptorC
                 final OutboundRecordingsEncoder outbound = previousRecording.outboundRecordingsCount(outboundSize);
                 outboundRecordingIds.forEach(id -> outbound.next().recordingId(id));
 
+                for (final LibraryExtendPosition pos : libraryIdToExtendPosition.values())
+                {
+                    outbound.next().recordingId(pos.recordingId);
+                }
+
                 mappedBuffer.force();
             }
             finally
@@ -203,7 +236,6 @@ public class RecordingCoordinator implements AutoCloseable, RecordingDescriptorC
         }
         catch (final Throwable e)
         {
-            e.printStackTrace();
             errorHandler.onError(e);
         }
     }
@@ -213,10 +245,9 @@ public class RecordingCoordinator implements AutoCloseable, RecordingDescriptorC
     {
         if (configuration.isRelevantStreamId(streamId))
         {
-            final RecordingIds recordingIds = streamId == configuration.inboundLibraryStream() ?
-                inboundRecordingIds : outboundRecordingIds;
-            final RecordingIdLookup lookup = streamId == configuration.inboundLibraryStream() ?
-                framerOutboundLookup : framerInboundLookup;
+            final boolean isInbound = streamId == configuration.inboundLibraryStream();
+            final RecordingIds recordingIds = isInbound ? inboundRecordingIds : outboundRecordingIds;
+            final RecordingIdLookup lookup = isInbound ? framerOutboundLookup : framerInboundLookup;
             final LibraryExtendPosition libraryExtendPosition = acquireRecording(streamId, recordingIds);
             final ExclusivePublication publication;
             if (libraryExtendPosition != null)
@@ -237,7 +268,7 @@ public class RecordingCoordinator implements AutoCloseable, RecordingDescriptorC
                 startRecording(streamId, publication.sessionId(), LOCAL);
             }
 
-            awaitRecordingStart(publication.sessionId(), lookup, recordingIds.used);
+            checkRecordingStart(publication.sessionId(), lookup, recordingIds.used, isInbound);
 
             return publication;
         }
@@ -333,7 +364,7 @@ public class RecordingCoordinator implements AutoCloseable, RecordingDescriptorC
                 else
                 {
                     libraryIdToExtendPosition.remove(libraryId);
-                    awaitRecordingStart(sessionId, framerOutboundLookup, outboundRecordingIds.used);
+                    checkRecordingStart(sessionId, framerOutboundLookup, outboundRecordingIds.used, false);
                     return null;
                 }
             }
@@ -342,6 +373,7 @@ public class RecordingCoordinator implements AutoCloseable, RecordingDescriptorC
             if (extendPosition != null)
             {
                 extendRecording(streamId, extendPosition, extendPosition.newSessionId);
+                saveRecordingIdsFile();
                 // Library needs to be informed of its extend position.
                 libraryIdToExtendPosition.put(libraryId, extendPosition);
                 return extendPosition;
@@ -350,7 +382,7 @@ public class RecordingCoordinator implements AutoCloseable, RecordingDescriptorC
             {
                 if (startRecording(streamId, sessionId, outboundLocation))
                 {
-                    awaitRecordingStart(sessionId, framerOutboundLookup, outboundRecordingIds.used);
+                    checkRecordingStart(sessionId, framerOutboundLookup, outboundRecordingIds.used, false);
                 }
             }
         }
@@ -377,7 +409,6 @@ public class RecordingCoordinator implements AutoCloseable, RecordingDescriptorC
         final int sessionId,
         final SourceLocation local)
     {
-
         if (recordingAlreadyStarted(sessionId))
         {
             return true;
@@ -404,11 +435,22 @@ public class RecordingCoordinator implements AutoCloseable, RecordingDescriptorC
         return RecordingPos.findCounterIdBySession(counters, sessionId) != Aeron.NULL_VALUE;
     }
 
-    private void awaitRecordingStart(
-        final int sessionId, final RecordingIdLookup lookup, final LongHashSet recordingIds)
+    // awaits the recording start and saves the file
+    private void checkRecordingStart(
+        final int sessionId, final RecordingIdLookup lookup, final LongHashSet recordingIds, final boolean isInbound)
     {
         final long recordingId = lookup.getRecordingId(sessionId);
         recordingIds.add(recordingId);
+
+        saveRecordingIdsFile();
+
+        if (DebugLogger.isEnabled(STATE_CLEANUP))
+        {
+            DebugLogger.log(STATE_CLEANUP, recordingStarted
+                .clear()
+                .with(recordingId)
+                .with(isInbound ? "inbound" : "outbound"));
+        }
     }
 
     // Called only on Framer.quiesce(), uses shutdown order
@@ -446,7 +488,10 @@ public class RecordingCoordinator implements AutoCloseable, RecordingDescriptorC
             awaitRecordingsCompletion(outboundAeronSessionIdToCompletionPosition);
         }
 
-        saveRecordingIdsFile();
+        if (saveOnShutdown)
+        {
+            saveRecordingIdsFile();
+        }
     }
 
     private void awaitRecordingsCompletion(

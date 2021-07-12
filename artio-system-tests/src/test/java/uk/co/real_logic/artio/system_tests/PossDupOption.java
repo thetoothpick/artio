@@ -13,19 +13,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package uk.co.real_logic.artio.engine;
+package uk.co.real_logic.artio.system_tests;
 
-import uk.co.real_logic.artio.fixp.FixPKey;
-
-/**
- * Expose information about an Artio FIXP connection.
- */
-public interface FixPSessionInfo
+enum PossDupOption
 {
-    /**
-     * Gets the key associated with this session.
-     *
-     * @return the key associated with this session.
-     */
-    FixPKey key();
+    YES, YES_WITHOUT_ORIG_SENDING_TIME, NO, NO_WITHOUT_ORIG_SENDING_TIME, MISSING_FIELD
 }

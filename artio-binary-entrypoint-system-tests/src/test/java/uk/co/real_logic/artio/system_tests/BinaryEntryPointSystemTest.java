@@ -21,6 +21,8 @@ import io.aeron.archive.client.AeronArchive;
 import org.agrona.CloseHelper;
 import org.agrona.ErrorHandler;
 import org.agrona.collections.Long2LongHashMap;
+import org.agrona.collections.LongArrayList;
+import org.agrona.concurrent.status.ReadablePosition;
 import org.hamcrest.Matchers;
 import org.junit.After;
 import org.junit.Test;
@@ -59,7 +61,7 @@ import static uk.co.real_logic.artio.engine.FixEngine.ENGINE_LIBRARY_ID;
 import static uk.co.real_logic.artio.library.LibraryConfiguration.NO_FIXP_MAX_RETRANSMISSION_RANGE;
 import static uk.co.real_logic.artio.system_tests.AbstractGatewayToGatewaySystemTest.TEST_TIMEOUT_IN_MS;
 import static uk.co.real_logic.artio.system_tests.ArchivePruneSystemTest.*;
-import static uk.co.real_logic.artio.system_tests.BinaryEntrypointClient.*;
+import static uk.co.real_logic.artio.system_tests.BinaryEntryPointClient.*;
 import static uk.co.real_logic.artio.system_tests.FakeBinaryEntrypointConnectionHandler.sendExecutionReportNew;
 import static uk.co.real_logic.artio.system_tests.FakeFixPConnectionExistsHandler.requestSession;
 import static uk.co.real_logic.artio.system_tests.SystemTestUtil.*;
@@ -80,10 +82,7 @@ public class BinaryEntryPointSystemTest
     private final ErrorHandler errorHandler = mock(ErrorHandler.class);
     private final ILink3RetransmitHandler retransmitHandler = mock(ILink3RetransmitHandler.class);
     private final FakeFixPConnectionExistsHandler connectionExistsHandler = new FakeFixPConnectionExistsHandler();
-    private final FakeBinaryEntrypointConnectionHandler connectionHandler = new FakeBinaryEntrypointConnectionHandler(
-        notAppliedResponse ->
-        {
-        });
+    private final FakeBinaryEntrypointConnectionHandler connectionHandler = new FakeBinaryEntrypointConnectionHandler();
     private final FakeFixPConnectionAcquiredHandler connectionAcquiredHandler = new FakeFixPConnectionAcquiredHandler(
         connectionHandler);
     private final FakeFixPAuthenticationStrategy fixPAuthenticationStrategy = new FakeFixPAuthenticationStrategy();
@@ -92,10 +91,10 @@ public class BinaryEntryPointSystemTest
 
     private boolean printErrors = true;
 
-    private void setupArtio(final boolean deleteLogFileDirOnStart)
+    private void setupArtio()
     {
         setup();
-        setupJustArtio(deleteLogFileDirOnStart);
+        setupJustArtio(true);
     }
 
     private void setup()
@@ -110,12 +109,11 @@ public class BinaryEntryPointSystemTest
     }
 
     private void setupArtio(
-        final boolean deleteLogFileDirOnStart,
         final int logonTimeoutInMs,
         final int fixPAcceptedSessionMaxRetransmissionRange)
     {
         setup();
-        setupJustArtio(deleteLogFileDirOnStart, logonTimeoutInMs, fixPAcceptedSessionMaxRetransmissionRange);
+        setupJustArtio(true, logonTimeoutInMs, fixPAcceptedSessionMaxRetransmissionRange);
     }
 
     private void setupJustArtio(final boolean deleteLogFileDirOnStart)
@@ -152,6 +150,19 @@ public class BinaryEntryPointSystemTest
 
         engine = FixEngine.launch(engineConfig);
 
+        library = launchLibrary(
+            shortLogonTimeoutInMs,
+            fixPAcceptedSessionMaxRetransmissionRange,
+            connectionExistsHandler,
+            connectionAcquiredHandler);
+    }
+
+    private FixLibrary launchLibrary(
+        final int shortLogonTimeoutInMs,
+        final int fixPAcceptedSessionMaxRetransmissionRange,
+        final FakeFixPConnectionExistsHandler connectionExistsHandler,
+        final FakeFixPConnectionAcquiredHandler connectionAcquiredHandler)
+    {
         final LibraryConfiguration libraryConfig = new LibraryConfiguration()
             .libraryAeronChannels(singletonList(IPC_CHANNEL))
             .replyTimeoutInMs(TEST_REPLY_TIMEOUT_IN_MS)
@@ -168,15 +179,15 @@ public class BinaryEntryPointSystemTest
                 .monitoringAgentFactory(MonitoringAgentFactory.none());
         }
 
-        library = testSystem.connect(libraryConfig);
+        return testSystem.connect(libraryConfig);
     }
 
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void shouldEstablishConnectionAtBeginningOfWeek() throws IOException
     {
-        setupArtio(true);
+        setupArtio();
 
-        try (BinaryEntrypointClient client = establishNewConnection())
+        try (BinaryEntryPointClient client = establishNewConnection())
         {
             clientTerminatesSession(client);
         }
@@ -185,9 +196,9 @@ public class BinaryEntryPointSystemTest
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void shouldSupportAcceptorTerminateConnection() throws IOException
     {
-        setupArtio(true);
+        setupArtio();
 
-        try (BinaryEntrypointClient client = establishNewConnection())
+        try (BinaryEntryPointClient client = establishNewConnection())
         {
             connection.terminate(TerminationCode.FINISHED);
             assertEquals(FixPConnection.State.UNBINDING, connection.state());
@@ -199,29 +210,31 @@ public class BinaryEntryPointSystemTest
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void shouldExchangeBusinessMessage() throws IOException
     {
-        setupArtio(true);
+        setupArtio();
 
         connectAndExchangeBusinessMessage();
     }
 
     private void connectAndExchangeBusinessMessage() throws IOException
     {
-        try (BinaryEntrypointClient client = establishNewConnection())
+        try (BinaryEntryPointClient client = establishNewConnection())
         {
             assertNextSequenceNumbers(1, 1);
 
             exchangeOrderAndReportNew(client);
 
             assertNextSequenceNumbers(2, 2);
+
+            clientTerminatesSession(client);
         }
     }
 
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void shouldCorrectlyAbortBusinessMessage() throws IOException
     {
-        setupArtio(true);
+        setupArtio();
 
-        try (BinaryEntrypointClient client = establishNewConnection())
+        try (BinaryEntryPointClient client = establishNewConnection())
         {
             connectionHandler.abortReport(true);
             client.writeNewOrderSingle(CL_ORD_ID);
@@ -245,7 +258,7 @@ public class BinaryEntryPointSystemTest
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void shouldRejectConnectionsIfAuthenticationFails() throws IOException
     {
-        setupArtio(true);
+        setupArtio();
 
         fixPAuthenticationStrategy.reject();
 
@@ -255,9 +268,9 @@ public class BinaryEntryPointSystemTest
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void shouldRejectConnectionsWithDuplicateIds() throws IOException
     {
-        setupArtio(true);
+        setupArtio();
 
-        try (BinaryEntrypointClient client = establishNewConnection())
+        try (BinaryEntryPointClient client = establishNewConnection())
         {
             connectionExistsHandler.reset();
             connectionAcquiredHandler.reset();
@@ -291,7 +304,7 @@ public class BinaryEntryPointSystemTest
     {
         successfulConnection();
 
-        try (BinaryEntrypointClient client = newClient())
+        try (BinaryEntryPointClient client = newClient())
         {
             client.writeNegotiate();
 
@@ -303,9 +316,9 @@ public class BinaryEntryPointSystemTest
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void shouldAcceptConnectionsWithArbitraryFirstSessionVerId() throws IOException
     {
-        setupArtio(true);
+        setupArtio();
 
-        try (BinaryEntrypointClient client = newClient())
+        try (BinaryEntryPointClient client = newClient())
         {
             client.sessionVerID(2);
             client.writeNegotiate();
@@ -318,9 +331,9 @@ public class BinaryEntryPointSystemTest
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void shouldRejectUnNegotiatedEstablish() throws IOException
     {
-        setupArtio(true);
+        setupArtio();
 
-        try (BinaryEntrypointClient client = newClient())
+        try (BinaryEntryPointClient client = newClient())
         {
             client.writeEstablish();
             client.readEstablishReject(EstablishRejectCode.UNNEGOTIATED);
@@ -333,7 +346,7 @@ public class BinaryEntryPointSystemTest
     {
         successfulConnection();
 
-        try (BinaryEntrypointClient client = newClient())
+        try (BinaryEntryPointClient client = newClient())
         {
             client.sessionVerID(2);
             client.writeEstablish();
@@ -345,10 +358,10 @@ public class BinaryEntryPointSystemTest
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void shouldDisconnectIfNegotiateTimeout() throws IOException
     {
-        setupArtio(true, TEST_NO_LOGON_DISCONNECT_TIMEOUT_IN_MS, 1);
+        setupArtio(TEST_NO_LOGON_DISCONNECT_TIMEOUT_IN_MS, 1);
 
         final long timeInMs = System.currentTimeMillis();
-        try (BinaryEntrypointClient client = newClient())
+        try (BinaryEntryPointClient client = newClient())
         {
             client.assertDisconnected();
             final long durationInMs = System.currentTimeMillis() - timeInMs;
@@ -366,11 +379,10 @@ public class BinaryEntryPointSystemTest
     public void shouldDisconnectIfEstablishNotSent() throws IOException
     {
         setupArtio(
-            true,
             TEST_NO_LOGON_DISCONNECT_TIMEOUT_IN_MS,
             NO_FIXP_MAX_RETRANSMISSION_RANGE);
 
-        try (BinaryEntrypointClient client = newClient())
+        try (BinaryEntryPointClient client = newClient())
         {
             final long timeInMs = System.currentTimeMillis();
             client.writeNegotiate();
@@ -409,9 +421,9 @@ public class BinaryEntryPointSystemTest
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void shouldRejectLaterEstablishMessage() throws IOException
     {
-        setupArtio(true);
+        setupArtio();
 
-        try (BinaryEntrypointClient client = establishNewConnection())
+        try (BinaryEntryPointClient client = establishNewConnection())
         {
             client.writeEstablish();
 
@@ -426,9 +438,9 @@ public class BinaryEntryPointSystemTest
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void shouldRejectEstablishMessageWithInvalidKeepAliveInterval() throws IOException
     {
-        setupArtio(true);
+        setupArtio();
 
-        try (BinaryEntrypointClient client = newClient())
+        try (BinaryEntryPointClient client = newClient())
         {
             client.keepAliveIntervalInMs(Long.MAX_VALUE);
 
@@ -450,9 +462,9 @@ public class BinaryEntryPointSystemTest
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void shouldAcceptRetransmitAfterASequenceMessageBasedGap() throws IOException
     {
-        setupArtio(true);
+        setupArtio();
 
-        try (BinaryEntrypointClient client = establishNewConnection())
+        try (BinaryEntryPointClient client = establishNewConnection())
         {
             exchangeOrderAndReportNew(client);
 
@@ -477,7 +489,7 @@ public class BinaryEntryPointSystemTest
 
         connectionHandler.replyToOrder(false);
 
-        try (BinaryEntrypointClient client = newClient())
+        try (BinaryEntryPointClient client = newClient())
         {
             client.writeEstablish(4);
             libraryAcquiresConnection(client);
@@ -493,9 +505,9 @@ public class BinaryEntryPointSystemTest
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void shouldAcceptValidRetransmitRequest() throws IOException
     {
-        setupArtio(true);
+        setupArtio();
 
-        try (BinaryEntrypointClient client = establishNewConnection())
+        try (BinaryEntryPointClient client = establishNewConnection())
         {
             exchange4OrdersAndReports(client);
 
@@ -528,7 +540,7 @@ public class BinaryEntryPointSystemTest
         });
     }
 
-    private void assertMessagesRetransmitted(final BinaryEntrypointClient client)
+    private void assertMessagesRetransmitted(final BinaryEntryPointClient client)
     {
         client.writeRetransmitRequest(2, 2);
         client.readRetransmission(2, 2);
@@ -536,7 +548,7 @@ public class BinaryEntryPointSystemTest
         client.readExecutionReportNew(3);
     }
 
-    private void exchange4OrdersAndReports(final BinaryEntrypointClient client)
+    private void exchange4OrdersAndReports(final BinaryEntryPointClient client)
     {
         exchangeOrderAndReportNew(client, 1);
         exchangeOrderAndReportNew(client, 2);
@@ -548,9 +560,9 @@ public class BinaryEntryPointSystemTest
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void shouldRejectRetransmitRequestWithHighEndNo() throws IOException
     {
-        setupArtio(true);
+        setupArtio();
 
-        try (BinaryEntrypointClient client = establishNewConnection())
+        try (BinaryEntryPointClient client = establishNewConnection())
         {
             exchangeOrderAndReportNew(client, 1);
             exchangeOrderAndReportNew(client, 2);
@@ -566,9 +578,9 @@ public class BinaryEntryPointSystemTest
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void shouldRejectRetransmitRequestWithHighStartNo() throws IOException
     {
-        setupArtio(true);
+        setupArtio();
 
-        try (BinaryEntrypointClient client = establishNewConnection())
+        try (BinaryEntryPointClient client = establishNewConnection())
         {
             assertNextSequenceNumbers(1, 1);
 
@@ -582,9 +594,9 @@ public class BinaryEntryPointSystemTest
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void shouldRejectRetransmitRequestWithWrongSessionId() throws IOException
     {
-        setupArtio(true);
+        setupArtio();
 
-        try (BinaryEntrypointClient client = establishNewConnection())
+        try (BinaryEntryPointClient client = establishNewConnection())
         {
             exchangeOrderAndReportNew(client, 1);
             client.writeRetransmitRequest(1000, 1, 1);
@@ -598,11 +610,10 @@ public class BinaryEntryPointSystemTest
     public void shouldRejectRetransmitRequestLimitExceeded() throws IOException
     {
         setupArtio(
-            true,
             DEFAULT_NO_LOGON_DISCONNECT_TIMEOUT_IN_MS,
             1);
 
-        try (BinaryEntrypointClient client = establishNewConnection())
+        try (BinaryEntryPointClient client = establishNewConnection())
         {
             exchangeOrderAndReportNew(client, 1);
             exchangeOrderAndReportNew(client, 2);
@@ -625,9 +636,9 @@ public class BinaryEntryPointSystemTest
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void shouldRespondToFinishedSendingWithFinishedReceiving() throws IOException
     {
-        setupArtio(true);
+        setupArtio();
 
-        try (BinaryEntrypointClient client = establishNewConnection())
+        try (BinaryEntryPointClient client = establishNewConnection())
         {
             clientInitiatedFinishSending(client);
 
@@ -640,11 +651,7 @@ public class BinaryEntryPointSystemTest
 
             assertNextSequenceNumbers(2, 3);
 
-            connection.finishSending();
-            assertCannotSendMessage();
-
-            client.readFinishedSending(2);
-            client.writeFinishedReceiving();
+            acceptorInitiatedFinishSending(client, 2);
 
             clientTerminatesSession(client);
         }
@@ -658,7 +665,7 @@ public class BinaryEntryPointSystemTest
         connectWithSessionVerId(2);
     }
 
-    private void clientInitiatedFinishSending(final BinaryEntrypointClient client)
+    private void clientInitiatedFinishSending(final BinaryEntryPointClient client)
     {
         exchangeOrderAndReportNew(client);
 
@@ -671,9 +678,9 @@ public class BinaryEntryPointSystemTest
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void shouldCompleteFinishedSendingProcess() throws IOException
     {
-        setupArtio(true);
+        setupArtio();
 
-        try (BinaryEntrypointClient client = establishNewConnection())
+        try (BinaryEntryPointClient client = establishNewConnection())
         {
             exchangeOrderAndReportNew(client);
 
@@ -691,13 +698,18 @@ public class BinaryEntryPointSystemTest
         }
     }
 
-    private void acceptorInitiatedFinishSending(final BinaryEntrypointClient client)
+    private void acceptorInitiatedFinishSending(final BinaryEntryPointClient client)
+    {
+        acceptorInitiatedFinishSending(client, 1);
+    }
+
+    private void acceptorInitiatedFinishSending(final BinaryEntryPointClient client, final int lastSeqNo)
     {
         connection.finishSending();
 
         assertCannotSendMessage();
 
-        client.readFinishedSending(1);
+        client.readFinishedSending(lastSeqNo);
         client.writeFinishedReceiving();
     }
 
@@ -705,7 +717,7 @@ public class BinaryEntryPointSystemTest
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void shouldUseFinishedSendingAsAHeartbeatKeepAliveInTheAbsenceOfResponse() throws IOException
     {
-        setupArtio(true);
+        setupArtio();
 
         withLowKeepAliveClient(client ->
         {
@@ -726,9 +738,9 @@ public class BinaryEntryPointSystemTest
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void shouldProcessRetransmitRequestsInResponseToFinishSending() throws IOException
     {
-        setupArtio(true);
+        setupArtio();
 
-        try (BinaryEntrypointClient client = establishNewConnection())
+        try (BinaryEntryPointClient client = establishNewConnection())
         {
             clientInitiatedFinishSending(client);
 
@@ -741,9 +753,9 @@ public class BinaryEntryPointSystemTest
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void shouldProcessRetransmitRequestsInResponseToAcceptorFinishSending() throws IOException
     {
-        setupArtio(true);
+        setupArtio();
 
-        try (BinaryEntrypointClient client = establishNewConnection())
+        try (BinaryEntryPointClient client = establishNewConnection())
         {
             exchangeOrderAndReportNew(client);
 
@@ -760,9 +772,9 @@ public class BinaryEntryPointSystemTest
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void shouldTerminateInResponseToReceivingTerminate() throws IOException
     {
-        setupArtio(true);
+        setupArtio();
 
-        try (BinaryEntrypointClient client = establishNewConnection())
+        try (BinaryEntryPointClient client = establishNewConnection())
         {
             exchangeOrderAndReportNew(client);
 
@@ -777,9 +789,9 @@ public class BinaryEntryPointSystemTest
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void shouldTerminateInResponseToReceivingMessageAfterFinishedSending() throws IOException
     {
-        setupArtio(true);
+        setupArtio();
 
-        try (BinaryEntrypointClient client = establishNewConnection())
+        try (BinaryEntryPointClient client = establishNewConnection())
         {
             terminatedBySendingMessageAfterFinishedSending(client, () ->
                 client.writeNewOrderSingle(2));
@@ -794,7 +806,7 @@ public class BinaryEntryPointSystemTest
     }
 
     private void terminatedBySendingMessageAfterFinishedSending(
-        final BinaryEntrypointClient client,
+        final BinaryEntryPointClient client,
         final Runnable sendMessage)
     {
         exchangeOrderAndReportNew(client);
@@ -807,7 +819,7 @@ public class BinaryEntryPointSystemTest
         client.readTerminate(TerminationCode.UNSPECIFIED);
     }
 
-    private void processRetransmitRequestsDuringFinishSending(final BinaryEntrypointClient client)
+    private void processRetransmitRequestsDuringFinishSending(final BinaryEntryPointClient client)
     {
         connection.finishSending();
 
@@ -826,7 +838,7 @@ public class BinaryEntryPointSystemTest
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void shouldTerminateSessionWhenSequenceNumberTooLowCanReestablish() throws IOException
     {
-        setupArtio(true);
+        setupArtio();
 
         shouldTerminateSessionWhenSequenceNumberTooLow();
 
@@ -838,7 +850,7 @@ public class BinaryEntryPointSystemTest
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void shouldTerminateSessionWhenSequenceNumberTooLowCanRenegotiate() throws IOException
     {
-        setupArtio(true);
+        setupArtio();
 
         shouldTerminateSessionWhenSequenceNumberTooLow();
 
@@ -848,7 +860,7 @@ public class BinaryEntryPointSystemTest
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void shouldTerminateSessionWhenSequenceNumberTooLowCanReestablishAfterRestart() throws IOException
     {
-        setupArtio(true);
+        setupArtio();
 
         shouldTerminateSessionWhenSequenceNumberTooLow();
 
@@ -861,7 +873,7 @@ public class BinaryEntryPointSystemTest
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void shouldTerminateSessionWhenSequenceNumberTooLowCanRenegotiateAfterRestart() throws IOException
     {
-        setupArtio(true);
+        setupArtio();
 
         shouldTerminateSessionWhenSequenceNumberTooLow();
 
@@ -873,7 +885,7 @@ public class BinaryEntryPointSystemTest
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void shouldSendSequenceMessageAfterTimeElapsed() throws IOException
     {
-        setupArtio(true);
+        setupArtio();
 
         withLowKeepAliveClient(client ->
         {
@@ -892,7 +904,7 @@ public class BinaryEntryPointSystemTest
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void shouldUseSequenceMessagesAsLivenessIndicator() throws IOException
     {
-        setupArtio(true);
+        setupArtio();
 
         withLowKeepAliveClient(client ->
         {
@@ -919,9 +931,9 @@ public class BinaryEntryPointSystemTest
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void sessionsListedInAdminApi() throws IOException
     {
-        setupArtio(true);
+        setupArtio();
 
-        try (BinaryEntrypointClient client = establishNewConnection())
+        try (BinaryEntryPointClient client = establishNewConnection())
         {
             final List<LibraryInfo> libraries = libraries(engine);
             assertThat(libraries, hasSize(2));
@@ -957,7 +969,7 @@ public class BinaryEntryPointSystemTest
     {
         printErrors = false;
 
-        setupArtio(true);
+        setupArtio();
 
         final Reply<ILink3Connection> reply = library.initiate(ILink3ConnectionConfiguration.builder()
             .host("127.0.0.1")
@@ -978,7 +990,7 @@ public class BinaryEntryPointSystemTest
     {
         printErrors = false;
 
-        setupArtio(true);
+        setupArtio();
 
         final Reply<Session> reply = initiate(library, port, "ABC", "DEF");
 
@@ -1018,9 +1030,15 @@ public class BinaryEntryPointSystemTest
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void shouldResetSequenceNumbersOfDisconnectedSessions() throws IOException
     {
-        shouldExchangeBusinessMessage();
+        setupArtio();
 
-        testSystem.awaitCompletedReply(engine.resetSequenceNumber(connection.sessionId()));
+        final ReadablePosition positionCounter = testSystem.libraryPosition(engine, library);
+
+        connectAndExchangeBusinessMessage();
+
+        testSystem.awaitPosition(positionCounter, connectionHandler.lastPosition());
+
+        resetSequenceNumber();
 
         rejectedReestablish(EstablishRejectCode.UNNEGOTIATED);
     }
@@ -1028,9 +1046,9 @@ public class BinaryEntryPointSystemTest
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void shouldOnlyRequestSessionsThatCanBeAcquired() throws IOException
     {
-        setupArtio(true);
+        setupArtio();
 
-        try (BinaryEntrypointClient client = establishNewConnection())
+        try (BinaryEntryPointClient client = establishNewConnection())
         {
             final Reply<SessionReplyStatus> reply = requestSession(library, connection.sessionId());
             testSystem.awaitCompletedReply(reply);
@@ -1038,16 +1056,45 @@ public class BinaryEntryPointSystemTest
         }
     }
 
+    // ----------------------------------
+    // BEGIN PRUNE TESTS
+    // ----------------------------------
+
     @Test(timeout = TEST_TIMEOUT_IN_MS)
-    public void shouldPruneAwayOldArchivePositions() throws IOException
+    public void shouldPruneAwayOldArchivePositionsAfterRenegotiate() throws IOException
+    {
+        shouldPruneAwayOldArchivePositions(false, () -> connectWithSessionVerId(2));
+    }
+
+    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    public void shouldPruneAwayOldArchivePositionsAfterResetSequenceNumbers() throws IOException
+    {
+        shouldPruneAwayOldArchivePositions(false, this::resetSequenceNumber);
+    }
+
+    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    public void shouldPruneAwayOldArchivePositionsAfterFinishSendingAndRenegotiate() throws IOException
+    {
+        // Don't support purging the sequence after a finish sending on it's own as a resend
+        // request could come in after that point.
+        shouldPruneAwayOldArchivePositions(true, () -> connectWithSessionVerId(2));
+    }
+
+    private interface ResetOperation
+    {
+        void reset() throws IOException;
+    }
+
+    private void shouldPruneAwayOldArchivePositions(
+        final boolean finishSending, final ResetOperation resetOp) throws IOException
     {
         mediaDriver = launchMediaDriver(TERM_MIN_LENGTH);
         newTestSystem();
         setupJustArtio(true);
 
-        exchangeOverASegmentOfMessages();
+        exchangeOverASegmentOfMessages(finishSending);
 
-        connectWithSessionVerId(2);
+        resetOp.reset();
 
         assertPruneWorks();
     }
@@ -1066,8 +1113,8 @@ public class BinaryEntryPointSystemTest
                 ", prunedRecordingIdToStartPos = " + prunedRecordingIdToStartPos +
                 ", recordingIdToStartPos = " + recordingIdToStartPos);
 
-            assertThat(recordingIdToStartPos.toString(), recordingIdToStartPos,
-                hasEntry(is(0L), greaterThanOrEqualTo((long)TERM_MIN_LENGTH)));
+            assertHasBeenPruned(recordingIdToStartPos, 0L);
+            assertHasBeenPruned(recordingIdToStartPos, 2L);
 
             assertRecordingsPruned(
                 prePruneRecordingIdToStartPos, recordingIdToStartPos, prunedRecordingIdToStartPos);
@@ -1082,18 +1129,190 @@ public class BinaryEntryPointSystemTest
         }
     }
 
-    private void exchangeOverASegmentOfMessages() throws IOException
+    private void assertHasBeenPruned(final Long2LongHashMap recordingIdToStartPos, final long recordingId)
     {
-        try (BinaryEntrypointClient client = establishNewConnection())
+        assertThat(recordingIdToStartPos.toString(), recordingIdToStartPos,
+            hasEntry(is(recordingId), greaterThanOrEqualTo((long)TERM_MIN_LENGTH)));
+    }
+
+    private void exchangeOverASegmentOfMessages(final boolean finishSending) throws IOException
+    {
+        try (BinaryEntryPointClient client = establishNewConnection())
         {
             final int overASegmentOfMessages = TERM_MIN_LENGTH / NewOrderSingleEncoder.BLOCK_LENGTH;
             for (int i = 0; i < overASegmentOfMessages; i++)
             {
                 exchangeOrderAndReportNew(client, i);
             }
+
+            if (finishSending)
+            {
+                client.writeFinishedSending(overASegmentOfMessages);
+                client.readFinishedReceiving();
+                acceptorInitiatedFinishSending(client, overASegmentOfMessages);
+            }
         }
     }
 
+    // ----------------------------------
+    // END PRUNE TESTS
+    // ----------------------------------
+
+    // ----------------------------------
+    // BEGIN CARDINALITY TESTS
+    // ----------------------------------
+
+    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    public void shouldSupportMultipleSessions() throws IOException
+    {
+        setupArtio();
+
+        try (BinaryEntryPointClient client = establishNewConnection())
+        {
+            final BinaryEntrypointConnection firstConnection = this.connection;
+            resetHandlers();
+
+            try (BinaryEntryPointClient client2 = newClient())
+            {
+                client2.sessionId(SESSION_ID_2);
+                establishNewConnection(client2);
+
+                exchangeOrderAndReportNew(client2);
+
+                clientTerminatesSession(client2);
+            }
+
+            this.connection = firstConnection;
+
+            exchangeOrderAndReportNew(client);
+
+            testSystem.awaitSend("Failed to send",
+                () -> connection.terminate(TerminationCode.FINISHED));
+            acceptorTerminatesSession(client);
+        }
+
+        assertEquals(connectionHandler.sessionIds(),
+            new LongArrayList(new long[]{SESSION_ID_2, SESSION_ID}, 2, LongArrayList.DEFAULT_NULL_VALUE));
+    }
+
+    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    public void shouldSupportMultipleLibraries() throws IOException
+    {
+        setupArtio();
+
+        final FakeFixPConnectionExistsHandler connectionExistsHandler2 = new FakeFixPConnectionExistsHandler();
+        final FakeBinaryEntrypointConnectionHandler connectionHandler2 = new FakeBinaryEntrypointConnectionHandler();
+        final FakeFixPConnectionAcquiredHandler connectionAcquiredHandler2 = new FakeFixPConnectionAcquiredHandler(
+            connectionHandler2);
+
+        final FixLibrary library2 = launchLibrary(
+            DEFAULT_NO_LOGON_DISCONNECT_TIMEOUT_IN_MS,
+            NO_FIXP_MAX_RETRANSMISSION_RANGE,
+            connectionExistsHandler2,
+            connectionAcquiredHandler2);
+
+        try
+        {
+            connectionExistsHandler2.request(false);
+
+            // connect to library 1
+            try (BinaryEntryPointClient client = establishNewConnection())
+            {
+                assertEquals(connectionExistsHandler.lastIdentification(),
+                    connectionExistsHandler2.lastIdentification());
+                assertFalse(connectionAcquiredHandler2.invoked());
+
+                exchangeOrderAndReportNew(client);
+
+                assertThat(connectionHandler2.templateIds(), hasSize(0));
+            }
+
+            resetHandlers();
+            connectionExistsHandler2.reset();
+            connectionExistsHandler.request(false);
+            connectionExistsHandler2.request(true);
+
+            // connect to library 2
+            try (BinaryEntryPointClient client = newClient())
+            {
+                client.sessionVerID(2);
+                establishNewConnection(client, connectionExistsHandler2, connectionAcquiredHandler2);
+
+                assertFalse(connectionAcquiredHandler.invoked());
+
+                exchangeOrderAndReportNew(client, CL_ORD_ID, connectionHandler2);
+
+                assertThat(connectionHandler.templateIds(), hasSize(0));
+            }
+        }
+        finally
+        {
+            testSystem.close(library2);
+        }
+    }
+
+    // ----------------------------------
+    // END CARDINALITY TESTS
+    // ----------------------------------
+
+    // ----------------------------------
+    // BEGIN OFFLINE TESTS
+    // ----------------------------------
+
+    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    public void shouldSupportOfflineSessions() throws IOException
+    {
+        setupArtio();
+
+        try (BinaryEntryPointClient client = establishNewConnection())
+        {
+            exchangeOrderAndReportNew(client);
+
+            clientTerminatesSession(client);
+        }
+
+        final long sessionId = connection.sessionId();
+        resetHandlers();
+
+        final Reply<SessionReplyStatus> reply = requestSession(library, sessionId);
+        testSystem.awaitCompletedReply(reply);
+        assertEquals(SessionReplyStatus.OK, reply.resultIfPresent());
+        acquireConnection(connectionAcquiredHandler);
+        assertEquals(FixPConnection.State.UNBOUND, connection.state());
+        assertNextSequenceNumbers(2, 2);
+        assertEquals(sessionId, connection.sessionId());
+        assertEquals(1, connection.sessionVerId());
+
+        connectionAcquiredHandler.reset();
+
+        // Reconnect should automatically send the reconnected session to the library that owns the offline session
+        try (BinaryEntryPointClient client = newClient())
+        {
+            client.writeEstablish(2);
+
+            testSystem.await("connection not acquired", connectionAcquiredHandler::invoked);
+            final BinaryEntrypointConnection offlineConnection = this.connection;
+            acquireConnection(connectionAcquiredHandler);
+            assertFalse(connectionExistsHandler.invoked());
+            assertSame(offlineConnection, connection);
+
+            assertConnectionMatches(client);
+            client.readEstablishAck(2, 1);
+
+            exchangeOrderAndReportNew(client);
+
+            clientTerminatesSession(client);
+        }
+    }
+
+    // ----------------------------------
+    // END OFFLINE TESTS
+    // ----------------------------------
+
+    private void resetSequenceNumber()
+    {
+        testSystem.awaitCompletedReply(engine.resetSequenceNumber(connection.sessionId()));
+    }
 
     private void assertAllSessionsOnlyContains(final FixEngine engine, final BinaryEntrypointConnection connection)
     {
@@ -1104,9 +1323,9 @@ public class BinaryEntryPointSystemTest
         assertEquals(sessionInfo.key(), connection.key());
     }
 
-    private void withLowKeepAliveClient(final Consumer<BinaryEntrypointClient> handler) throws IOException
+    private void withLowKeepAliveClient(final Consumer<BinaryEntryPointClient> handler) throws IOException
     {
-        try (BinaryEntrypointClient client = newClient())
+        try (BinaryEntryPointClient client = newClient())
         {
             client.keepAliveIntervalInMs(500);
             establishNewConnection(client);
@@ -1157,7 +1376,7 @@ public class BinaryEntryPointSystemTest
         reEstablishConnection(5, 2);
     }
 
-    private void retransmitAfterGap(final BinaryEntrypointClient client)
+    private void retransmitAfterGap(final BinaryEntryPointClient client)
     {
         assertNextSequenceNumbers(4, 2);
 
@@ -1175,7 +1394,7 @@ public class BinaryEntryPointSystemTest
 
     private long rejectedReestablish(final EstablishRejectCode rejectCode) throws IOException
     {
-        try (BinaryEntrypointClient client = newClient())
+        try (BinaryEntryPointClient client = newClient())
         {
             client.writeEstablish();
 
@@ -1208,9 +1427,9 @@ public class BinaryEntryPointSystemTest
 
     private void withReEstablishedConnection(
         final int alreadyRecvMsgCount,
-        final Consumer<BinaryEntrypointClient> handler) throws IOException
+        final Consumer<BinaryEntryPointClient> handler) throws IOException
     {
-        try (BinaryEntrypointClient client = newClient())
+        try (BinaryEntryPointClient client = newClient())
         {
             final int nextSeqNo = alreadyRecvMsgCount + 1;
             client.writeEstablish(nextSeqNo);
@@ -1225,15 +1444,23 @@ public class BinaryEntryPointSystemTest
         }
     }
 
-    private void exchangeOrderAndReportNew(final BinaryEntrypointClient client)
+    private void exchangeOrderAndReportNew(final BinaryEntryPointClient client)
     {
         exchangeOrderAndReportNew(client, CL_ORD_ID);
     }
 
-    private void exchangeOrderAndReportNew(final BinaryEntrypointClient client, final int clOrdId)
+    private void exchangeOrderAndReportNew(final BinaryEntryPointClient client, final int clOrdId)
+    {
+        exchangeOrderAndReportNew(client, clOrdId, connectionHandler);
+    }
+
+    private void exchangeOrderAndReportNew(
+        final BinaryEntryPointClient client,
+        final int clOrdId,
+        final FakeBinaryEntrypointConnectionHandler connectionHandler)
     {
         client.writeNewOrderSingle(clOrdId);
-        assertReceivesOrder();
+        assertReceivesOrder(connectionHandler);
         client.readExecutionReportNew(clOrdId);
     }
 
@@ -1258,12 +1485,12 @@ public class BinaryEntryPointSystemTest
     }
 
     private void reNegotiateWithVerId(
-        final int sessionVerID, final Consumer<BinaryEntrypointClient> handler)
+        final int sessionVerID, final Consumer<BinaryEntryPointClient> handler)
         throws IOException
     {
         resetHandlers();
 
-        try (BinaryEntrypointClient client = newClient())
+        try (BinaryEntryPointClient client = newClient())
         {
             client.sessionVerID(sessionVerID);
             establishNewConnection(client);
@@ -1274,7 +1501,7 @@ public class BinaryEntryPointSystemTest
 
     private void successfulConnection() throws IOException
     {
-        setupArtio(true);
+        setupArtio();
 
         establishSuccessNewConnection();
 
@@ -1283,7 +1510,7 @@ public class BinaryEntryPointSystemTest
 
     private void establishSuccessNewConnection() throws IOException
     {
-        try (BinaryEntrypointClient client = establishNewConnection())
+        try (BinaryEntryPointClient client = establishNewConnection())
         {
             exchangeOrderAndReportNew(client);
 
@@ -1296,19 +1523,20 @@ public class BinaryEntryPointSystemTest
     private void resetHandlers()
     {
         connectionHandler.replyToOrder(true);
+        connectionHandler.reset();
         connectionExistsHandler.reset();
         connectionAcquiredHandler.reset();
         connection = null;
     }
 
-    private BinaryEntrypointClient newClient() throws IOException
+    private BinaryEntryPointClient newClient() throws IOException
     {
-        return new BinaryEntrypointClient(port, testSystem);
+        return new BinaryEntryPointClient(port, testSystem);
     }
 
     private void connectionRejected(final NegotiationRejectCode negotiationRejectCode) throws IOException
     {
-        try (BinaryEntrypointClient client = newClient())
+        try (BinaryEntryPointClient client = newClient())
         {
             client.writeNegotiate();
 
@@ -1333,11 +1561,16 @@ public class BinaryEntryPointSystemTest
 
     private void assertReceivesOrder()
     {
+        assertReceivesOrder(connectionHandler);
+    }
+
+    private void assertReceivesOrder(final FakeBinaryEntrypointConnectionHandler connectionHandler)
+    {
         testSystem.await("does not receive new order single",
             () -> connectionHandler.templateIds().containsInt(NewOrderSingleDecoder.TEMPLATE_ID));
     }
 
-    private void clientTerminatesSession(final BinaryEntrypointClient client)
+    private void clientTerminatesSession(final BinaryEntryPointClient client)
     {
         client.writeTerminate();
         client.readTerminate();
@@ -1347,7 +1580,7 @@ public class BinaryEntryPointSystemTest
         assertConnectionDisconnected();
     }
 
-    private void acceptorTerminatesSession(final BinaryEntrypointClient client)
+    private void acceptorTerminatesSession(final BinaryEntryPointClient client)
     {
         client.readTerminate();
         client.writeTerminate();
@@ -1362,43 +1595,76 @@ public class BinaryEntryPointSystemTest
         assertEquals(FixPConnection.State.UNBOUND, connection.state());
     }
 
-    private BinaryEntrypointClient establishNewConnection() throws IOException
+    private BinaryEntryPointClient establishNewConnection() throws IOException
     {
-        final BinaryEntrypointClient client = newClient();
+        final BinaryEntryPointClient client = newClient();
         establishNewConnection(client);
         return client;
     }
 
-    private void establishNewConnection(final BinaryEntrypointClient client)
+    private void establishNewConnection(final BinaryEntryPointClient client)
+    {
+        establishNewConnection(client, connectionExistsHandler, connectionAcquiredHandler);
+    }
+
+    private void establishNewConnection(
+        final BinaryEntryPointClient client,
+        final FakeFixPConnectionExistsHandler connectionExistsHandler,
+        final FakeFixPConnectionAcquiredHandler connectionAcquiredHandler)
     {
         client.writeNegotiate();
 
-        libraryAcquiresConnection(client);
+        libraryAcquiresConnection(client, connectionExistsHandler, connectionAcquiredHandler);
 
         client.readNegotiateResponse();
 
         client.writeEstablish();
         client.readFirstEstablishAck();
 
-        assertConnectionMatches(client);
+        assertConnectionMatches(client, connectionAcquiredHandler);
     }
 
-    private void assertConnectionMatches(final BinaryEntrypointClient client)
+    private void assertConnectionMatches(final BinaryEntryPointClient client)
     {
-        connection = (BinaryEntrypointConnection)connectionAcquiredHandler.connection();
-        assertEquals(SESSION_ID, connection.sessionId());
+        assertConnectionMatches(client, connectionAcquiredHandler);
+    }
+
+    private void assertConnectionMatches(
+        final BinaryEntryPointClient client, final FakeFixPConnectionAcquiredHandler connectionAcquiredHandler)
+    {
+        acquireConnection(connectionAcquiredHandler);
+        assertEquals(client.sessionId(), connection.sessionId());
         assertEquals(client.sessionVerID(), connection.sessionVerId());
         assertEquals(FixPConnection.State.ESTABLISHED, connection.state());
     }
 
-    private void libraryAcquiresConnection(final BinaryEntrypointClient client)
+    private void acquireConnection(final FakeFixPConnectionAcquiredHandler connectionAcquiredHandler)
+    {
+        connection = (BinaryEntrypointConnection)connectionAcquiredHandler.connection();
+    }
+
+    private void libraryAcquiresConnection(final BinaryEntryPointClient client)
+    {
+        libraryAcquiresConnection(client, connectionExistsHandler, connectionAcquiredHandler);
+    }
+
+    private void libraryAcquiresConnection(
+        final BinaryEntryPointClient client,
+        final FakeFixPConnectionExistsHandler connectionExistsHandler,
+        final FakeFixPConnectionAcquiredHandler connectionAcquiredHandler)
     {
         testSystem.await("connection doesn't exist", connectionExistsHandler::invoked);
-        assertNotNull(fixPAuthenticationStrategy.lastSessionId());
-        assertEquals(SESSION_ID, connectionExistsHandler.lastSurrogateSessionId());
+
+        final BinaryEntryPointContext context = (BinaryEntryPointContext)fixPAuthenticationStrategy.lastSessionId();
+        assertNotNull(context);
+        assertEquals(client.sessionId(), context.sessionID());
+        assertEquals(client.sessionVerID(), context.sessionVerID());
+//        assertEquals(FIRM_ID, context.enteringFirm());
+
+        assertEquals(client.sessionId(), connectionExistsHandler.lastSurrogateSessionId());
         final BinaryEntryPointContext id =
             (BinaryEntryPointContext)connectionExistsHandler.lastIdentification();
-        assertEquals(SESSION_ID, id.sessionID());
+        assertEquals(client.sessionId(), id.sessionID());
         assertEquals("sessionVerID", client.sessionVerID(), id.sessionVerID());
         final Reply<SessionReplyStatus> reply = connectionExistsHandler.lastReply();
 

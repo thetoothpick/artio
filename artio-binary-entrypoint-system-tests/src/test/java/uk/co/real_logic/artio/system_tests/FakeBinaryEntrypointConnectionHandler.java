@@ -18,6 +18,7 @@ package uk.co.real_logic.artio.system_tests;
 import b3.entrypoint.fixp.sbe.*;
 import org.agrona.DirectBuffer;
 import org.agrona.collections.IntArrayList;
+import org.agrona.collections.LongArrayList;
 import uk.co.real_logic.artio.fixp.FixPConnection;
 import uk.co.real_logic.artio.fixp.FixPConnectionHandler;
 import uk.co.real_logic.artio.library.NotAppliedResponse;
@@ -30,23 +31,19 @@ import java.util.function.Consumer;
 public class FakeBinaryEntrypointConnectionHandler implements FixPConnectionHandler
 {
     private final IntArrayList messageIds = new IntArrayList();
+    private final LongArrayList sessionIds = new LongArrayList();
     private final List<Exception> exceptions = new ArrayList<>();
     private final Consumer<NotAppliedResponse> notAppliedResponse;
 
-    private boolean hasReceivedNotApplied;
     private DisconnectReason disconnectReason;
     private boolean replyToOrder = true;
     private boolean abortReport;
     private boolean finishedSending = false;
+    private long lastPosition;
 
-    public FakeBinaryEntrypointConnectionHandler(final Consumer<NotAppliedResponse> notAppliedResponse)
+    public FakeBinaryEntrypointConnectionHandler()
     {
-        this.notAppliedResponse = notAppliedResponse;
-    }
-
-    public boolean hasReceivedNotApplied()
-    {
-        return hasReceivedNotApplied;
+        this.notAppliedResponse = ignore -> {};
     }
 
     public void abortReport(final boolean abortReport)
@@ -74,6 +71,7 @@ public class FakeBinaryEntrypointConnectionHandler implements FixPConnectionHand
         final boolean possRetrans)
     {
         messageIds.add(templateId);
+        sessionIds.add(connection.key().sessionIdIfExists());
 
         if (replyToOrder && templateId == NewOrderSingleDecoder.TEMPLATE_ID)
         {
@@ -83,7 +81,7 @@ public class FakeBinaryEntrypointConnectionHandler implements FixPConnectionHand
             final long clOrderID = newOrderSingle.clOrdID();
             final long securityID = newOrderSingle.securityID();
 
-            sendExecutionReportNew(connection, clOrderID, securityID, abortReport);
+            lastPosition = sendExecutionReportNew(connection, clOrderID, securityID, abortReport);
         }
     }
 
@@ -92,14 +90,16 @@ public class FakeBinaryEntrypointConnectionHandler implements FixPConnectionHand
         finishedSending = true;
     }
 
-    static void sendExecutionReportNew(
+    static long sendExecutionReportNew(
         final FixPConnection connection, final long clOrderID, final long securityID, final boolean abortReport)
     {
         final ExecutionReport_NewEncoder executionReport = new ExecutionReport_NewEncoder();
 
+        long position;
+
         while (true)
         {
-            final long position = connection.tryClaim(executionReport);
+            position = connection.tryClaim(executionReport);
             if (position >= 0)
             {
                 break;
@@ -133,6 +133,8 @@ public class FakeBinaryEntrypointConnectionHandler implements FixPConnectionHand
         {
             connection.commit();
         }
+
+        return position;
     }
 
     public void onNotApplied(
@@ -141,7 +143,6 @@ public class FakeBinaryEntrypointConnectionHandler implements FixPConnectionHand
         final long msgCount,
         final NotAppliedResponse response)
     {
-        hasReceivedNotApplied = true;
         notAppliedResponse.accept(response);
     }
 
@@ -181,15 +182,27 @@ public class FakeBinaryEntrypointConnectionHandler implements FixPConnectionHand
         return messageIds;
     }
 
+    public LongArrayList sessionIds()
+    {
+        return sessionIds;
+    }
+
     public List<Exception> exceptions()
     {
         return exceptions;
     }
 
+    public long lastPosition()
+    {
+        return lastPosition;
+    }
+
     public void reset()
     {
+        lastPosition = 0;
         disconnectReason = null;
         messageIds.clear();
         exceptions.clear();
+        sessionIds.clear();
     }
 }

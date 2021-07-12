@@ -39,12 +39,12 @@ import uk.co.real_logic.artio.util.AsciiBuffer;
 import uk.co.real_logic.artio.util.EpochFractionClock;
 import uk.co.real_logic.artio.util.MutableAsciiBuffer;
 
+import java.util.function.BooleanSupplier;
+
 import static io.aeron.logbuffer.ControlledFragmentHandler.Action.ABORT;
 import static io.aeron.logbuffer.ControlledFragmentHandler.Action.CONTINUE;
 import static java.lang.Integer.MIN_VALUE;
 import static java.util.concurrent.TimeUnit.*;
-import static uk.co.real_logic.artio.engine.EngineConfiguration.validateMessageThrottleOptions;
-import static uk.co.real_logic.artio.messages.CancelOnDisconnectOption.*;
 import static uk.co.real_logic.artio.GatewayProcess.NO_CONNECTION_ID;
 import static uk.co.real_logic.artio.LogTag.FIX_MESSAGE;
 import static uk.co.real_logic.artio.builder.Validation.CODEC_VALIDATION_DISABLED;
@@ -52,10 +52,12 @@ import static uk.co.real_logic.artio.builder.Validation.CODEC_VALIDATION_ENABLED
 import static uk.co.real_logic.artio.dictionary.SessionConstants.*;
 import static uk.co.real_logic.artio.dictionary.generation.CodecUtil.MISSING_INT;
 import static uk.co.real_logic.artio.dictionary.generation.CodecUtil.MISSING_LONG;
+import static uk.co.real_logic.artio.engine.EngineConfiguration.validateMessageThrottleOptions;
 import static uk.co.real_logic.artio.engine.SessionInfo.UNKNOWN_SEQUENCE_INDEX;
 import static uk.co.real_logic.artio.engine.logger.SequenceNumberIndexWriter.NO_REQUIRED_POSITION;
 import static uk.co.real_logic.artio.fields.RejectReason.*;
 import static uk.co.real_logic.artio.library.SessionConfiguration.NO_RESEND_REQUEST_CHUNK_SIZE;
+import static uk.co.real_logic.artio.messages.CancelOnDisconnectOption.*;
 import static uk.co.real_logic.artio.messages.DisconnectReason.*;
 import static uk.co.real_logic.artio.messages.MessageStatus.OK;
 import static uk.co.real_logic.artio.messages.SessionState.*;
@@ -111,6 +113,8 @@ public class Session
     private final OnMessageInfo messageInfo;
     private final ConnectionType connectionType;
 
+    private final BooleanSupplier saveSeqIndexSyncFunc = this::saveSeqIndexSync;
+
     private CompositeKey sessionKey;
     private SessionState state;
     private String beginString;
@@ -125,6 +129,10 @@ public class Session
     private int lastResendChunkMsgSeqNum = INITIAL_LAST_RESEND_CHUNK_MSG_SEQ_NUM;
     // The last msg seq no before you hit the end of the resend request
     private int endOfResendRequestRange = INITIAL_END_OF_RESEND_REQUEST_RANGE;
+
+    // Set when the tryResetSequenceNumbers() method is invoked in order to remember that we're awaiting a logon message
+    // reply from the counter-party.
+    private boolean awaitingLogonReply = false;
 
     private boolean awaitingHeartbeat = INITIAL_AWAITING_HEARTBEAT;
 
@@ -162,6 +170,7 @@ public class Session
     private FixDictionary fixDictionary;
 
     private long cancelOnDisconnectTimeoutWindowInNs = MISSING_LONG;
+    private boolean isSlowConsumer;
     CancelOnDisconnectOption cancelOnDisconnectOption;
 
     Session(
@@ -424,6 +433,18 @@ public class Session
     }
 
     /**
+     * Gets the slow consumer status for this session. See
+     * <a href="https://github.com/real-logic/artio/wiki/Performance-and-Fairness#slow-consumer-support">the wiki</a>
+     * for details on what a slow consumer is.
+     *
+     * @return true if the session is a slow consumer, false otherwise.
+     */
+    public boolean isSlowConsumer()
+    {
+        return isSlowConsumer;
+    }
+
+    /**
      * Sends a logout message and puts the session into the awaiting logout state.
      * <p>
      * This method will eventually also disconnect the Session, but it won't disconnect the session until you
@@ -507,7 +528,7 @@ public class Session
         return logoutAndDisconnect(APPLICATION_DISCONNECT);
     }
 
-    private long logoutAndDisconnect(final DisconnectReason reason)
+    long logoutAndDisconnect(final DisconnectReason reason)
     {
         long position = NO_OPERATION;
         if (state() != DISCONNECTED)
@@ -790,6 +811,10 @@ public class Session
      * Acts like {@link #trySendSequenceReset(int)} but also resets the received sequence number. This method
      * can be used to reset sequence numbers of offline sessions.
      *
+     * If the return value of this method is negative it indicates back-pressure has been applied and this method
+     * should be retried. See {@link Publication} for constant values indicating the meaning of the back-pressure
+     * values.
+     *
      * @param nextSentMessageSequenceNumber     the new sequence number of the next message to be
      *                                          sent.
      * @param nextReceivedMessageSequenceNumber the new sequence number of the next message to be
@@ -801,14 +826,47 @@ public class Session
         final int nextReceivedMessageSequenceNumber)
     {
         final long position = trySendSequenceReset(nextSentMessageSequenceNumber);
-        // Do not reset the sequence index at this point.
-        lastReceivedMsgSeqNumOnly(nextReceivedMessageSequenceNumber - 1);
-        if (redact(NO_REQUIRED_POSITION))
+        if (position >= 0)
         {
-            this.sessionProcessHandler.enqueueTask(() -> redact(NO_REQUIRED_POSITION));
+            // Do not reset the sequence index at this point.
+            lastReceivedMsgSeqNumOnly(nextReceivedMessageSequenceNumber - 1);
+            if (redact(NO_REQUIRED_POSITION))
+            {
+                sessionProcessHandler.enqueueTask(() -> redact(NO_REQUIRED_POSITION));
+            }
         }
-
         return position;
+    }
+
+    /**
+     * Useful for administrative operations that need to reset the received sequence number of the session in question.
+     * This method can be used to reset sequence numbers of offline sessions.
+     *
+     * @param lastReceivedMsgSeqNum  the sequence number of the last message received.
+     * @return the position in the stream that corresponds to the end of this message.
+     */
+    public long tryUpdateLastReceivedSequenceNumber(
+        final int lastReceivedMsgSeqNum)
+    {
+        // Do not reset the sequence index at this point.
+        final long position = saveRedact(NO_REQUIRED_POSITION, lastReceivedMsgSeqNum);
+        if (position > 0)
+        {
+            if (this.lastReceivedMsgSeqNum > lastReceivedMsgSeqNum)
+            {
+                if (!saveSeqIndexSync())
+                {
+                    sessionProcessHandler.enqueueTask(saveSeqIndexSyncFunc);
+                }
+            }
+            lastReceivedMsgSeqNum(lastReceivedMsgSeqNum);
+        }
+        return position;
+    }
+
+    private boolean saveSeqIndexSync()
+    {
+        return outboundPublication.saveSeqIndexSync(libraryId, id, sequenceIndex + 1) > 0;
     }
 
     /**
@@ -843,31 +901,47 @@ public class Session
     }
 
     /**
-     * Resets both the receiver and sender sequence numbers of this session. This is equivalent to
-     * sending a Logon message with ResetSeqNum flag set to Y.
+     * Resets both the receiver and sender sequence numbers of this session. When this session is online this is
+     * equivalent to sending a Logon message with ResetSeqNum flag set to Y. This method
+     * can be used to reset sequence numbers of offline sessions, when used as such, it is equivalent to calling
+     * <code>trySendSequenceReset(1, 1)</code>.
      * <p>
-     * If you want to send a sequence reset message then you should use {@link #trySendSequenceReset(int, int)}.
+     * If you want to send a sequence reset message to a connected FIX session then you should use
+     * {@link #trySendSequenceReset(int, int)}. The key difference between these two methods is that this should be
+     * used to reset sequence numbers back to 1, whilst {@link #trySendSequenceReset(int, int)} should be used to
+     * increase the sequence numbers from their current position.
      *
      * @return the position in the stream that corresponds to the end of this message.
      */
     public long tryResetSequenceNumbers()
     {
-        final int sentSeqNum = 1;
-        final int heartbeatIntervalInS = (int)NANOSECONDS.toSeconds(heartbeatIntervalInNs);
-        final long position = proxy.sendLogon(
-            sentSeqNum,
-            heartbeatIntervalInS,
-            username(),
-            password(),
-            true,
-            sequenceIndex() + 1, // the sequence index update is only saved if this message is sent
-            lastMsgSeqNumProcessed,
-            cancelOnDisconnectOption,
-            getCancelOnDisconnectTimeoutWindowInMs());
-        nextSequenceIndex(clock.nanoTime(), position);
-        lastSentMsgSeqNum(sentSeqNum, position);
+        if (state == DISCONNECTED)
+        {
+            return trySendSequenceReset(1, 1);
+        }
+        else
+        {
+            final int sentSeqNum = 1;
+            final int heartbeatIntervalInS = (int)NANOSECONDS.toSeconds(heartbeatIntervalInNs);
+            final long position = proxy.sendLogon(
+                sentSeqNum,
+                heartbeatIntervalInS,
+                username(),
+                password(),
+                true,
+                sequenceIndex() + 1, // the sequence index update is only saved if this message is sent
+                lastMsgSeqNumProcessed,
+                cancelOnDisconnectOption,
+                getCancelOnDisconnectTimeoutWindowInMs());
+            nextSequenceIndex(clock.nanoTime(), position);
+            lastSentMsgSeqNum(sentSeqNum, position);
+            if (position >= 0)
+            {
+                awaitingLogonReply(true);
+            }
 
-        return position;
+            return position;
+        }
     }
 
     /**
@@ -912,7 +986,16 @@ public class Session
         checkCancelOnDisconnectDisconnect();
     }
 
-    // Also checks the sequence index
+    /**
+     * Sets the sequence number of the last message received. It is exceedingly unlikely that any Artio users want to
+     * use this method to set the sequence number. If you want to update this value in a way that will be reliably
+     * persisted and update the state of your index then you should use {@link #tryUpdateLastReceivedSequenceNumber(int)}.
+     *
+     * This method does check and update the sequence index value.
+     *
+     * @param lastReceivedMsgSeqNum the sequence number of the last message received.
+     * @return this
+     */
     public Session lastReceivedMsgSeqNum(final int lastReceivedMsgSeqNum)
     {
         if (this.lastReceivedMsgSeqNum > lastReceivedMsgSeqNum)
@@ -1043,6 +1126,27 @@ public class Session
         final boolean possDup,
         final long position)
     {
+        final long timeInNs = timeInNs();
+        final Action action = checkStateAndValidateMessage(msgSeqNo, timeInNs, msgType, msgTypeLength,
+            sendingTime, origSendingTime, isPossDupOrResend, possDup, position);
+        if (action != null)
+        {
+            return action;
+        }
+        return checkSeqNoChange(msgSeqNo, timeInNs, isPossDupOrResend, position);
+    }
+
+    Action checkStateAndValidateMessage(
+        final int msgSeqNo,
+        final long timeInNs,
+        final char[] msgType,
+        final int msgTypeLength,
+        final long sendingTime,
+        final long origSendingTime,
+        final boolean isPossDupOrResend,
+        final boolean possDup,
+        final long position)
+    {
         final SessionState state = state();
         if (state == SessionState.CONNECTED)
         {
@@ -1056,15 +1160,8 @@ public class Session
         }
         else
         {
-            final long timeInNs = timeInNs();
-            final Action action = validateRequiredFieldsAndCodec(
+            return validateRequiredFieldsAndCodec(
                 msgSeqNo, timeInNs, msgType, msgTypeLength, sendingTime, origSendingTime, possDup, position);
-            if (action != null)
-            {
-                return action;
-            }
-
-            return checkSeqNoChange(msgSeqNo, timeInNs, isPossDupOrResend, position);
         }
     }
 
@@ -1290,7 +1387,12 @@ public class Session
     {
         messageInfo.isValid(false);
 
-        return inboundPublication.saveRedactSequenceUpdate(id, lastReceivedMsgSeqNum, position) < 0;
+        return saveRedact(position, lastReceivedMsgSeqNum) < 0;
+    }
+
+    private long saveRedact(final long position, final int lastReceivedMsgSeqNum)
+    {
+        return inboundPublication.saveRedactSequenceUpdate(id, lastReceivedMsgSeqNum, position);
     }
 
     private Action checkPosition(final long position)
@@ -1363,7 +1465,7 @@ public class Session
 
         if (state() == initialState())
         {
-            // Initial income connection logic
+            // Initial incoming connection logic
             final int expectedMsgSeqNo = expectedReceivedSeqNum();
             if (expectedMsgSeqNo == msgSeqNum)
             {
@@ -1372,6 +1474,12 @@ public class Session
                 if (action == ABORT)
                 {
                     return ABORT;
+                }
+
+                if (proxy.seqNumResetRequested())
+                {
+                    lastReceivedMsgSeqNum = 0;
+                    nextSequenceIndex(logonTimeInNs);
                 }
 
                 // Don't configure this session as active until successful outbound publication
@@ -1399,9 +1507,9 @@ public class Session
                 final boolean requestSeqNumReset = proxy.seqNumResetRequested();
                 if (requestSeqNumReset) // if we requested sequence number reset then do not await for replay
                 {
-                    lastReceivedMsgSeqNum = 0; // TODO: should this not be msgSeqNum?
+                    lastReceivedMsgSeqNum = 0;
                     setupCompleteLogonStateReset(logonTimeInNs, heartbeatIntervalInS, username, password, timeInNs());
-
+                    nextSequenceIndex(logonTimeInNs); // reset asked so reset
                     return CONTINUE;
                 }
                 else
@@ -1444,9 +1552,14 @@ public class Session
         final long logonTimeInNs,
         final int msgSeqNo)
     {
-        // if we have just received a reset request and not a response to one we just sent.
-        if (lastSentMsgSeqNum() != INITIAL_SEQUENCE_NUMBER)
+        if (awaitingLogonReply || lastSentMsgSeqNum == INITIAL_SEQUENCE_NUMBER)
         {
+            lastReceivedMsgSeqNumOnly(msgSeqNo);
+            awaitingLogonReply(false);
+        }
+        else
+        {
+            // if we have just received a reset request and not a response to one we just sent.
             final int logonSequenceIndex = isInitialRequest() ? sequenceIndex() : sequenceIndex() + 1;
             final long position = proxy.sendLogon(INITIAL_SEQUENCE_NUMBER, heartbeatInterval,
                 null,
@@ -1465,10 +1578,6 @@ public class Session
             lastReceivedMsgSeqNum(msgSeqNo);
             lastLogonTimeInNs(logonTimeInNs);
             lastSequenceResetTimeInNs(logonTimeInNs);
-        }
-        else
-        {
-            lastReceivedMsgSeqNumOnly(msgSeqNo);
         }
 
         // logon time becomes time of the confirmation message.
@@ -1803,18 +1912,29 @@ public class Session
         final int messageOffset,
         final int messageLength)
     {
-        final Action action = onMessage(
+        final long timeInNs = timeInNs();
+        final Action action = checkStateAndValidateMessage(
             msgSeqNum,
+            timeInNs,
             RESEND_REQUEST_MESSAGE_TYPE_CHARS,
+            RESEND_REQUEST_MESSAGE_TYPE_CHARS.length,
             sendingTime,
             origSendingTime,
             isPossDupOrResend,
             possDup,
             position);
 
-        if (action == ABORT || !messageInfo.isValid())
+        // validate here, so that out of sequence resendrequest is executed
+        // can't rely on own resend request
+        if (action != null || !messageInfo.isValid())
         {
             return action;
+        }
+
+        final Action checkSeqAction = checkNormalSeqNoChange(msgSeqNum, timeInNs, isPossDupOrResend, position);
+        if (checkSeqAction == ABORT)
+        {
+            return checkSeqAction;
         }
 
         final boolean replayUpToMostRecent = endSeqNum == Replayer.MOST_RECENT_MESSAGE;
@@ -1824,12 +1944,15 @@ public class Session
             // Just an invalid range.
             if (endSeqNum < beginSeqNum)
             {
-                final String message = messageBuffer.getAscii(messageOffset, messageLength);
-                throw new IllegalStateException(String.format(
-                    "[%s] Error in resend request, endSeqNo (%d) < beginSeqNo (%d)",
-                    message,
-                    endSeqNum,
-                    beginSeqNum));
+                return checkPosition(proxy.sendReject(
+                    newSentSeqNum(),
+                    msgSeqNum,
+                    END_SEQ_NO,
+                    RESEND_REQUEST_MESSAGE_TYPE_CHARS,
+                    RESEND_REQUEST_MESSAGE_TYPE_CHARS.length,
+                    VALUE_IS_INCORRECT.representation(),
+                    sequenceIndex(),
+                    lastMsgSeqNumProcessed));
             }
 
             // begin too high - reject
@@ -2322,6 +2445,11 @@ public class Session
         this.enableLastMsgSeqNumProcessed = enableLastMsgSeqNumProcessed;
     }
 
+    void awaitingLogonReply(final boolean awaitingLogonReply)
+    {
+        this.awaitingLogonReply = awaitingLogonReply;
+    }
+
     OnMessageInfo messageInfo()
     {
         return messageInfo;
@@ -2353,5 +2481,10 @@ public class Session
     boolean areCountersClosed()
     {
         return sentMsgSeqNo.isClosed() || receivedMsgSeqNo.isClosed();
+    }
+
+    void isSlowConsumer(final boolean hasBecomeSlow)
+    {
+        this.isSlowConsumer = hasBecomeSlow;
     }
 }

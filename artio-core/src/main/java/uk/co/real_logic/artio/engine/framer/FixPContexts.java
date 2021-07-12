@@ -246,6 +246,11 @@ public class FixPContexts implements SessionContexts
             context.onEndSequence();
             updateContext(context);
         }
+        else
+        {
+            errorHandler.onError(new IllegalArgumentException(
+                "Unable to reset sequence number for " + sessionId + " unknown session"));
+        }
     }
 
     public boolean isKnownSessionId(final long sessionId)
@@ -253,7 +258,7 @@ public class FixPContexts implements SessionContexts
         return lookupContext(sessionId) != null;
     }
 
-    private FixPContext lookupContext(final long sessionId)
+    FixPContext lookupContext(final long sessionId)
     {
         final Iterator<Map.Entry<FixPKey, FixPContext>> it = keyToContext.entrySet().iterator();
         while (it.hasNext())

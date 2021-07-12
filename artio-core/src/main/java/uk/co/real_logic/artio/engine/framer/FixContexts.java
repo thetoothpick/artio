@@ -357,7 +357,7 @@ public class FixContexts implements SessionContexts
                         .wrap(buffer, filePosition)
                         .sessionId(sessionId)
                         .sequenceIndex(sequenceIndex)
-                        .logonTime(context.lastLogonTime())
+                        .logonTime(context.lastLogonTimeInNs())
                         .lastSequenceResetTime(context.lastSequenceResetTime())
                         .compositeKeyLength(compositeKeyLength)
                         .lastFixDictionary(fixDictionaryName);
@@ -380,13 +380,23 @@ public class FixContexts implements SessionContexts
         return fixDictionary.getClass().getName();
     }
 
-    public void sequenceReset(final long sessionId, final long resetTime)
+    public void sequenceReset(final long sessionId, final long resetTimeInNs)
     {
         final Entry<CompositeKey, SessionContext> entry = lookupById(sessionId);
         if (entry != null)
         {
             final SessionContext context = entry.getValue();
-            context.onSequenceReset(resetTime);
+            context.onSequenceReset(resetTimeInNs);
+        }
+    }
+
+    public void onSequenceIndex(final long sessionId, final long resetTimeInNs, final int sequenceIndex)
+    {
+        final Entry<CompositeKey, SessionContext> entry = lookupById(sessionId);
+        if (entry != null)
+        {
+            final SessionContext context = entry.getValue();
+            context.onSequenceIndex(resetTimeInNs, sequenceIndex);
         }
     }
 
@@ -471,7 +481,7 @@ public class FixContexts implements SessionContexts
         {
             sessionIdEncoder
                 .sequenceIndex(context.sequenceIndex())
-                .logonTime(context.lastLogonTime())
+                .logonTime(context.lastLogonTimeInNs())
                 .lastSequenceResetTime(context.lastSequenceResetTime());
 
             updateSectorChecksum(filePosition);

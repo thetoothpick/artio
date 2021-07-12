@@ -15,25 +15,33 @@
  */
 package uk.co.real_logic.artio.system_tests;
 
+import org.agrona.collections.IntArrayList;
 import org.agrona.concurrent.status.ReadablePosition;
+import org.hamcrest.Matchers;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 import uk.co.real_logic.artio.*;
+import uk.co.real_logic.artio.builder.ExecutionReportEncoder;
 import uk.co.real_logic.artio.builder.ResendRequestEncoder;
 import uk.co.real_logic.artio.builder.TestRequestEncoder;
 import uk.co.real_logic.artio.engine.EngineConfiguration;
 import uk.co.real_logic.artio.engine.FixEngine;
+import uk.co.real_logic.artio.fields.UtcTimestampEncoder;
 import uk.co.real_logic.artio.library.DynamicLibraryScheduler;
+import uk.co.real_logic.artio.messages.MessageStatus;
 import uk.co.real_logic.artio.messages.SessionReplyStatus;
 import uk.co.real_logic.artio.session.Session;
 import uk.co.real_logic.artio.session.SessionWriter;
 
 import java.io.File;
 import java.io.IOException;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.Arrays;
 import java.util.function.Consumer;
+import java.util.function.LongSupplier;
 
-import static io.aeron.logbuffer.ControlledFragmentHandler.Action.CONTINUE;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.greaterThan;
 import static org.hamcrest.Matchers.lessThan;
@@ -53,6 +61,9 @@ import static uk.co.real_logic.artio.validation.SessionPersistenceStrategy.alway
 
 public class PersistentSequenceNumberGatewayToGatewaySystemTest extends AbstractGatewayToGatewaySystemTest
 {
+    private static final DateTimeFormatter FORMATTER =
+        DateTimeFormatter.ofPattern("yyyyMMdd-HH:mm:ss[.nnn]");
+
     private static final int HIGH_INITIAL_SEQUENCE_NUMBER = 1000;
     private static final int DOES_NOT_MATTER = -1;
     private static final int DEFAULT_SEQ_NUM_AFTER = 4;
@@ -81,6 +92,8 @@ public class PersistentSequenceNumberGatewayToGatewaySystemTest extends Abstract
     private boolean dirsDeleteOnStart = true;
 
     private TimeRange firstConnectTimeRange;
+
+    private IntArrayList resendMsgSeqNums = new IntArrayList();
 
     @Before
     public void setUp() throws IOException
@@ -323,7 +336,7 @@ public class PersistentSequenceNumberGatewayToGatewaySystemTest extends Abstract
         final int messageCount = 100;
         for (int i = 0; i < messageCount; i++)
         {
-            assertEquals(CONTINUE, reportFactory.trySendReport(acceptingSession, Side.BUY));
+            reportFactory.sendReport(testSystem, acceptingSession, Side.BUY);
         }
 
         final int lastSeqNum = messageCount + 1;
@@ -473,21 +486,19 @@ public class PersistentSequenceNumberGatewayToGatewaySystemTest extends Abstract
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void shouldStoreAndForwardMessagesSentWhilstOfflineWithFollowerSession()
     {
-        printErrorMessages = true;
+        printErrorMessages = false;
 
         launch(this::nothing);
 
-        final int libraryId = acceptingLibrary.libraryId();
-        final ReadablePosition positionCounter = testSystem.awaitCompletedReply(
-            acceptingEngine.libraryIndexedPosition(libraryId)).resultIfPresent();
+        final ReadablePosition positionCounter = testSystem.libraryPosition(acceptingEngine, acceptingLibrary);
 
         final SessionWriter sessionWriter = createFollowerSession(TEST_TIMEOUT_IN_MS);
 
-        final long position = sendReportOnFollowerSession(testSystem, sessionWriter);
-
-        testSystem.await("Failed to complete index", () -> positionCounter.getVolatile() >= position);
+        sendReportsOnFollowerSession(testSystem, sessionWriter, positionCounter);
 
         receivedReplayFromReconnectedSession();
+
+        logoutInitiatingSession();
     }
 
     @Test(timeout = TEST_TIMEOUT_IN_MS)
@@ -495,6 +506,35 @@ public class PersistentSequenceNumberGatewayToGatewaySystemTest extends Abstract
     {
         printErrorMessages = false;
 
+        resetSomeSequenceNumbersOfOfflineSessions(
+            () -> acceptingSession.trySendSequenceReset(1, 1),
+            1,
+            1);
+    }
+
+    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    public void shouldResetSequenceNumbersOfOfflineSessionsWithResetSequenceNumbers()
+    {
+        resetSomeSequenceNumbersOfOfflineSessions(
+            () -> acceptingSession.tryResetSequenceNumbers(),
+            1,
+            1);
+    }
+
+    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    public void shouldResetReceivedSequenceNumbersOfOfflineSessions()
+    {
+        resetSomeSequenceNumbersOfOfflineSessions(
+            () -> acceptingSession.tryUpdateLastReceivedSequenceNumber(0),
+            4,
+            4);
+    }
+
+    private void resetSomeSequenceNumbersOfOfflineSessions(
+        final LongSupplier resetSeqNums,
+        final int logonSequenceNumber,
+        final int initiatorInitialReceivedSequenceNumber)
+    {
         launch(this::nothing);
         connectPersistingSessions();
         assertEquals(0, acceptingSession.sequenceIndex());
@@ -508,21 +548,23 @@ public class PersistentSequenceNumberGatewayToGatewaySystemTest extends Abstract
         final int acceptorSequenceNumber = acceptingSession.lastSentMsgSeqNum() + 1;
         cannotConnectWithSequence(acceptorSequenceNumber, 1);
 
+        final ReadablePosition positionCounter = testSystem.libraryPosition(acceptingEngine, acceptingLibrary);
+
         assertEquals(0, acceptingSession.sequenceIndex());
-        assertThat(acceptingSession.trySendSequenceReset(1, 1),
-            greaterThan(0L));
-        assertEquals(1, acceptingSession.sequenceIndex());
+        final long position = testSystem.awaitSend(resetSeqNums);
+        assertThat(acceptingSession, FixMatchers.hasSequenceIndex(1));
+        assertEquals(0, acceptingSession.lastReceivedMsgSeqNum());
 
         initiatingOtfAcceptor.messages().clear();
 
         onAcquireSession = this::nothing;
-        connectPersistingSessions(1, 1, false);
+        testSystem.awaitPosition(positionCounter, position);
+        connectPersistingSessions(1, initiatorInitialReceivedSequenceNumber, false);
 
         final FixMessage logon = initiatingOtfAcceptor.receivedMessage(LOGON_MESSAGE_AS_STR).findFirst().get();
-        assertEquals(1, logon.messageSequenceNumber());
+        assertEquals(logonSequenceNumber, logon.messageSequenceNumber());
 
-        // Ensure that the sequenceIndex is correct after the reset
-        assertEquals(1, acceptingSession.sequenceIndex());
+        assertAcceptingSessionHasSequenceIndex(1);
     }
 
     private void connectPersistingSessions()
@@ -727,7 +769,17 @@ public class PersistentSequenceNumberGatewayToGatewaySystemTest extends Abstract
     {
         assertOfflineSession(sessionId, acceptingSession);
 
-        ReportFactory.sendOneReport(acceptingSession, Side.BUY);
+        final ReportFactory factory = new ReportFactory();
+        factory.sendReport(testSystem, acceptingSession, Side.BUY);
+        resendMsgSeqNums.add(factory.lastMsgSeqNum());
+
+        factory.possDupFlag(PossDupOption.YES);
+        factory.sendReport(testSystem, acceptingSession, Side.BUY);
+        resendMsgSeqNums.add(factory.lastMsgSeqNum());
+
+        factory.possDupFlag(PossDupOption.NO);
+        factory.sendReport(testSystem, acceptingSession, Side.BUY);
+        resendMsgSeqNums.add(factory.lastMsgSeqNum());
 
         receivedReplayFromReconnectedSession();
     }
@@ -737,9 +789,58 @@ public class PersistentSequenceNumberGatewayToGatewaySystemTest extends Abstract
         onAcquireSession = this::nothing;
         connectPersistingSessions();
 
+        for (final int resendMsgSeqNum : resendMsgSeqNums)
+        {
+            assertReceivedReplayedReport(resendMsgSeqNum);
+        }
+    }
+
+    private void assertReceivedReplayedReport(final int msgSeqNum)
+    {
         final FixMessage executionReport = testSystem.awaitMessageOf(
-            initiatingOtfAcceptor, EXECUTION_REPORT_MESSAGE_AS_STR);
+            initiatingOtfAcceptor, EXECUTION_REPORT_MESSAGE_AS_STR, msg -> msg.messageSequenceNumber() == msgSeqNum);
         assertEquals(ReportFactory.MSFT, executionReport.get(SYMBOL));
         assertEquals("Y", executionReport.possDup());
+        assertEquals(executionReport + " has incorrect status", MessageStatus.OK, executionReport.status());
+        assertTrue(executionReport + " was not valid", executionReport.isValid());
+
+        final LocalDateTime sendingTime = LocalDateTime.parse(executionReport.get(SENDING_TIME), FORMATTER);
+        final LocalDateTime origSendingTime = LocalDateTime.parse(executionReport.get(ORIG_SENDING_TIME), FORMATTER);
+        assertThat(origSendingTime, Matchers.lessThan(sendingTime));
+    }
+
+    void sendReportsOnFollowerSession(
+        final TestSystem testSystem,
+        final SessionWriter sessionWriter,
+        final ReadablePosition positionCounter)
+    {
+        sendReportOnFollowerSession(testSystem, sessionWriter, 1, PossDupOption.MISSING_FIELD);
+        sendReportOnFollowerSession(testSystem, sessionWriter, 2, PossDupOption.YES);
+        sendReportOnFollowerSession(testSystem, sessionWriter, 3, PossDupOption.NO);
+        sendReportOnFollowerSession(
+            testSystem, sessionWriter, 4, PossDupOption.NO_WITHOUT_ORIG_SENDING_TIME);
+        final long position = sendReportOnFollowerSession(
+            testSystem, sessionWriter, 5, PossDupOption.YES_WITHOUT_ORIG_SENDING_TIME);
+
+        resendMsgSeqNums.addAll(Arrays.asList(1, 2, 3, 4, 5));
+
+        testSystem.awaitPosition(positionCounter, position);
+    }
+
+    private long sendReportOnFollowerSession(
+        final TestSystem testSystem, final SessionWriter sessionWriter, final int msgSeqNum,
+        final PossDupOption possDupFlag)
+    {
+        final ReportFactory reportFactory = new ReportFactory();
+        reportFactory.possDupFlag(possDupFlag);
+        final ExecutionReportEncoder report = reportFactory.setupReport(Side.BUY, msgSeqNum);
+
+        final UtcTimestampEncoder timestampEncoder = new UtcTimestampEncoder();
+        final long timeInThePast = System.currentTimeMillis() - 100;
+        report.header().senderCompID(ACCEPTOR_ID).targetCompID(INITIATOR_ID)
+            .sendingTime(timestampEncoder.buffer(), timestampEncoder.encode(timeInThePast))
+            .msgSeqNum(msgSeqNum);
+
+        return testSystem.awaitSend("failed to send", () -> sessionWriter.send(report, msgSeqNum));
     }
 }

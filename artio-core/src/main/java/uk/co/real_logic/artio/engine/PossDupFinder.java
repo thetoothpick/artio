@@ -22,7 +22,7 @@ import uk.co.real_logic.artio.otf.MessageControl;
 import uk.co.real_logic.artio.otf.OtfMessageAcceptor;
 import uk.co.real_logic.artio.util.AsciiBuffer;
 
-public class PossDupFinder implements OtfMessageAcceptor
+class PossDupFinder implements OtfMessageAcceptor
 {
     public static final int NO_ENTRY = -1;
 
@@ -34,6 +34,7 @@ public class PossDupFinder implements OtfMessageAcceptor
     private int lengthOfBodyLength;
     private int origSendingTimeOffset;
     private int origSendingTimeLength;
+    private int checkSumOffset;
 
     public MessageControl onNext()
     {
@@ -45,6 +46,7 @@ public class PossDupFinder implements OtfMessageAcceptor
         bodyLength = NO_ENTRY;
         bodyLengthOffset = NO_ENTRY;
         lengthOfBodyLength = NO_ENTRY;
+        checkSumOffset = NO_ENTRY;
         return MessageControl.CONTINUE;
     }
 
@@ -71,6 +73,11 @@ public class PossDupFinder implements OtfMessageAcceptor
                 lengthOfBodyLength = length;
                 bodyLength = buffer.getInt(offset, offset + length);
                 break;
+
+            case SessionConstants.CHECKSUM:
+                checkSumOffset = offset;
+                break;
+
         }
         return MessageControl.CONTINUE;
     }
@@ -109,6 +116,11 @@ public class PossDupFinder implements OtfMessageAcceptor
         return possDupOffset;
     }
 
+    public int checkSumOffset()
+    {
+        return checkSumOffset;
+    }
+
     int sendingTimeEnd()
     {
         return sendingTimeOffset + sendingTimeLength + 1;
@@ -129,7 +141,7 @@ public class PossDupFinder implements OtfMessageAcceptor
         return origSendingTimeOffset;
     }
 
-    public int origSendingTimeLength()
+    int origSendingTimeLength()
     {
         return origSendingTimeLength;
     }

@@ -24,6 +24,7 @@ import uk.co.real_logic.artio.dictionary.FixDictionary;
 import uk.co.real_logic.artio.library.OnMessageInfo;
 import uk.co.real_logic.artio.messages.CancelOnDisconnectOption;
 import uk.co.real_logic.artio.messages.ConnectionType;
+import uk.co.real_logic.artio.messages.DisconnectReason;
 import uk.co.real_logic.artio.messages.SessionState;
 import uk.co.real_logic.artio.protocol.GatewayPublication;
 import uk.co.real_logic.artio.util.EpochFractionClock;
@@ -247,6 +248,7 @@ public class InternalSession extends Session implements AutoCloseable
         fixDictionary(fixDictionary);
         address(address);
         refreshSequenceNumberCounters(counters);
+        awaitingLogonReply(false);
     }
 
     public void lastReceivedMsgSeqNumOnly(final int value)
@@ -313,5 +315,15 @@ public class InternalSession extends Session implements AutoCloseable
         }
 
         return false;
+    }
+
+    public void isSlowConsumer(final boolean hasBecomeSlow)
+    {
+        super.isSlowConsumer(hasBecomeSlow);
+    }
+
+    public long logoutAndDisconnect(final DisconnectReason reason)
+    {
+        return super.logoutAndDisconnect(reason);
     }
 }

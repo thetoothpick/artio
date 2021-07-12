@@ -15,6 +15,7 @@
  */
 package uk.co.real_logic.artio.system_tests;
 
+import org.agrona.ErrorHandler;
 import org.junit.Before;
 import org.junit.Test;
 import uk.co.real_logic.artio.Reply;
@@ -31,14 +32,17 @@ import uk.co.real_logic.artio.fixt.builder.HeaderEncoder;
 import uk.co.real_logic.artio.fixt.builder.LogonEncoder;
 import uk.co.real_logic.artio.library.LibraryConfiguration;
 import uk.co.real_logic.artio.library.SessionConfiguration;
+import uk.co.real_logic.artio.messages.MessageStatus;
 import uk.co.real_logic.artio.other.Constants;
 import uk.co.real_logic.artio.session.Session;
 import uk.co.real_logic.artio.session.SessionCustomisationStrategy;
 
 import static io.aeron.CommonContext.IPC_CHANNEL;
 import static java.util.Collections.singletonList;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.*;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.*;
+import static uk.co.real_logic.artio.MonitoringAgentFactory.none;
 import static uk.co.real_logic.artio.TestFixtures.launchMediaDriver;
 import static uk.co.real_logic.artio.fixt.ApplVerID.FIX50;
 import static uk.co.real_logic.artio.fixt.Constants.APPL_VER_ID;
@@ -48,11 +52,15 @@ public class MultipleFixVersionSystemTest extends AbstractGatewayToGatewaySystem
 {
     private static final String FIXT_ACCEPTOR_LOGS = "fixt-acceptor-logs";
     private static final String FIXT_ACCEPTOR_ID = "fixt-acceptor";
+    private static final Class<FixDictionaryImpl> FIXT_DICTIONARY = FixDictionaryImpl.class;
 
     private static final String OTHER_INITIATOR_ID = "otherInitiator";
+    // Fix 4.4
     private static final Class<? extends FixDictionary> OTHER_FIX_DICTIONARY =
         uk.co.real_logic.artio.other.FixDictionaryImpl.class;
     static final String TEST_VALUE = "test";
+
+    private final ErrorHandler errorHandler = mock(ErrorHandler.class);
 
     private Session fixtInitiatingSession;
     private Session fixtAcceptingSession;
@@ -64,11 +72,19 @@ public class MultipleFixVersionSystemTest extends AbstractGatewayToGatewaySystem
         delete(FIXT_ACCEPTOR_LOGS);
 
         mediaDriver = launchMediaDriver();
+    }
 
-        launchMultiVersionAcceptingEngine();
+    private void launchArtio()
+    {
+        launchArtio(true);
+    }
+
+    private void launchArtio(final boolean printErrorMessages)
+    {
+        launchMultiVersionAcceptingEngine(printErrorMessages);
         initiatingEngine = launchInitiatingEngine(libraryAeronPort, nanoClock);
 
-        connectMultiVersionAcceptingLibrary();
+        connectMultiVersionAcceptingLibrary(printErrorMessages);
 
         final LibraryConfiguration configuration = initiatingLibraryConfig(
             libraryAeronPort, initiatingHandler, nanoClock);
@@ -78,7 +94,7 @@ public class MultipleFixVersionSystemTest extends AbstractGatewayToGatewaySystem
         testSystem = new TestSystem(acceptingLibrary, acceptingLibrary, initiatingLibrary);
     }
 
-    private void connectMultiVersionAcceptingLibrary()
+    private void connectMultiVersionAcceptingLibrary(final boolean printErrorMessages)
     {
         final LibraryConfiguration configuration = new LibraryConfiguration();
 
@@ -89,10 +105,16 @@ public class MultipleFixVersionSystemTest extends AbstractGatewayToGatewaySystem
             .libraryName("accepting")
             .sessionCustomisationStrategy(new FixTSessionCustomisationStrategy(FIX50));
 
+        if (!printErrorMessages)
+        {
+            configuration.monitoringAgentFactory(none());
+            configuration.errorHandlerFactory(errorBuffer -> errorHandler);
+        }
+
         acceptingLibrary = connect(configuration);
     }
 
-    private void launchMultiVersionAcceptingEngine()
+    private void launchMultiVersionAcceptingEngine(final boolean printErrorMessages)
     {
         final EngineConfiguration configuration = new EngineConfiguration();
         final EngineConfiguration acceptingConfiguration = configuration
@@ -108,12 +130,20 @@ public class MultipleFixVersionSystemTest extends AbstractGatewayToGatewaySystem
             .overrideAcceptorFixDictionary(FixDictionaryImpl.class)
             .sessionCustomisationStrategy(new FixTSessionCustomisationStrategy(FIX50));
 
+        if (!printErrorMessages)
+        {
+            configuration.monitoringAgentFactory(none());
+            configuration.errorHandlerFactory(errorBuffer -> errorHandler);
+        }
+
         acceptingEngine = FixEngine.launch(acceptingConfiguration);
     }
 
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void shouldBeAbleToSendMessagesFromInitiatorToBothAcceptors()
     {
+        launchArtio();
+
         connectSessions();
         connectFixTSessions();
 
@@ -123,6 +153,8 @@ public class MultipleFixVersionSystemTest extends AbstractGatewayToGatewaySystem
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void shouldBeAbleToAquireSessions()
     {
+        launchArtio();
+
         connectSessions();
         acquireAcceptingSession();
 
@@ -144,6 +176,8 @@ public class MultipleFixVersionSystemTest extends AbstractGatewayToGatewaySystem
     @Test(timeout = TEST_TIMEOUT_IN_MS)
     public void shouldBeAbleToAcceptAFixVersionBasedUponLogonMessage()
     {
+        launchArtio();
+
         connectOtherSession();
 
         messagesCanBeExchanged();
@@ -158,6 +192,38 @@ public class MultipleFixVersionSystemTest extends AbstractGatewayToGatewaySystem
         initiatingOtfAcceptor.messages().forEach(this::assertHasTestField);
     }
 
+    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    public void shouldHandleIncorrectFixVersionsGracefully()
+    {
+        // Test that if a session connects with a different FIX version than expected that no random exceptions
+        // Are thrown or stalls occur.
+
+        launchArtio(false);
+
+        final Class<? extends FixDictionary> defaultDictionary = FixDictionary.findDefault();
+        connectFixTSessions(defaultDictionary);
+
+        assertMessagesOfInvalidTypeAreRejected();
+
+        clearMessages();
+        acquireFixTSession();
+
+        assertMessagesOfInvalidTypeAreRejected();
+
+        verify(errorHandler, times(2)).onError(any());
+    }
+
+    private void assertMessagesOfInvalidTypeAreRejected()
+    {
+        final FixDictionaryImpl fixtDictionary = new FixDictionaryImpl();
+        final String testReqID = testReqId();
+        sendTestRequest(fixtInitiatingSession, testReqID, fixtDictionary);
+        final FixMessage reject = testSystem.awaitMessageOf(initiatingOtfAcceptor, Constants.REJECT_MESSAGE_AS_STR);
+        final String rejectStr = reject.toString();
+        assertTrue(rejectStr, reject.isValid());
+        assertEquals(rejectStr, MessageStatus.OK, reject.status());
+    }
+
     private void assertHasTestField(final FixMessage msg)
     {
         assertEquals(msg.toString(), TEST_VALUE, msg.get(Constants.TEST_FIELD));
@@ -170,12 +236,17 @@ public class MultipleFixVersionSystemTest extends AbstractGatewayToGatewaySystem
 
     private void connectOtherSession()
     {
+        connectOtherSession(OTHER_FIX_DICTIONARY);
+    }
+
+    private void connectOtherSession(final Class<? extends FixDictionary> fixDictionary)
+    {
         final SessionConfiguration config = SessionConfiguration.builder()
             .address("localhost", port)
             .credentials(USERNAME, PASSWORD)
             .senderCompId(OTHER_INITIATOR_ID)
             .targetCompId(ACCEPTOR_ID)
-            .fixDictionary(OTHER_FIX_DICTIONARY)
+            .fixDictionary(fixDictionary)
             .build();
 
         final Reply<Session> reply = initiatingLibrary.initiate(config);
@@ -185,14 +256,17 @@ public class MultipleFixVersionSystemTest extends AbstractGatewayToGatewaySystem
     private void bothSessionsCanExchangeMessages()
     {
         messagesCanBeExchanged();
+        fixTMessagesCanBeExchanged();
 
+        assertHeaderHasApplVerId(initiatingOtfAcceptor);
+    }
+
+    private void fixTMessagesCanBeExchanged()
+    {
         final FixDictionaryImpl fixtDictionary = new FixDictionaryImpl();
-
         final String testReqID = testReqId();
         sendTestRequest(fixtInitiatingSession, testReqID, fixtDictionary);
         assertReceivedSingleHeartbeat(testSystem, initiatingOtfAcceptor, testReqID);
-
-        assertHeaderHasApplVerId(initiatingOtfAcceptor);
     }
 
     private void assertHeaderHasApplVerId(final FakeOtfAcceptor acceptor)
@@ -215,12 +289,17 @@ public class MultipleFixVersionSystemTest extends AbstractGatewayToGatewaySystem
 
     private void connectFixTSessions()
     {
+        connectFixTSessions(FIXT_DICTIONARY);
+    }
+
+    private void connectFixTSessions(final Class<? extends FixDictionary> fixDictionary)
+    {
         final SessionConfiguration config = SessionConfiguration.builder()
             .address("localhost", port)
             .credentials(USERNAME, PASSWORD)
             .senderCompId(INITIATOR_ID)
             .targetCompId(FIXT_ACCEPTOR_ID)
-            .fixDictionary(FixDictionaryImpl.class)
+            .fixDictionary(fixDictionary)
             .build();
 
         final Reply<Session> reply = initiatingLibrary.initiate(config);

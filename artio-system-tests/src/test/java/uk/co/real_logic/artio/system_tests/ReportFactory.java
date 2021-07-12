@@ -22,40 +22,53 @@ import uk.co.real_logic.artio.OrdStatus;
 import uk.co.real_logic.artio.Pressure;
 import uk.co.real_logic.artio.Side;
 import uk.co.real_logic.artio.builder.ExecutionReportEncoder;
+import uk.co.real_logic.artio.builder.HeaderEncoder;
+import uk.co.real_logic.artio.fields.UtcTimestampEncoder;
 import uk.co.real_logic.artio.session.Session;
 
-import static io.aeron.logbuffer.ControlledFragmentHandler.Action.CONTINUE;
 import static java.nio.charset.StandardCharsets.US_ASCII;
-import static org.junit.Assert.assertEquals;
 
 public class ReportFactory
 {
+
     private static final int SIZE_OF_ASCII_LONG = String.valueOf(Long.MAX_VALUE).length();
     public static final String MSFT = "MSFT";
 
     private final ExecutionReportEncoder executionReport = new ExecutionReportEncoder();
     private final byte[] encodeBuffer = new byte[SIZE_OF_ASCII_LONG];
     private final UnsafeBuffer encoder = new UnsafeBuffer(encodeBuffer);
+    private final UtcTimestampEncoder timestamp = new UtcTimestampEncoder();
 
-    public Action trySendReport(final Session session, final Side side)
+    private PossDupOption possDupFlag = PossDupOption.MISSING_FIELD;
+
+    public Action trySendReportAct(final Session session, final Side side)
     {
         setupReport(side, session.lastSentMsgSeqNum());
 
         return Pressure.apply(session.trySend(executionReport));
     }
 
-    public void sendReport(final Session session, final Side side)
+    public long trySendReport(final Session session, final Side side)
     {
-        assertEquals(CONTINUE, trySendReport(session, side));
+        setupReport(side, session.lastSentMsgSeqNum());
+
+        return session.trySend(executionReport);
     }
 
-    public static void sendOneReport(final Session session, final Side side)
+    public void sendReport(final TestSystem testSystem, final Session session, final Side side)
     {
-        new ReportFactory().sendReport(session, side);
+        testSystem.awaitSend(() -> trySendReport(session, Side.SELL));
+    }
+
+    public static void sendOneReport(final TestSystem testSystem, final Session session, final Side side)
+    {
+        new ReportFactory().sendReport(testSystem, session, side);
     }
 
     public ExecutionReportEncoder setupReport(final Side side, final int execAndOrderId)
     {
+        executionReport.reset();
+
         final int encodedLength = encoder.putLongAscii(0, execAndOrderId);
 
         executionReport.orderID(encodeBuffer, encodedLength)
@@ -68,6 +81,39 @@ public class ReportFactory
 
         executionReport.instrument().symbol(MSFT.getBytes(US_ASCII));
 
+        final HeaderEncoder header = executionReport.header();
+
+        switch (possDupFlag)
+        {
+            case YES:
+            case YES_WITHOUT_ORIG_SENDING_TIME:
+                header.possDupFlag(true);
+                break;
+
+            case NO:
+            case NO_WITHOUT_ORIG_SENDING_TIME:
+                header.possDupFlag(false);
+                break;
+        }
+
+        switch (possDupFlag)
+        {
+            case YES:
+            case NO:
+                header.origSendingTime(timestamp.buffer(), timestamp.encode(System.currentTimeMillis()));
+                break;
+        }
+
         return executionReport;
+    }
+
+    public int lastMsgSeqNum()
+    {
+        return executionReport.header().msgSeqNum();
+    }
+
+    public void possDupFlag(final PossDupOption possDupFlag)
+    {
+        this.possDupFlag = possDupFlag;
     }
 }
