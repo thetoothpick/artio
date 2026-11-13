@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -45,9 +45,9 @@ import java.util.List;
 public class FramerContext
 {
     private static final int ADMIN_COMMAND_CAPACITY = 64;
+    private static final String ADMIN_ENGINE_SUBSCRIPTION_ALIAS = "adminEngineSubscription";
 
     private final QueuedPipe<AdminCommand> adminCommands = new ManyToOneConcurrentArrayQueue<>(ADMIN_COMMAND_CAPACITY);
-    private final SystemEpochClock epochClock = new SystemEpochClock();
 
     private final Framer framer;
 
@@ -60,13 +60,14 @@ public class FramerContext
     private final FixContexts fixContexts;
     private final FixPContexts fixPContexts;
 
+    private volatile boolean startingClose = false;
+
     public FramerContext(
         final EngineConfiguration configuration,
         final FixCounters fixCounters,
         final EngineContext engineContext,
         final ErrorHandler errorHandler,
         final Image replayImage,
-        final Image slowReplayImage,
         final EngineTimers timers,
         final AgentInvoker conductorAgentInvoker,
         final RecordingCoordinator recordingCoordinator,
@@ -75,12 +76,14 @@ public class FramerContext
         this.configuration = configuration;
 
         final SessionIdStrategy sessionIdStrategy = configuration.sessionIdStrategy();
+        final SessionIdGenerator sessionIdGenerator = configuration.sessionIdGenerator();
 
         final IdleStrategy idleStrategy = configuration.framerIdleStrategy();
         final Streams outboundLibraryStreams = engineContext.outboundLibraryStreams();
 
         this.fixContexts = new FixContexts(
-            configuration.sessionIdBuffer(), sessionIdStrategy, configuration.initialSequenceIndex(), errorHandler);
+            configuration.sessionIdBuffer(), sessionIdStrategy, configuration.initialSequenceIndex(), errorHandler,
+            configuration.isReproductionEnabled(), sessionIdGenerator);
         this.fixPContexts = new FixPContexts(
             configuration.fixPIdBuffer(),
             errorHandler,
@@ -100,8 +103,11 @@ public class FramerContext
             configuration.receivedSequenceNumberBuffer(), errorHandler, recordingCoordinator.framerInboundLookup(),
             null);
 
+        final ReproductionLogWriter reproductionLogWriter = reproductionLogWriter(outboundLibraryStreams);
+
         final FixEndPointFactory endPointFactory;
-        if (configuration.acceptsBinaryEntryPoint())
+        final SystemEpochClock epochClock = new SystemEpochClock();
+        if (configuration.acceptsFixP())
         {
             gatewaySessions = new FixPGatewaySessions(
                 epochClock,
@@ -135,6 +141,7 @@ public class FramerContext
                 configuration,
                 fixContexts,
                 inboundPublication,
+                reproductionLogWriter,
                 fixCounters,
                 errorHandler,
                 (FixGatewaySessions)gatewaySessions,
@@ -154,11 +161,8 @@ public class FramerContext
             endPointFactory,
             engineContext.outboundLibrarySubscription(
                 "outboundLibrarySubscription", finalImagePositions),
-            engineContext.outboundLibrarySubscription(
-                "outboundSlowSubscription", null),
             replayImage,
-            slowReplayImage,
-            engineContext.inboundReplayQuery(),
+            engineContext.inboundReplayQuery(false),
             outboundPublication,
             inboundPublication,
             this.adminCommands,
@@ -172,19 +176,38 @@ public class FramerContext
             engineContext.inboundCompletionPosition(),
             engineContext.outboundLibraryCompletionPosition(),
             finalImagePositions,
-            conductorAgentInvoker,
             recordingCoordinator,
             fixPContexts,
             aeron.countersReader(),
-            engineContext.outboundIndexRegistrationId());
+            engineContext.inboundIndexRegistrationId(),
+            engineContext.outboundIndexRegistrationId(),
+            fixCounters,
+            engineContext.senderSequenceNumbers(),
+            conductorAgentInvoker,
+            reproductionLogWriter);
+    }
+
+    private ReproductionLogWriter reproductionLogWriter(final Streams outboundLibraryStreams)
+    {
+        if (configuration.writeReproductionLog())
+        {
+            return new ReproductionLogWriter(outboundLibraryStreams.reproductionPublication());
+        }
+        else
+        {
+            return null;
+        }
     }
 
     private Subscription newAdminEngineSubscription(final Aeron aeron)
     {
+        final String channel = new ChannelUriStringBuilder(configuration.libraryAeronChannel())
+            .alias(ADMIN_ENGINE_SUBSCRIPTION_ALIAS)
+            .build();
         final Subscription adminEngineSubscription = aeron.addSubscription(
-            configuration.libraryAeronChannel(), configuration.outboundAdminStream());
+            channel, configuration.outboundAdminStream());
         StreamInformation.print(
-            "adminEngineSubscription", adminEngineSubscription, configuration.printAeronStreamIdentifiers());
+            ADMIN_ENGINE_SUBSCRIPTION_ALIAS, adminEngineSubscription, configuration.printAeronStreamIdentifiers());
         return adminEngineSubscription;
     }
 
@@ -194,7 +217,7 @@ public class FramerContext
         final ExclusivePublication adminDataPublication = aeron.addExclusivePublication(
             configuration.libraryAeronChannel(), configuration.inboundAdminStream());
         StreamInformation.print(
-            "adminEngineSubscription", adminDataPublication, configuration.printAeronStreamIdentifiers());
+            "adminEnginePublication", adminDataPublication, configuration.printAeronStreamIdentifiers());
         return new AdminReplyPublication(
             adminDataPublication,
             fixCounters.failedAdminReplyPublications(),
@@ -224,12 +247,13 @@ public class FramerContext
         final ResetSequenceNumberCommand reply = new ResetSequenceNumberCommand(
             sessionId,
             gatewaySessions,
-            configuration.acceptsBinaryEntryPoint() ? fixPContexts : fixContexts,
+            configuration.acceptsFixP() ? fixPContexts : fixContexts,
             receivedSequenceNumberIndex,
             sentSequenceNumberIndex,
             inboundPublication,
             outboundPublication,
-            configuration.epochNanoClock().nanoTime());
+            configuration.epochNanoClock(),
+            configuration.replyTimeoutInMs());
 
         if (adminCommands.offer(reply))
         {
@@ -274,6 +298,8 @@ public class FramerContext
             idleStrategy.idle();
         }
         idleStrategy.reset();
+
+        startingClose = true;
 
         while (!command.hasCompleted())
         {
@@ -360,6 +386,56 @@ public class FramerContext
     {
         final PositionRequestCommand command = new PositionRequestCommand(
             libraryId);
+
+        if (adminCommands.offer(command))
+        {
+            return command;
+        }
+
+        return null;
+    }
+
+    // Called on replayer thread
+    public void resetOutboundReplayQuery(final long fixSessionId)
+    {
+        if (startingClose)
+        {
+            return;
+        }
+
+        final ResetReplayQueryCommand command = new ResetReplayQueryCommand(fixSessionId);
+
+        final IdleStrategy idleStrategy = configuration.archiverIdleStrategy();
+        // Need to poll the scheduler here in case we're in low resource mode where this blocking poll will
+        // block the framer thread
+        final EngineScheduler scheduler = configuration.scheduler();
+
+        while (!adminCommands.offer(command) && !startingClose)
+        {
+            idleStrategy.idle(scheduler.pollFramer());
+        }
+        idleStrategy.reset();
+
+        while (!command.isDone() && !startingClose)
+        {
+            idleStrategy.idle(scheduler.pollFramer());
+        }
+        idleStrategy.reset();
+    }
+
+    public Reply<?> startReproduction()
+    {
+        final StartReproduction command = new StartReproduction();
+        while (!offer(command) && !startingClose)
+        {
+            Thread.yield();
+        }
+        return command;
+    }
+
+    public Reply<EngineStreamInfo> engineStreamInfo()
+    {
+        final EngineStreamInfoRequestCommand command = new EngineStreamInfoRequestCommand();
 
         if (adminCommands.offer(command))
         {

@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,7 +22,9 @@ import org.agrona.nio.TransportPoller;
 import uk.co.real_logic.artio.messages.DisconnectReason;
 
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.nio.channels.SelectionKey;
+import java.nio.channels.Selector;
 import java.util.Arrays;
 import java.util.function.LongConsumer;
 import java.util.stream.Stream;
@@ -32,6 +34,46 @@ import static uk.co.real_logic.artio.messages.DisconnectReason.ENGINE_SHUTDOWN;
 
 class ReceiverEndPoints extends TransportPoller
 {
+    public static final String ARTIO_ITERATION_THRESHOLD_PROP_NAME = "fix.core.iteration.threshold";
+
+    public static final int ARTIO_ITERATION_THRESHOLD = Integer.getInteger(
+        ARTIO_ITERATION_THRESHOLD_PROP_NAME, ITERATION_THRESHOLD_DEFAULT);
+
+    // FIXME: >> A temporary workaround to the recursive poll problem
+    private static final Field SELECTED_KEYS_FIELD;
+    private static final Field PUBLIC_SELECTED_KEYS_FIELD;
+    static
+    {
+        Field selectKeysField = null;
+        Field publicSelectKeysField = null;
+
+        try (Selector selector = Selector.open())
+        {
+            final Class<?> clazz = Class.forName("sun.nio.ch.SelectorImpl", false, ClassLoader.getSystemClassLoader());
+
+            if (clazz.isAssignableFrom(selector.getClass()))
+            {
+                selectKeysField = clazz.getDeclaredField("selectedKeys");
+                selectKeysField.setAccessible(true);
+
+                publicSelectKeysField = clazz.getDeclaredField("publicSelectedKeys");
+                publicSelectKeysField.setAccessible(true);
+            }
+        }
+        catch (final Exception ex)
+        {
+            LangUtil.rethrowUnchecked(ex);
+        }
+        finally
+        {
+            SELECTED_KEYS_FIELD = selectKeysField;
+            PUBLIC_SELECTED_KEYS_FIELD = publicSelectKeysField;
+        }
+    }
+
+    private final NioSelectedKeySet selectedKeySet = new NioSelectedKeySet();
+    // FIXME: << temporary workaround
+
     private final ErrorHandler errorHandler;
 
     // Authentication flow requires periodic polling of the receiver end points until the authentication is
@@ -45,26 +87,45 @@ class ReceiverEndPoints extends TransportPoller
     ReceiverEndPoints(final ErrorHandler errorHandler)
     {
         this.errorHandler = errorHandler;
+
+        // FIXME: A temporary workaround using legacy Selector hacks
+        try
+        {
+            SELECTED_KEYS_FIELD.set(selector, selectedKeySet);
+            PUBLIC_SELECTED_KEYS_FIELD.set(selector, selectedKeySet);
+        }
+        catch (final Exception ex)
+        {
+            throw new RuntimeException(ex);
+        }
     }
 
     void add(final ReceiverEndPoint endPoint)
     {
         if (endPoint.requiresAuthentication())
         {
-            requiredPollingEndPoints = ArrayUtil.add(requiredPollingEndPoints, endPoint);
+            addToRequiredPollingEndpoints(endPoint);
         }
         else
         {
-            addToNormalEndpoints(endPoint);
+            addToNormalEndpoints(endPoint, true);
         }
     }
 
-    private void addToNormalEndpoints(final ReceiverEndPoint endPoint)
+    private void addToRequiredPollingEndpoints(final ReceiverEndPoint endPoint)
+    {
+        requiredPollingEndPoints = ArrayUtil.add(requiredPollingEndPoints, endPoint);
+    }
+
+    private void addToNormalEndpoints(final ReceiverEndPoint endPoint, final boolean register)
     {
         try
         {
             endPoints = ArrayUtil.add(endPoints, endPoint);
-            endPoint.register(selector);
+            if (register)
+            {
+                endPoint.register(selector);
+            }
         }
         catch (final IOException ex)
         {
@@ -90,7 +151,26 @@ class ReceiverEndPoints extends TransportPoller
         selectNowToForceProcessing();
     }
 
-    void receiverEndPointPollingOptional(final long connectionId)
+    void receiverEndPointPollingRequired(final long connectionId)
+    {
+        final ReceiverEndPoint[] endPoints = this.endPoints;
+        final int index = findEndPoint(connectionId, endPoints);
+        if (index != UNKNOWN_INDEX)
+        {
+            final ReceiverEndPoint endPoint = endPoints[index];
+            this.endPoints = ArrayUtil.remove(endPoints, index);
+
+            addToRequiredPollingEndpoints(endPoint);
+        }
+        else
+        {
+            errorHandler.onError(new Exception(String.format(
+                "Unable to make endpoint required for polling due to it not being found, connectionId=%d",
+                connectionId)));
+        }
+    }
+
+    void receiverEndPointPollingOptional(final long connectionId, final boolean register)
     {
         final ReceiverEndPoint[] requiredPollingEndPoints = this.requiredPollingEndPoints;
         final int index = findEndPoint(connectionId, requiredPollingEndPoints);
@@ -98,7 +178,7 @@ class ReceiverEndPoints extends TransportPoller
         {
             final ReceiverEndPoint endPoint = requiredPollingEndPoints[index];
             this.requiredPollingEndPoints = ArrayUtil.remove(requiredPollingEndPoints, index);
-            addToNormalEndpoints(endPoint);
+            addToNormalEndpoints(endPoint, register);
         }
         else
         {
@@ -187,7 +267,7 @@ class ReceiverEndPoints extends TransportPoller
         int bytesReceived = 0;
         final ReceiverEndPoint[] endPoints = this.endPoints;
         final int numEndPoints = endPoints.length;
-        final int threshold = ITERATION_THRESHOLD - numRequiredPollingEndPoints;
+        final int threshold = ARTIO_ITERATION_THRESHOLD - numRequiredPollingEndPoints;
         if (numEndPoints <= threshold)
         {
             bytesReceived = pollArray(bytesReceived, endPoints, numEndPoints);
@@ -201,22 +281,35 @@ class ReceiverEndPoints extends TransportPoller
             int i;
             for (i = 0; i < size; i++)
             {
-                final ReceiverEndPoint endPoint = (ReceiverEndPoint)keys[i].attachment();
-                final int polledBytes = endPoint.poll();
-                if (polledBytes < 0)
+                final SelectionKey key = keys[i];
+                // key could be null if a ReceiverEndPoint was removed during the processing of a previous key in the
+                // current poll iteration
+                if (key != null)
                 {
-                    backpressuredEndPoint = endPoint;
-                    bytesReceived -= polledBytes;
-                    break;
-                }
+                    final ReceiverEndPoint endPoint = (ReceiverEndPoint)key.attachment();
+                    final int polledBytes = endPoint.poll();
+                    if (polledBytes < 0)
+                    {
+                        backpressuredEndPoint = endPoint;
+                        bytesReceived -= polledBytes;
+                        break;
+                    }
 
-                bytesReceived += polledBytes;
+                    bytesReceived += polledBytes;
+                }
             }
 
-            // check we need to reset
             if (i != 0)
             {
-                selectedKeySet.reset(i);
+                if (i == size)
+                {
+                    selectedKeySet.reset();
+                }
+                else
+                {
+                    final int skipCount = Math.min(i, selectedKeySet.size());
+                    selectedKeySet.reset(skipCount);
+                }
             }
         }
         return bytesReceived;
@@ -244,6 +337,7 @@ class ReceiverEndPoints extends TransportPoller
         requiredPollingEndPoints = new ReceiverEndPoint[0];
     }
 
+    @Override
     public void close()
     {
         closeRequiredPollingEndPoints();
@@ -271,7 +365,7 @@ class ReceiverEndPoints extends TransportPoller
         for (int i = 0; i < length; i++)
         {
             final ReceiverEndPoint endPoint = endPoints[i];
-            if (endPoint.libraryId() == libraryId && endPoint instanceof ILink3ReceiverEndPoint)
+            if (endPoint.libraryId() == libraryId && endPoint instanceof InitiatorFixPReceiverEndPoint)
             {
                 removeFunc.accept(endPoint.connectionId());
                 endPoint.close(DisconnectReason.LIBRARY_DISCONNECT);
@@ -293,6 +387,7 @@ class ReceiverEndPoints extends TransportPoller
         }
     }
 
+    @Override
     public String toString()
     {
         return "ReceiverEndPoints{" +

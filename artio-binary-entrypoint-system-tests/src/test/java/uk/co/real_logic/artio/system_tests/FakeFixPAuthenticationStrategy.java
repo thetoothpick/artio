@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@ public class FakeFixPAuthenticationStrategy implements FixPAuthenticationStrateg
 {
     private volatile boolean accept;
     private volatile FixPContext lastSessionId;
+    private Enum<?> rejectCode;
 
     public FakeFixPAuthenticationStrategy()
     {
@@ -39,21 +40,41 @@ public class FakeFixPAuthenticationStrategy implements FixPAuthenticationStrateg
         this.accept = false;
     }
 
-    public void authenticate(final FixPContext sessionId, final FixPAuthenticationProxy authProxy)
+    public void reject(final Enum<?> rejectCode)
     {
-        lastSessionId = sessionId;
+        this.rejectCode = rejectCode;
+        this.accept = false;
+    }
+
+    @Override
+    public void authenticate(final FixPContext context, final FixPAuthenticationProxy authProxy)
+    {
+        lastSessionId = context;
+
         if (accept)
         {
             authProxy.accept();
         }
         else
         {
-            authProxy.reject();
+            if (rejectCode != null)
+            {
+                authProxy.reject(rejectCode);
+            }
+            else
+            {
+                authProxy.reject();
+            }
         }
     }
 
     public FixPContext lastSessionId()
     {
         return lastSessionId;
+    }
+
+    public void resetLastSessionId()
+    {
+        lastSessionId = null;
     }
 }

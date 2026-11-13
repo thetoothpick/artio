@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,14 +16,17 @@
 package uk.co.real_logic.artio;
 
 import io.aeron.archive.client.AeronArchive;
+import io.aeron.archive.client.ArchiveException;
+import org.agrona.Strings;
 import org.agrona.concurrent.*;
 import org.agrona.concurrent.errors.ErrorConsumer;
 import org.agrona.concurrent.errors.ErrorLogReader;
 import uk.co.real_logic.artio.engine.EngineConfiguration;
 
+import static uk.co.real_logic.artio.AtomicBuffers.checkAligned;
 import static uk.co.real_logic.artio.CommonConfiguration.DEFAULT_NAME_PREFIX;
 
-public class ErrorPrinter implements Agent
+public class ErrorPrinter implements MonitoringAgent
 {
     public static void main(final String[] args)
     {
@@ -49,14 +52,17 @@ public class ErrorPrinter implements Agent
                 lastObservationTimestampInMs);
         };
 
+    private volatile boolean archiverStopped = false;
+
     private final ErrorConsumer errorConsumer;
     private final EpochClock clock;
 
     private final AtomicBuffer errorBuffer;
     private final String agentNamePrefix;
 
-    private long lastPollTimeInMs;
     private final AeronArchive aeronArchive;
+
+    private long lastPollTimeInMs;
 
     ErrorPrinter(
         final AtomicBuffer errorBuffer,
@@ -66,7 +72,7 @@ public class ErrorPrinter implements Agent
         final ErrorConsumer customErrorConsumer,
         final EpochClock clock)
     {
-        this.errorBuffer = errorBuffer;
+        this.errorBuffer = checkAligned(errorBuffer);
         this.agentNamePrefix = agentNamePrefix;
         lastPollTimeInMs = startTimeInMs;
         this.aeronArchive = aeronArchive;
@@ -74,15 +80,31 @@ public class ErrorPrinter implements Agent
         this.clock = clock;
     }
 
+    @Override
     public int doWork()
     {
         int work = 0;
-        if (aeronArchive != null)
+        if (aeronArchive != null && !archiverStopped)
         {
-            final String errorResponse = aeronArchive.pollForErrorResponse();
-            if (errorResponse != null)
+            String errorResponse;
+
+            try
             {
-                System.err.println(errorResponse);
+                errorResponse = aeronArchive.pollForErrorResponse();
+            }
+            catch (final ArchiveException e)
+            {
+                // Suppress this
+                errorResponse = e.getMessage();
+            }
+
+            if (errorResponse != null && !archiverStopped)
+            {
+                if (aeronArchive.state() == AeronArchive.State.CLOSED)
+                {
+                    archiverStopped = true;
+                }
+                System.err.println(formatArchiveError(errorResponse));
                 work++;
             }
         }
@@ -99,8 +121,22 @@ public class ErrorPrinter implements Agent
         return work;
     }
 
+    @Override
     public String roleName()
     {
         return agentNamePrefix + "Error Printer";
+    }
+
+    @Override
+    public void archiverStopped()
+    {
+        // This isn't completely thread-safe, but the only result of the race is that
+        // "ERROR - client is closed" can be unnecessarily printed out during shutdown
+        archiverStopped = true;
+    }
+
+    private String formatArchiveError(final String error)
+    {
+        return (Strings.isEmpty(agentNamePrefix) ? "FIX Engine" : agentNamePrefix) + " Archive error: " + error;
     }
 }

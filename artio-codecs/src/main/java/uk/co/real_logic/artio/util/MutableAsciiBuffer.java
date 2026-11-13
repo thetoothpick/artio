@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,11 +15,13 @@
  */
 package uk.co.real_logic.artio.util;
 
+import org.agrona.AsciiEncoding;
 import org.agrona.AsciiNumberFormatException;
 import org.agrona.DirectBuffer;
 import org.agrona.concurrent.UnsafeBuffer;
 import uk.co.real_logic.artio.fields.*;
 import uk.co.real_logic.artio.util.float_parsing.AsciiBufferCharReader;
+import uk.co.real_logic.artio.util.float_parsing.DecimalFloatOverflowHandler;
 import uk.co.real_logic.artio.util.float_parsing.DecimalFloatParser;
 
 import java.nio.ByteBuffer;
@@ -75,16 +77,19 @@ public final class MutableAsciiBuffer extends UnsafeBuffer implements AsciiBuffe
         super(address, length);
     }
 
+    @Override
     public int getNatural(final int startInclusive, final int endExclusive)
     {
         return super.parseNaturalIntAscii(startInclusive, endExclusive - startInclusive);
     }
 
+    @Override
     public long getNaturalLong(final int startInclusive, final int endExclusive)
     {
         return super.parseNaturalLongAscii(startInclusive, endExclusive - startInclusive);
     }
 
+    @Override
     @SuppressWarnings("FinalParameters")
     public int getInt(int startInclusive, final int endExclusive)
     {
@@ -97,12 +102,14 @@ public final class MutableAsciiBuffer extends UnsafeBuffer implements AsciiBuffe
         return super.parseIntAscii(startInclusive, length);
     }
 
+    @Override
     public int getDigit(final int index)
     {
         final byte value = getByte(index);
         return getDigit(index, value);
     }
 
+    @Override
     public boolean isDigit(final int index)
     {
         final byte value = getByte(index);
@@ -119,16 +126,19 @@ public final class MutableAsciiBuffer extends UnsafeBuffer implements AsciiBuffe
         return value - 0x30;
     }
 
+    @Override
     public char getChar(final int index)
     {
         return (char)getByte(index);
     }
 
+    @Override
     public boolean getBoolean(final int index)
     {
         return YES == getByte(index);
     }
 
+    @Override
     public byte[] getBytes(final byte[] oldBuffer, final int offset, final int length)
     {
         final byte[] resultBuffer = oldBuffer.length < length ? new byte[length] : oldBuffer;
@@ -136,6 +146,7 @@ public final class MutableAsciiBuffer extends UnsafeBuffer implements AsciiBuffe
         return resultBuffer;
     }
 
+    @Override
     public char[] getChars(final char[] oldBuffer, final int offset, final int length)
     {
         final char[] resultBuffer = oldBuffer.length < length ? new char[length] : oldBuffer;
@@ -153,6 +164,7 @@ public final class MutableAsciiBuffer extends UnsafeBuffer implements AsciiBuffe
      * @param length the length in bytes to convert to a String
      * @return a String
      */
+    @Override
     public String getAscii(final int offset, final int length)
     {
         final byte[] buff = new byte[length];
@@ -160,42 +172,62 @@ public final class MutableAsciiBuffer extends UnsafeBuffer implements AsciiBuffe
         return new String(buff, 0, length, US_ASCII);
     }
 
+    @Override
     public long getMessageType(final int offset, final int length)
     {
         return MessageTypeEncoding.packMessageType(byteArray(), addressOffset(), offset, length);
     }
 
+    @Override
     @SuppressWarnings("FinalParameters")
-    public DecimalFloat getFloat(final DecimalFloat number, int offset, int length)
+    public DecimalFloat getFloat(
+        final DecimalFloat number,
+        int offset,
+        int length,
+        int tagId,
+        DecimalFloatOverflowHandler decimalFloatOverflowHandler)
     {
-        return DecimalFloatParser.extract(number, AsciiBufferCharReader.INSTANCE, this, offset, length);
+        return DecimalFloatParser.extract(
+          number,
+          AsciiBufferCharReader.INSTANCE,
+          this,
+          offset,
+          length,
+          tagId,
+          decimalFloatOverflowHandler);
     }
 
+    @Override
     public int getLocalMktDate(final int offset, final int length)
     {
         return LocalMktDateDecoder.decode(this, offset, length);
     }
 
+    @Override
     public long getUtcTimestamp(final int offset, final int length)
     {
         return UtcTimestampDecoder.decode(this, offset, length, true);
     }
 
+    @Override
     public long getUtcTimeOnly(final int offset, final int length)
     {
         return UtcTimeOnlyDecoder.decode(this, offset, length, true);
     }
 
+    @Override
     public int getUtcDateOnly(final int offset)
     {
         return UtcDateOnlyDecoder.decode(this, offset);
     }
 
+    @Override
     public int scanBack(final int startInclusive, final int endExclusive, final char terminatingCharacter)
     {
         return scanBack(startInclusive, endExclusive, (byte)terminatingCharacter);
     }
 
+    @Override
     public int scanBack(final int startInclusive, final int endExclusive, final byte terminator)
     {
         for (int index = startInclusive; index > endExclusive; index--)
@@ -210,11 +242,13 @@ public final class MutableAsciiBuffer extends UnsafeBuffer implements AsciiBuffe
         return UNKNOWN_INDEX;
     }
 
+    @Override
     public int scan(final int startInclusive, final int endExclusive, final char terminatingCharacter)
     {
         return scan(startInclusive, endExclusive, (byte)terminatingCharacter);
     }
 
+    @Override
     public int scan(final int startInclusive, final int endExclusive, final byte terminator)
     {
         int indexValue = UNKNOWN_INDEX;
@@ -231,6 +265,7 @@ public final class MutableAsciiBuffer extends UnsafeBuffer implements AsciiBuffe
         return indexValue;
     }
 
+    @Override
     public int computeChecksum(final int startInclusive, final int endExclusive)
     {
         int total = 0;
@@ -277,7 +312,7 @@ public final class MutableAsciiBuffer extends UnsafeBuffer implements AsciiBuffe
         return 1;
     }
 
-    public int putFloatAscii(final int offset, final DecimalFloat price)
+    public int putFloatAscii(final int offset, final ReadOnlyDecimalFloat price)
     {
         return putFloatAscii(offset, price.value(), price.scale());
     }
@@ -293,7 +328,7 @@ public final class MutableAsciiBuffer extends UnsafeBuffer implements AsciiBuffe
      */
     public int putFloatAscii(final int offset, final long value, final int scale)
     {
-        if (DecimalFloat.isNaNValue(value, scale))
+        if (ReadOnlyDecimalFloat.isNaNValue(value, scale))
         {
             throw new IllegalArgumentException("You cannot encode NaN into a buffer - it's not a number");
         }
@@ -307,50 +342,27 @@ public final class MutableAsciiBuffer extends UnsafeBuffer implements AsciiBuffe
         final int minusAdj = value < 0 ? 1 : 0;
         final int start = offset + minusAdj;
 
-        // Encode the value into a tmp space, leaving the longest possible space required
-        final int tmpEnd = start + LONGEST_LONG_LENGTH;
-        final int tmpStart = putLong(remainder, tmpEnd) + 1;
-        final int length = tmpEnd - tmpStart + 1;
+        final int length = remainder == Long.MIN_VALUE ? AsciiEncoding.MIN_LONG_VALUE.length - 1 :
+            AsciiEncoding.digitCount(-remainder);
 
-        // Move the value to the beginning once you've encoded it
-        if (scale > 0)
+        if (length <= scale)
         {
-            final int end = start + length;
-            final int split = end - scale;
-            final int digitsBeforeDot = length - scale;
-            if (digitsBeforeDot <= 0)
-            {
-                int cursor = start;
-                putByte(cursor++, ZERO);
-                putByte(cursor++, DOT);
-                final int numberOfZeros = -digitsBeforeDot;
-                final int endOfZeros = cursor + numberOfZeros;
-                for (; cursor < endOfZeros; cursor++)
-                {
-                    putByte(cursor, ZERO);
-                }
-                putBytes(cursor, this, tmpStart, length);
-
-                return minusAdj + ZERO_LENGTH + DOT_LENGTH + numberOfZeros + length;
-            }
-            else
-            {
-                putBytes(start, this, tmpStart, digitsBeforeDot);
-                putByte(split, DOT);
-                putBytes(split + 1, this, tmpStart + digitsBeforeDot, scale);
-
-                return minusAdj + length + DOT_LENGTH;
-            }
+            putByte(start, ZERO);
+            putByte(start + 1, DOT);
+            putTrailingZero(start + 2, scale - length);
+            putLong(remainder, start + scale + DOT_LENGTH);
+            return minusAdj + scale + 2;
+        }
+        else if (scale > 0)
+        {
+            putLong(remainder, start + length + DOT_LENGTH - 1, scale);
+            return minusAdj + length + DOT_LENGTH;
         }
         else
         {
-            putBytes(start, this, tmpStart, length);
-            final int trailingZeros = -scale;
-            if (trailingZeros > 0)
-            {
-                putTrailingZero(start + length, trailingZeros);
-            }
-            return length + minusAdj + trailingZeros;
+            putLong(remainder, start + length - 1);
+            putTrailingZero(start + length, -scale);
+            return minusAdj + length - scale;
         }
     }
 
@@ -384,7 +396,7 @@ public final class MutableAsciiBuffer extends UnsafeBuffer implements AsciiBuffe
         }
         else
         {
-            // Deal with negatives to avoid overflow for Integer.MAX_VALUE
+            // Deal with negatives to avoid overflow for LONG.MAX_VALUE
             return -1L * value;
         }
     }
@@ -399,6 +411,29 @@ public final class MutableAsciiBuffer extends UnsafeBuffer implements AsciiBuffe
             remainder = remainder / 10;
             putByte(index, (byte)(ZERO + (-1L * digit)));
             index--;
+        }
+
+        return index;
+    }
+
+    @SuppressWarnings("FinalParameters")
+    private int putLong(long remainder, final int end, int scale)
+    {
+        int index = end;
+        while (remainder < 0)
+        {
+            if (scale == 0)
+            {
+                putByte(index, DOT);
+            }
+            else
+            {
+                final long digit = remainder % 10;
+                remainder = remainder / 10;
+                putByte(index, (byte)(ZERO + (-1L * digit)));
+            }
+            index--;
+            scale--;
         }
 
         return index;

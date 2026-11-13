@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 package uk.co.real_logic.artio.engine.logger;
 
 import org.agrona.ErrorHandler;
+import org.agrona.collections.ArrayListUtil;
 import org.agrona.collections.Long2LongHashMap;
 import org.agrona.concurrent.AtomicBuffer;
 import uk.co.real_logic.artio.engine.ChecksumFramer;
@@ -23,14 +24,17 @@ import uk.co.real_logic.artio.messages.*;
 import uk.co.real_logic.artio.storage.messages.IndexedPositionDecoder;
 import uk.co.real_logic.artio.storage.messages.IndexedPositionEncoder;
 
+import java.util.ArrayList;
+
 import static io.aeron.archive.status.RecordingPos.NULL_RECORDING_ID;
+import static uk.co.real_logic.artio.AtomicBuffers.checkAligned;
 import static uk.co.real_logic.artio.engine.SectorFramer.OUT_OF_SPACE;
 
 /**
  * Writes out a log of the stream positions that we have indexed up to.
  * Not thread safe, but writes to a thread safe buffer.
  */
-class IndexedPositionWriter
+class IndexedPositionWriter implements AutoCloseable
 {
     static final int HEADER_LENGTH = MessageHeaderEncoder.ENCODED_LENGTH;
     static final int RECORD_LENGTH = IndexedPositionEncoder.BLOCK_LENGTH;
@@ -47,20 +51,22 @@ class IndexedPositionWriter
     private final ErrorHandler errorHandler;
     private final RecordingIdLookup recordingIdLookup;
     private final ChecksumFramer checksumFramer;
-    private final Long2LongHashMap recheckSessions = new Long2LongHashMap(MISSING_RECORD);
+    // Iterated repeatedly in a loop, but only modified occasionally
+    private final ArrayList<CheckPosition> recheckSessions = new ArrayList<>();
 
     IndexedPositionWriter(
         final AtomicBuffer buffer,
         final ErrorHandler errorHandler,
         final int errorReportingOffset,
         final String fileName,
-        final RecordingIdLookup recordingIdLookup)
+        final RecordingIdLookup recordingIdLookup,
+        final boolean indexChecksumEnabled)
     {
-        this.buffer = buffer;
+        this.buffer = checkAligned(buffer);
         this.errorHandler = errorHandler;
         this.recordingIdLookup = recordingIdLookup;
         checksumFramer = new ChecksumFramer(
-            buffer, buffer.capacity(), errorHandler, errorReportingOffset, fileName);
+            buffer, buffer.capacity(), errorHandler, errorReportingOffset, fileName, indexChecksumEnabled);
         setupHeader();
         initialiseOffsets();
     }
@@ -154,7 +160,8 @@ class IndexedPositionWriter
         }
     }
 
-    void close()
+    @Override
+    public void close()
     {
         updateChecksums();
     }
@@ -176,10 +183,37 @@ class IndexedPositionWriter
 
     public void trackPosition(final int aeronSessionId, final long endPosition)
     {
-        recheckSessions.remove(aeronSessionId);
-        if (!checkPosition(aeronSessionId, endPosition))
+        final boolean indexedUpTo = checkPosition(aeronSessionId, endPosition);
+
+        final ArrayList<CheckPosition> recheckSessions = this.recheckSessions;
+        int pos = MISSING_RECORD;
+        for (int i = 0; i < recheckSessions.size(); i++)
         {
-            recheckSessions.put(aeronSessionId, endPosition);
+            if (recheckSessions.get(i).aeronSessionId == aeronSessionId)
+            {
+                pos = i;
+                break;
+            }
+        }
+
+        if (indexedUpTo)
+        {
+            // Indexed and we have record, so we can just scrub it.
+            if (pos != MISSING_RECORD)
+            {
+                ArrayListUtil.fastUnorderedRemove(recheckSessions, pos);
+            }
+        }
+        else
+        {
+            if (pos != MISSING_RECORD)
+            {
+                recheckSessions.get(pos).endPosition = endPosition;
+            }
+            else
+            {
+                recheckSessions.add(new CheckPosition(aeronSessionId, endPosition));
+            }
         }
     }
 
@@ -197,15 +231,15 @@ class IndexedPositionWriter
     public int checkRecordings()
     {
         int work = 0;
-        final Long2LongHashMap.EntryIterator it = recheckSessions.entrySet().iterator();
-        while (it.hasNext())
+        final ArrayList<CheckPosition> recheckSessions = this.recheckSessions;
+        int size = recheckSessions.size();
+        for (int i = 0; i < size; i++)
         {
-            it.next();
-            final int aeronSessionId = (int)it.getLongKey();
-            final long endPosition = it.getLongValue();
-            if (checkPosition(aeronSessionId, endPosition))
+            final CheckPosition checkPosition = recheckSessions.get(i);
+            if (checkPosition(checkPosition.aeronSessionId, checkPosition.endPosition))
             {
-                it.remove();
+                ArrayListUtil.fastUnorderedRemove(recheckSessions, i);
+                size--;
                 work++;
             }
         }
@@ -223,6 +257,7 @@ class IndexedPositionWriter
                 // May not have setup the recording id when these messages come in.
                 case LibraryConnectDecoder.TEMPLATE_ID:
                 case ApplicationHeartbeatDecoder.TEMPLATE_ID:
+                case ConnectDecoder.TEMPLATE_ID: // handover new connection awaits it to be indexed, can't ignore
                     trackPosition(aeronSessionId, endPosition);
                     return;
 
@@ -232,7 +267,6 @@ class IndexedPositionWriter
                 case ControlNotificationDecoder.TEMPLATE_ID:
                 case EndOfDayDecoder.TEMPLATE_ID:
                 case DisconnectDecoder.TEMPLATE_ID:
-                case ConnectDecoder.TEMPLATE_ID:
                     return;
             }
             recordingId = recordingIdLookup.getRecordingId(aeronSessionId);
@@ -240,5 +274,17 @@ class IndexedPositionWriter
 
         // For other messages block until the recording id is setup.
         indexedUpTo(aeronSessionId, recordingId, endPosition);
+    }
+
+    static final class CheckPosition
+    {
+        final int aeronSessionId;
+        long endPosition;
+
+        CheckPosition(final int aeronSessionId, final long endPosition)
+        {
+            this.aeronSessionId = aeronSessionId;
+            this.endPosition = endPosition;
+        }
     }
 }

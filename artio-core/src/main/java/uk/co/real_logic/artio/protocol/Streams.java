@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,13 +16,17 @@
 package uk.co.real_logic.artio.protocol;
 
 import io.aeron.Aeron;
+import io.aeron.ChannelUriStringBuilder;
 import io.aeron.ExclusivePublication;
 import io.aeron.Subscription;
+import org.agrona.LangUtil;
 import org.agrona.concurrent.EpochNanoClock;
 import org.agrona.concurrent.IdleStrategy;
 import org.agrona.concurrent.status.AtomicCounter;
 import uk.co.real_logic.artio.StreamInformation;
 import uk.co.real_logic.artio.engine.RecordingCoordinator;
+
+import java.nio.file.NoSuchFileException;
 
 public final class Streams
 {
@@ -68,15 +72,48 @@ public final class Streams
 
     public ExclusivePublication dataPublication(final String name)
     {
-        final ExclusivePublication publication = recordingCoordinator.track(aeronChannel, streamId);
+        final ExclusivePublication publication = recordingCoordinator.trackEngine(aeronChannel, streamId);
         StreamInformation.print(name, publication, printAeronStreamIdentifiers);
+        return publication;
+    }
+
+    public ExclusivePublication reproductionPublication()
+    {
+        final ExclusivePublication publication = recordingCoordinator.reproductionPublication();
+        StreamInformation.print("recordingPublication", publication, printAeronStreamIdentifiers);
         return publication;
     }
 
     public Subscription subscription(final String name)
     {
-        final Subscription subscription = aeron.addSubscription(aeronChannel, streamId);
-        StreamInformation.print(name, subscription, printAeronStreamIdentifiers);
-        return subscription;
+        while (true)
+        {
+            try
+            {
+                final String channel = new ChannelUriStringBuilder(aeronChannel)
+                    .alias(name)
+                    .build();
+                final Subscription subscription = aeron.addSubscription(channel, streamId);
+                StreamInformation.print(name, subscription, printAeronStreamIdentifiers);
+                return subscription;
+            }
+            // Catch and retry, this has only ever been seen in a CI system with a virtual file-system where the
+            // created file doesn't appear in the virtual file system
+            catch (final Exception e)
+            {
+                // Thrown by the underlying
+                //noinspection ConstantConditions
+                if (e instanceof NoSuchFileException)
+                {
+                    final NoSuchFileException noSuchFileException = (NoSuchFileException)e;
+                    if (noSuchFileException.getMessage().contains(".logbuffer"))
+                    {
+                        continue;
+                    }
+                }
+
+                LangUtil.rethrowUnchecked(e);
+            }
+        }
     }
 }

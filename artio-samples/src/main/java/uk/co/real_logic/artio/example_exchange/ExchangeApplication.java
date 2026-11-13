@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,16 +31,23 @@ import java.io.File;
 import java.util.Collections;
 
 import static io.aeron.CommonContext.IPC_CHANNEL;
+import static io.aeron.archive.Archive.Configuration.REPLICATION_CHANNEL_PROP_NAME;
+import static io.aeron.archive.client.AeronArchive.Configuration.CONTROL_CHANNEL_PROP_NAME;
+import static io.aeron.archive.client.AeronArchive.Configuration.CONTROL_RESPONSE_CHANNEL_PROP_NAME;
 import static io.aeron.driver.ThreadingMode.SHARED;
 import static uk.co.real_logic.artio.CommonConfiguration.backoffIdleStrategy;
 
-public class ExchangeApplication
+public final class ExchangeApplication
 {
     public static final String ACCEPTOR_COMP_ID = "exexchange";
     public static final String INITIATOR_COMP_ID = "extrader";
 
     public static void main(final String[] args) throws Exception
     {
+        System.setProperty(CONTROL_CHANNEL_PROP_NAME, "aeron:udp?endpoint=localhost:10010");
+        System.setProperty(CONTROL_RESPONSE_CHANNEL_PROP_NAME, "aeron:udp?endpoint=localhost:10020");
+        System.setProperty(REPLICATION_CHANNEL_PROP_NAME, "aeron:udp?endpoint=localhost:0");
+
         final MessageValidationStrategy validationStrategy = MessageValidationStrategy.targetCompId(ACCEPTOR_COMP_ID)
             .and(MessageValidationStrategy.senderCompId(Collections.singletonList(INITIATOR_COMP_ID)));
 

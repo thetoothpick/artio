@@ -16,27 +16,27 @@
 package uk.co.real_logic.artio.dictionary.generation;
 
 import org.agrona.generation.StringWriterOutputManager;
-import org.junit.BeforeClass;
-import org.junit.Test;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
+
+import java.util.stream.Stream;
 import uk.co.real_logic.artio.builder.Decoder;
 import uk.co.real_logic.artio.builder.Encoder;
 import uk.co.real_logic.artio.util.MutableAsciiBuffer;
 
-import java.util.Arrays;
-import java.util.Collection;
 import java.util.Map;
 
 import static org.agrona.generation.CompilerUtil.compileInMemory;
-import static org.junit.Assert.assertSame;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.params.provider.Arguments.of;
 import static uk.co.real_logic.artio.dictionary.ExampleDictionary.*;
 import static uk.co.real_logic.artio.dictionary.generation.AbstractDecoderGeneratorTest.CODEC_LOGGING;
 import static uk.co.real_logic.artio.dictionary.generation.Generator.RUNTIME_REJECT_UNKNOWN_ENUM_VALUE_PROPERTY;
 import static uk.co.real_logic.artio.dictionary.generation.ToEncoderDecoderGeneratorTest.assertEncodesCorrectly;
 
 @SuppressWarnings("unchecked")
-@RunWith(Parameterized.class)
 public class CopyToEncoderGeneratorTest
 {
     private static final int BUFFER_SIZE = 1024;
@@ -44,7 +44,7 @@ public class CopyToEncoderGeneratorTest
     private static Class<? extends Decoder> heartbeatDecoder;
     private static Class<? extends Encoder> heartbeatEncoder;
 
-    @BeforeClass
+    @BeforeAll
     public static void setUp() throws ClassNotFoundException
     {
         final Map<String, CharSequence> sources = generateClasses();
@@ -71,16 +71,16 @@ public class CopyToEncoderGeneratorTest
     {
         final StringWriterOutputManager outputManager = new StringWriterOutputManager();
         final ConstantGenerator constantGenerator = new ConstantGenerator(
-            MESSAGE_EXAMPLE, TEST_PACKAGE, outputManager);
+            MESSAGE_EXAMPLE, TEST_PACKAGE, null, outputManager);
         final EnumGenerator enumGenerator = new EnumGenerator(MESSAGE_EXAMPLE, TEST_PARENT_PACKAGE, outputManager);
         final DecoderGenerator decoderGenerator = new DecoderGenerator(
             MESSAGE_EXAMPLE, 1, TEST_PACKAGE,
             TEST_PARENT_PACKAGE, TEST_PACKAGE, outputManager, ValidationOn.class,
-            RejectUnknownFieldOn.class, RejectUnknownEnumValueOn.class, false,
-            RUNTIME_REJECT_UNKNOWN_ENUM_VALUE_PROPERTY);
+            RejectUnknownFieldOn.class, RejectUnknownEnumValueOn.class, false, false, false,
+            RUNTIME_REJECT_UNKNOWN_ENUM_VALUE_PROPERTY, true, null);
         final EncoderGenerator encoderGenerator = new EncoderGenerator(MESSAGE_EXAMPLE, TEST_PACKAGE,
             TEST_PARENT_PACKAGE, outputManager, ValidationOn.class, RejectUnknownFieldOn.class,
-            RejectUnknownEnumValueOn.class, RUNTIME_REJECT_UNKNOWN_ENUM_VALUE_PROPERTY);
+            RejectUnknownEnumValueOn.class, RUNTIME_REJECT_UNKNOWN_ENUM_VALUE_PROPERTY, true);
 
         constantGenerator.generate();
         enumGenerator.generate();
@@ -90,49 +90,45 @@ public class CopyToEncoderGeneratorTest
         return outputManager.getSources();
     }
 
-    @Parameterized.Parameters(name = "{0}")
-    public static Collection<Object[]> data()
+    public static Stream<Arguments> data()
     {
-        return Arrays.asList(
-            new Object[] {ENCODED_MESSAGE},
-            new Object[] {MULTI_STRING_VALUE_MESSAGE},
-            new Object[] {MULTI_VALUE_STRING_MESSAGE},
-            new Object[] {MULTI_CHAR_VALUE_MESSAGE},
-            new Object[] {MULTI_CHAR_VALUE_NO_ENUM_MESSAGE},
-            new Object[] {VALID_MULTI_STRING_VALUE_MESSAGE},
-            new Object[] {NO_OPTIONAL_MESSAGE},
-            new Object[] {COMPONENT_MESSAGE},
-            new Object[] {TAG_SPECIFIED_WHERE_INT_VALUE_IS_LARGE},
-            new Object[] {DERIVED_FIELDS_MESSAGE},
-            new Object[] {REPEATING_GROUP_MESSAGE},
-            new Object[] {SINGLE_REPEATING_GROUP_MESSAGE},
-            new Object[] {NO_REPEATING_GROUP_MESSAGE},
-            new Object[] {NO_REPEATING_GROUP_IN_REPEATING_GROUP_MESSAGE},
-            new Object[] {NO_MISSING_REQUIRED_FIELDS_IN_REPEATING_GROUP_MESSAGE},
-            new Object[] {MULTIPLE_ENTRY_REPEATING_GROUP},
-            new Object[] {NESTED_COMPONENT_MESSAGE},
-            new Object[] {NESTED_GROUP_MESSAGE},
-            new Object[] {ZERO_REPEATING_GROUP_MESSAGE},
-            new Object[] {SOH_IN_DATA_FIELD_MESSAGE},
-            new Object[] {SHORT_TIMESTAMP_MESSAGE}
+        return Stream.of(
+            of(ENCODED_MESSAGE),
+            of(MULTI_STRING_VALUE_MESSAGE),
+            of(MULTI_VALUE_STRING_MESSAGE),
+            of(MULTI_CHAR_VALUE_MESSAGE),
+            of(MULTI_CHAR_VALUE_NO_ENUM_MESSAGE),
+            of(VALID_MULTI_STRING_VALUE_MESSAGE),
+            of(NO_OPTIONAL_MESSAGE),
+            of(COMPONENT_MESSAGE),
+            of(TAG_SPECIFIED_WHERE_INT_VALUE_IS_LARGE),
+            of(DERIVED_FIELDS_MESSAGE),
+            of(REPEATING_GROUP_MESSAGE),
+            of(SINGLE_REPEATING_GROUP_MESSAGE),
+            of(NO_REPEATING_GROUP_MESSAGE),
+            of(NO_REPEATING_GROUP_IN_REPEATING_GROUP_MESSAGE),
+            of(NO_MISSING_REQUIRED_FIELDS_IN_REPEATING_GROUP_MESSAGE),
+            of(MULTIPLE_ENTRY_REPEATING_GROUP),
+            of(NESTED_COMPONENT_MESSAGE),
+            of(NESTED_GROUP_MESSAGE),
+            of(ZERO_REPEATING_GROUP_MESSAGE),
+            of(SOH_IN_DATA_FIELD_MESSAGE),
+            of(SHORT_TIMESTAMP_MESSAGE),
+            of(LONG_FIELD_MESSAGE)
         );
     }
 
-    private final String testCaseMessage;
-
-    public CopyToEncoderGeneratorTest(final String testCaseMessage)
+    @ParameterizedTest
+    @MethodSource(value = "data")
+    public void shouldCopyToEncoder(final String testCaseMessage) throws Exception
     {
-        this.testCaseMessage = testCaseMessage;
-    }
-
-    @Test
-    public void shouldCopyToEncoder() throws Exception
-    {
-        shouldToEncoderProvidedEncoder(heartbeatDecoder, heartbeatEncoder);
+        shouldToEncoderProvidedEncoder(heartbeatDecoder, heartbeatEncoder, testCaseMessage);
     }
 
     private void shouldToEncoderProvidedEncoder(
-        final Class<? extends Decoder> heartbeatDecoder, final Class<? extends Encoder> heartbeatEncoder)
+        final Class<? extends Decoder> heartbeatDecoder,
+        final Class<? extends Encoder> heartbeatEncoder,
+        final String testCaseMessage)
         throws Exception
     {
         final Decoder decoder = heartbeatDecoder.getConstructor().newInstance();

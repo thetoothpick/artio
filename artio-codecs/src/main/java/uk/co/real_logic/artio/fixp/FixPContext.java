@@ -32,38 +32,18 @@ public interface FixPContext
     FixPKey key();
 
     /**
-     * Invoked when an acceptor reconnects.
-     *
-     * @param oldContext the FixPContext from the previous connect
-     * @return a response that might be a reason to reject this connection or OK if there is no error.
-     */
-    FixPFirstMessageResponse checkAccept(FixPContext oldContext);
-
-    /**
-     * Invoked when an initiator reconnects.
-     *
-     * @param reestablishConnection true if the initiator's configuration for reestablishing the connection has set
-     *                              this value to true.
-     */
-    void initiatorReconnect(boolean reestablishConnection);
-
-    /**
      * Gets the protocol type for this key.
      *
      * @return the protocol type for this key.
      */
     FixPProtocolType protocolType();
 
+    int compareVersion(FixPContext oldContext);
+
     /**
-     * Invoked when a sequence is ended. There are two cases for that:
+     * Gets whether this context was generated from a <code>Negotiate</code> or an <code>Establish</code> message.
      *
-     * <ul>
-     *     <li>When the <code>FixEngine.resetSequenceNumber(sessionId)</code> method is invoked.</li>
-     *     <li>For FIXP protocols that implement the FinishedSending / FinishedReceiving mechanism, it is invoked
-     *     upon receipt of either of those methods.</li>
-     * </ul>
-     *
-     * Implementations should be idempotent.
+     * @return true iff this context was generated from a <code>Negotiate</code> message.
      */
-    void onEndSequence();
+    boolean fromNegotiate();
 }

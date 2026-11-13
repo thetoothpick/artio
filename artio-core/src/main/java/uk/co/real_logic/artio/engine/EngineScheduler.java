@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -48,7 +48,10 @@ public interface EngineScheduler extends AutoCloseable
     /**
      * Invoked by the FIX Engine to stop the threads. Should only return once they are completed stopped.
      */
+    @Override
     void close();
+
+    int pollFramer();
 
     /**
      * Used to configure the aeron context object. This can be hooked in order to
@@ -63,7 +66,7 @@ public interface EngineScheduler extends AutoCloseable
         throw new IllegalStateException("Cannot re-use scheduler for multiple launch attempts");
     }
 
-    static void awaitRunnerStart(AgentRunner runner)
+    static void awaitRunnerStart(final AgentRunner runner)
     {
         if (runner != null)
         {

@@ -15,8 +15,8 @@
  */
 package uk.co.real_logic.artio.engine;
 
+import io.aeron.Publication;
 import org.agrona.DirectBuffer;
-import org.agrona.ErrorHandler;
 import uk.co.real_logic.artio.ValidationError;
 import uk.co.real_logic.artio.dictionary.LongDictionary;
 import uk.co.real_logic.artio.fields.AsciiFieldFlyweight;
@@ -33,39 +33,74 @@ public class SequenceNumberExtractor
 {
     public static final int NO_SEQUENCE_NUMBER = -1;
 
-    private final ErrorHandler errorHandler;
-
     private boolean isSequenceReset;
     private int sequenceNumber;
+    private int newSequenceNumber;
 
-    public SequenceNumberExtractor(final ErrorHandler errorHandler)
+    private long aeronSessionId;
+    private long position = Publication.NOT_CONNECTED;
+
+    public SequenceNumberExtractor()
     {
-        this.errorHandler = errorHandler;
     }
 
     public int extract(
         final DirectBuffer buffer, final int offset, final int length)
     {
         sequenceNumber = NO_SEQUENCE_NUMBER;
+        newSequenceNumber = NO_SEQUENCE_NUMBER;
         isSequenceReset = false;
 
         parser.onMessage(buffer, offset, length);
 
+        return pickSequenceNumber();
+    }
+
+    public int extractCached(
+        final DirectBuffer buffer, final int offset, final int length, final long aeronSessId, final long position)
+    {
+        if (aeronSessId == this.aeronSessionId && position == this.position)
+        {
+            return pickSequenceNumber();
+        }
+        else
+        {
+            this.aeronSessionId = aeronSessId;
+            this.position = position;
+            return extract(buffer, offset, length);
+        }
+    }
+
+    private int pickSequenceNumber()
+    {
+        return newSequenceNumber != NO_SEQUENCE_NUMBER ? newSequenceNumber - 1 : sequenceNumber;
+    }
+
+    public int sequenceNumber()
+    {
         return sequenceNumber;
+    }
+
+    public int newSequenceNumber()
+    {
+        return newSequenceNumber;
     }
 
     private final OtfMessageAcceptor extractor = new OtfMessageAcceptor()
     {
+        @Override
         public MessageControl onNext()
         {
             return CONTINUE;
         }
 
+        @Override
         public MessageControl onComplete()
         {
             return CONTINUE;
         }
 
+        @Override
         public MessageControl onField(
             final int tag, final AsciiBuffer buffer, final int offset, final int length)
         {
@@ -73,35 +108,42 @@ public class SequenceNumberExtractor
             {
                 isSequenceReset = length == 1 && buffer.getByte(offset) == SEQUENCE_RESET_TYPE_BYTE;
             }
-            else if (tag == MSG_SEQ_NO && !isSequenceReset)
+            else if (tag == MSG_SEQ_NO)
             {
                 sequenceNumber = buffer.getInt(offset, offset + length);
-                return STOP;
+                if (!isSequenceReset)
+                {
+                    return STOP;
+                }
             }
             else if (tag == NEW_SEQ_NO && isSequenceReset)
             {
-                sequenceNumber = buffer.getInt(offset, offset + length) - 1;
+                newSequenceNumber = buffer.getInt(offset, offset + length);
                 return STOP;
             }
 
             return CONTINUE;
         }
 
+        @Override
         public MessageControl onGroupHeader(final int tag, final int numInGroup)
         {
             return CONTINUE;
         }
 
+        @Override
         public MessageControl onGroupBegin(final int tag, final int numInGroup, final int index)
         {
             return CONTINUE;
         }
 
+        @Override
         public MessageControl onGroupEnd(final int tag, final int numInGroup, final int index)
         {
             return CONTINUE;
         }
 
+        @Override
         public boolean onError(
             final ValidationError error,
             final long messageType,

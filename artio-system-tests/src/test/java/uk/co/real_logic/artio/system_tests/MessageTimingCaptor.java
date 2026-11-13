@@ -15,31 +15,85 @@
  */
 package uk.co.real_logic.artio.system_tests;
 
+import org.agrona.DirectBuffer;
 import org.agrona.collections.LongArrayList;
+import org.agrona.concurrent.UnsafeBuffer;
 import uk.co.real_logic.artio.engine.MessageTimingHandler;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.hasSize;
-import static org.junit.Assert.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
 public class MessageTimingCaptor implements MessageTimingHandler
 {
 
+    public static final UnsafeBuffer NO_META_DATA = new UnsafeBuffer(new byte[0]);
+
+    private final List<DirectBuffer> metadata = new ArrayList<>();
     private final LongArrayList sequenceNumbers = new LongArrayList();
 
-    public void onMessage(final long sequenceNumber, final long connectionId)
+    @Override
+    public synchronized void onMessage(
+        final long sequenceNumber,
+        final long connectionId,
+        final DirectBuffer metaDataBuffer,
+        final int metaDataOffset,
+        final int metaDataLength)
     {
         sequenceNumbers.add(sequenceNumber);
-    }
 
-    public void verifyConsecutiveSequenceNumbers(final int lastSentMsgSeqNum)
-    {
-        assertThat(sequenceNumbers, hasSize(lastSentMsgSeqNum));
-        for (int i = 0; i < lastSentMsgSeqNum; i++)
+        if (metaDataLength == 0)
         {
-            final long sequenceNumber = sequenceNumbers.getLong(i);
-            assertEquals(i + 1L, sequenceNumber);
+            metadata.add(NO_META_DATA);
+        }
+        else
+        {
+            final UnsafeBuffer buffer = new UnsafeBuffer(new byte[metaDataLength]);
+            buffer.putBytes(0, metaDataBuffer, metaDataOffset, metaDataLength);
+
+            metadata.add(buffer);
         }
     }
 
+    public synchronized void verifyConsecutiveSequenceNumbers(final int lastSentMsgSeqNum)
+    {
+        assertThat(sequenceNumbers.toString(), sequenceNumbers, hasSize(lastSentMsgSeqNum));
+        for (int i = 0; i < lastSentMsgSeqNum; i++)
+        {
+            final long sequenceNumber = sequenceNumbers.getLong(i);
+            final long expectedSequenceNumber = i + 1L;
+            if (expectedSequenceNumber != sequenceNumber)
+            {
+                assertEquals(expectedSequenceNumber, sequenceNumber, sequenceNumbers.toString());
+            }
+        }
+    }
+
+    public synchronized void verifyConsecutiveMetaData(final int lastSentMsgSeqNum)
+    {
+        assertThat(metadata, hasSize(lastSentMsgSeqNum));
+        for (int i = 0; i < lastSentMsgSeqNum; i++)
+        {
+            final DirectBuffer buffer = metadata.get(i);
+            if (buffer.capacity() > 0)
+            {
+                final long sequenceNumber = buffer.getInt(0);
+                assertEquals(i + 1L, sequenceNumber, Arrays.toString(buffer.byteArray()));
+            }
+        }
+    }
+
+    public synchronized DirectBuffer getMetaData(final int messageIndex)
+    {
+        return metadata.get(messageIndex);
+    }
+
+    public synchronized int count()
+    {
+        return sequenceNumbers.size();
+    }
 }

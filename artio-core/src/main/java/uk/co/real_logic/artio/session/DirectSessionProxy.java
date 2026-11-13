@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited., Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited., Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
  */
 package uk.co.real_logic.artio.session;
 
+import org.agrona.DirectBuffer;
 import org.agrona.ErrorHandler;
 import org.agrona.concurrent.EpochNanoClock;
 import uk.co.real_logic.artio.DebugLogger;
@@ -38,6 +39,7 @@ import static java.util.Objects.requireNonNull;
 import static uk.co.real_logic.artio.LogTag.FIX_MESSAGE;
 import static uk.co.real_logic.artio.dictionary.SessionConstants.*;
 import static uk.co.real_logic.artio.dictionary.generation.CodecUtil.MISSING_INT;
+import static uk.co.real_logic.artio.fields.RejectReason.OTHER;
 import static uk.co.real_logic.artio.fields.RejectReason.VALUE_IS_INCORRECT;
 import static uk.co.real_logic.artio.messages.MessageStatus.OK;
 import static uk.co.real_logic.artio.session.Session.LIBRARY_DISCONNECTED;
@@ -55,6 +57,7 @@ public class DirectSessionProxy implements SessionProxy
     private static final int REJECT_COUNT = RejectReason.values().length;
     private static final byte[][] NOT_LOGGED_ON_SESSION_REJECT_REASONS = new byte[REJECT_COUNT][];
     private static final byte[][] LOGGED_ON_SESSION_REJECT_REASONS = new byte[REJECT_COUNT][];
+    private static final int OTHER_REJECT_INDEX = 19;
 
     static
     {
@@ -106,6 +109,7 @@ public class DirectSessionProxy implements SessionProxy
     private boolean libraryConnected = true;
     private boolean seqNumResetRequested = false;
     private long lastSentPosition = 0;
+    private long timestampNs;
 
     public DirectSessionProxy(
         final int sessionBufferSize,
@@ -127,10 +131,12 @@ public class DirectSessionProxy implements SessionProxy
         this.buffer = new MutableAsciiBuffer(new byte[sessionBufferSize]);
         this.errorHandler = errorHandler;
         lowSequenceNumber = new AsciiFormatter("MsgSeqNum too low, expecting %s but received %s");
+        timestampNs = clock.nanoTime();
         timestampEncoder = new UtcTimestampEncoder(epochFractionPrecision);
-        timestampEncoder.initialise(clock.nanoTime(), TimeUnit.NANOSECONDS);
+        timestampEncoder.initialise(timestampNs, TimeUnit.NANOSECONDS);
     }
 
+    @Override
     public void fixDictionary(final FixDictionary dictionary)
     {
         this.dictionary = dictionary;
@@ -153,6 +159,7 @@ public class DirectSessionProxy implements SessionProxy
             sequenceReset.header());
     }
 
+    @Override
     public void setupSession(final long sessionId, final CompositeKey sessionKey)
     {
         requireNonNull(sessionKey, "sessionKey");
@@ -165,11 +172,13 @@ public class DirectSessionProxy implements SessionProxy
         }
     }
 
+    @Override
     public void connectionId(final long connectionId)
     {
         this.connectionId = connectionId;
     }
 
+    @Override
     public long sendResendRequest(
         final int msgSeqNo,
         final int beginSeqNo,
@@ -177,6 +186,8 @@ public class DirectSessionProxy implements SessionProxy
         final int sequenceIndex,
         final int lastMsgSeqNumProcessed)
     {
+        timestampNs = clock.nanoTime();
+
         final SessionHeaderEncoder header = resendRequest.header();
         setupHeader(header, msgSeqNo, lastMsgSeqNumProcessed);
         resendRequest.beginSeqNo(beginSeqNo)
@@ -185,11 +196,13 @@ public class DirectSessionProxy implements SessionProxy
         return send(result, RESEND_REQUEST_MESSAGE_TYPE, sequenceIndex, resendRequest, msgSeqNo);
     }
 
+    @Override
     public long sendRequestDisconnect(final long connectionId, final DisconnectReason reason)
     {
         return gatewayPublication.saveRequestDisconnect(libraryId, connectionId, reason);
     }
 
+    @Override
     public long sendLogon(
         final int msgSeqNo,
         final int heartbeatIntervalInS,
@@ -201,6 +214,8 @@ public class DirectSessionProxy implements SessionProxy
         final CancelOnDisconnectOption cancelOnDisconnectOption,
         final int cancelOnDisconnectTimeoutWindowInMs)
     {
+        timestampNs = clock.nanoTime();
+
         final AbstractLogonEncoder logon = this.logon;
         final SessionHeaderEncoder header = logon.header();
         setupHeader(header, msgSeqNo, lastMsgSeqNumProcessed);
@@ -265,15 +280,22 @@ public class DirectSessionProxy implements SessionProxy
         return string != null && string.length() > 0;
     }
 
-    public long sendLogout(final int msgSeqNo, final int sequenceIndex, final int lastMsgSeqNumProcessed)
+    @Override
+    public long sendLogout(
+        final int msgSeqNo,
+        final int sequenceIndex,
+        final int lastMsgSeqNumProcessed,
+        final byte[] text)
     {
-        return sendLogout(msgSeqNo, null, 0, sequenceIndex, lastMsgSeqNumProcessed);
+        return sendLogout(msgSeqNo, text, text == null ? 0 : text.length, sequenceIndex, lastMsgSeqNumProcessed);
     }
 
+    @Override
     public long sendLogout(
         final int msgSeqNo, final int sequenceIndex, final int rejectReason, final int lastMsgSeqNumProcessed)
     {
-        final byte[] reasonText = LOGGED_ON_SESSION_REJECT_REASONS[rejectReason];
+        final int rejectReasonIndex = getRejectReasonIndex(rejectReason);
+        final byte[] reasonText = LOGGED_ON_SESSION_REJECT_REASONS[rejectReasonIndex];
         return sendLogout(msgSeqNo, reasonText, reasonText.length, sequenceIndex, lastMsgSeqNumProcessed);
     }
 
@@ -290,6 +312,8 @@ public class DirectSessionProxy implements SessionProxy
         final int sequenceIndex,
         final int lastMsgSeqNumProcessed)
     {
+        timestampNs = clock.nanoTime();
+
         final SessionHeaderEncoder header = logout.header();
         setupHeader(header, msgSeqNo, lastMsgSeqNumProcessed);
 
@@ -303,6 +327,7 @@ public class DirectSessionProxy implements SessionProxy
         return send(result, LOGOUT_MESSAGE_TYPE, sequenceIndex, logout, msgSeqNo);
     }
 
+    @Override
     public long sendLowSequenceNumberLogout(
         final int msgSeqNo,
         final int expectedSeqNo,
@@ -321,24 +346,28 @@ public class DirectSessionProxy implements SessionProxy
         return position;
     }
 
+    @Override
     public long sendIncorrectBeginStringLogout(
         final int msgSeqNo, final int sequenceIndex, final int lastMsgSeqNumProcessed)
     {
         return sendLogout(msgSeqNo, INCORRECT_BEGIN_STRING, sequenceIndex, lastMsgSeqNumProcessed);
     }
 
+    @Override
     public long sendNegativeHeartbeatLogout(
         final int msgSeqNo, final int sequenceIndex, final int lastMsgSeqNumProcessed)
     {
         return sendLogout(msgSeqNo, NEGATIVE_HEARTBEAT, sequenceIndex, lastMsgSeqNumProcessed);
     }
 
+    @Override
     public long sendReceivedMessageWithoutSequenceNumber(
         final int msgSeqNo, final int sequenceIndex, final int lastMsgSeqNumProcessed)
     {
         return sendLogout(msgSeqNo, NO_MSG_SEQ_NO, sequenceIndex, lastMsgSeqNumProcessed);
     }
 
+    @Override
     public long sendRejectWhilstNotLoggedOn(
         final int msgSeqNo, final RejectReason reason, final int sequenceIndex, final int lastMsgSeqNumProcessed)
     {
@@ -346,18 +375,22 @@ public class DirectSessionProxy implements SessionProxy
             msgSeqNo, NOT_LOGGED_ON_SESSION_REJECT_REASONS[reason.ordinal()], sequenceIndex, lastMsgSeqNumProcessed);
     }
 
+    @Override
     public long sendHeartbeat(final int msgSeqNo, final int sequenceIndex, final int lastMsgSeqNumProcessed)
     {
         return sendHeartbeat(
             msgSeqNo, null, 0, sequenceIndex, lastMsgSeqNumProcessed);
     }
 
+    @Override
     public long sendHeartbeat(
         final int msgSeqNo, final char[] testReqId,
         final int testReqIdLength,
         final int sequenceIndex,
         final int lastMsgSeqNumProcessed)
     {
+        timestampNs = clock.nanoTime();
+
         final SessionHeaderEncoder header = heartbeat.header();
         setupHeader(header, msgSeqNo, lastMsgSeqNumProcessed);
 
@@ -374,6 +407,7 @@ public class DirectSessionProxy implements SessionProxy
         return send(result, HEARTBEAT_MESSAGE_TYPE, sequenceIndex, heartbeat, msgSeqNo);
     }
 
+    @Override
     public long sendReject(
         final int msgSeqNo,
         final int refSeqNum,
@@ -384,6 +418,8 @@ public class DirectSessionProxy implements SessionProxy
         final int sequenceIndex,
         final int lastMsgSeqNumProcessed)
     {
+        timestampNs = clock.nanoTime();
+
         if (refTagId != MISSING_INT)
         {
             reject.refTagID(refTagId);
@@ -397,7 +433,8 @@ public class DirectSessionProxy implements SessionProxy
         {
             reject.refMsgType(refMsgType, refMsgTypeLength);
         }
-        reject.text(LOGGED_ON_SESSION_REJECT_REASONS[rejectReason]);
+        final int rejectReasonIndex = getRejectReasonIndex(rejectReason);
+        reject.text(LOGGED_ON_SESSION_REJECT_REASONS[rejectReasonIndex]);
 
         final SessionHeaderEncoder header = reject.header();
         setupHeader(header, msgSeqNo, lastMsgSeqNumProcessed);
@@ -409,9 +446,12 @@ public class DirectSessionProxy implements SessionProxy
         return send(result, REJECT_MESSAGE_TYPE, sequenceIndex, reject, msgSeqNo);
     }
 
+    @Override
     public long sendTestRequest(
         final int msgSeqNo, final CharSequence testReqID, final int sequenceIndex, final int lastMsgSeqNumProcessed)
     {
+        timestampNs = clock.nanoTime();
+
         final SessionHeaderEncoder header = testRequest.header();
         setupHeader(header, msgSeqNo, lastMsgSeqNumProcessed);
 
@@ -421,9 +461,12 @@ public class DirectSessionProxy implements SessionProxy
         return send(result, TEST_REQUEST_MESSAGE_TYPE, sequenceIndex, testRequest, msgSeqNo);
     }
 
+    @Override
     public long sendSequenceReset(
         final int msgSeqNo, final int newSeqNo, final int sequenceIndex, final int lastMsgSeqNumProcessed)
     {
+        timestampNs = clock.nanoTime();
+
         final SessionHeaderEncoder header = sequenceReset.header();
         setupHeader(header, msgSeqNo, lastMsgSeqNumProcessed);
 
@@ -436,7 +479,7 @@ public class DirectSessionProxy implements SessionProxy
     private void setupHeader(final SessionHeaderEncoder header, final int msgSeqNo, final int lastMsgSeqNumProcessed)
     {
         final UtcTimestampEncoder timestampEncoder = this.timestampEncoder;
-        final int length = timestampEncoder.updateFrom(clock.nanoTime(), TimeUnit.NANOSECONDS);
+        final int length = timestampEncoder.updateFrom(timestampNs, TimeUnit.NANOSECONDS);
         header.sendingTime(timestampEncoder.buffer(), length);
         header.msgSeqNum(msgSeqNo);
 
@@ -462,16 +505,21 @@ public class DirectSessionProxy implements SessionProxy
         final int offset = Encoder.offset(result);
         final long position = gatewayPublication.saveMessage(
             buffer, offset, length,
-            libraryId, messageType, sessionId, sequenceIndex, connectionId, OK, msgSeqNo);
+            libraryId, messageType, sessionId, sequenceIndex, connectionId, OK, msgSeqNo, timestampNs);
         encoder.resetMessage();
 
         if (position > 0)
         {
-            DebugLogger.log(FIX_MESSAGE, "Sent ", buffer, offset, length);
+            DebugLogger.logFixMessage(FIX_MESSAGE, messageType, "Sent ", buffer, offset, length);
             lastSentPosition = position;
         }
 
         return position;
+    }
+
+    private int getRejectReasonIndex(final int rejectReason)
+    {
+        return rejectReason == OTHER.representation() ? OTHER_REJECT_INDEX : rejectReason;
     }
 
     public long lastSentPosition()
@@ -479,18 +527,53 @@ public class DirectSessionProxy implements SessionProxy
         return lastSentPosition;
     }
 
+    @Override
     public void libraryConnected(final boolean libraryConnected)
     {
         this.libraryConnected = libraryConnected;
     }
 
+    @Override
     public boolean seqNumResetRequested()
     {
         return seqNumResetRequested;
     }
 
+    @Override
     public long sendCancelOnDisconnectTrigger(final long sessionId, final long timeInNs)
     {
         return gatewayPublication.saveCancelOnDisconnectTrigger(sessionId, timeInNs);
+    }
+
+    @Override
+    public long sendValidResendRequest(
+        final long sessionId,
+        final long connectionId,
+        final long beginSequenceNumber,
+        final long endSequenceNumber,
+        final int sequenceIndex,
+        final long correlationId,
+        final long overriddenBeginSequenceNumber,
+        final DirectBuffer bodyBuffer,
+        final int bodyOffset,
+        final int bodyLength)
+    {
+        return gatewayPublication.saveValidResendRequest(
+            sessionId,
+            connectionId,
+            beginSequenceNumber,
+            endSequenceNumber,
+            sequenceIndex,
+            correlationId,
+            overriddenBeginSequenceNumber,
+            bodyBuffer,
+            bodyOffset,
+            bodyLength);
+    }
+
+    @Override
+    public boolean isAsync()
+    {
+        return false;
     }
 }

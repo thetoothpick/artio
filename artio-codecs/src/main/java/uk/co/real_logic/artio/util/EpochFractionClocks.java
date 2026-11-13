@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -59,11 +59,13 @@ public final class EpochFractionClocks
             this.clock = clock;
         }
 
+        @Override
         public long epochFractionTime()
         {
             return clock.nanoTime() / CalendricalUtil.NANOS_IN_MILLIS;
         }
 
+        @Override
         public EpochFractionFormat epochFractionPrecision()
         {
             return EpochFractionFormat.MILLISECONDS;
@@ -79,11 +81,13 @@ public final class EpochFractionClocks
             this.epochNanoClock = epochNanoClock;
         }
 
+        @Override
         public long epochFractionTime()
         {
             return epochNanoClock.nanoTime() / CalendricalUtil.NANOS_IN_MICROS;
         }
 
+        @Override
         public EpochFractionFormat epochFractionPrecision()
         {
             return EpochFractionFormat.MICROSECONDS;
@@ -99,11 +103,13 @@ public final class EpochFractionClocks
             this.epochNanoClock = epochNanoClock;
         }
 
+        @Override
         public long epochFractionTime()
         {
             return epochNanoClock.nanoTime();
         }
 
+        @Override
         public EpochFractionFormat epochFractionPrecision()
         {
             return EpochFractionFormat.NANOSECONDS;

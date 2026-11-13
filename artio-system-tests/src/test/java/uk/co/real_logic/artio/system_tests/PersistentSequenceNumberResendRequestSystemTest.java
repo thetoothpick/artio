@@ -17,8 +17,10 @@ package uk.co.real_logic.artio.system_tests;
 
 import io.aeron.logbuffer.ControlledFragmentHandler.Action;
 import org.agrona.DirectBuffer;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+
 import uk.co.real_logic.artio.Reply;
 import uk.co.real_logic.artio.TestFixtures;
 import uk.co.real_logic.artio.decoder.NewOrderSingleDecoder;
@@ -26,13 +28,17 @@ import uk.co.real_logic.artio.engine.EngineConfiguration;
 import uk.co.real_logic.artio.engine.FixEngine;
 import uk.co.real_logic.artio.library.LibraryConfiguration;
 import uk.co.real_logic.artio.library.OnMessageInfo;
+import uk.co.real_logic.artio.messages.ReplayMessagesStatus;
 import uk.co.real_logic.artio.session.Session;
 import uk.co.real_logic.artio.util.MutableAsciiBuffer;
 
 import static io.aeron.logbuffer.ControlledFragmentHandler.Action.ABORT;
-import static org.junit.Assert.assertEquals;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.hasSize;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static uk.co.real_logic.artio.Constants.EXECUTION_REPORT_MESSAGE_AS_STR;
 import static uk.co.real_logic.artio.Timing.assertEventuallyTrue;
+import static uk.co.real_logic.artio.engine.logger.Replayer.MOST_RECENT_MESSAGE;
 import static uk.co.real_logic.artio.library.SessionConfiguration.AUTOMATIC_INITIAL_SEQUENCE_NUMBER;
 import static uk.co.real_logic.artio.system_tests.SystemTestUtil.*;
 import static uk.co.real_logic.artio.validation.SessionPersistenceStrategy.alwaysPersistent;
@@ -48,6 +54,7 @@ public class PersistentSequenceNumberResendRequestSystemTest extends AbstractGat
             private final MutableAsciiBuffer asciiBuffer = new MutableAsciiBuffer();
             private final ReportFactory reportFactory = new ReportFactory();
 
+            @Override
             public Action onMessage(
                 final DirectBuffer buffer,
                 final int offset,
@@ -66,7 +73,7 @@ public class PersistentSequenceNumberResendRequestSystemTest extends AbstractGat
                 {
                     newOrderSingle.decode(asciiBuffer, 0, length);
 
-                    final Action action = reportFactory.trySendReport(session, newOrderSingle.sideAsEnum());
+                    final Action action = reportFactory.trySendReportAct(session, newOrderSingle.sideAsEnum());
                     if (action == ABORT)
                     {
                         return action;
@@ -80,7 +87,7 @@ public class PersistentSequenceNumberResendRequestSystemTest extends AbstractGat
         };
     }
 
-    @Before
+    @BeforeEach
     public void setUp()
     {
         deleteLogs();
@@ -88,7 +95,8 @@ public class PersistentSequenceNumberResendRequestSystemTest extends AbstractGat
         launch(AUTOMATIC_INITIAL_SEQUENCE_NUMBER);
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void shouldReplayMessageBeforeARestart()
     {
         final int resendSeqNum = exchangeMessages();
@@ -133,6 +141,52 @@ public class PersistentSequenceNumberResendRequestSystemTest extends AbstractGat
             }, 5000);
     }
 
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
+    public void shouldNotBeAbleToReplayMessagesFromBeforeReset1()
+    {
+        // reset when ReplayIndex instances exist
+        shouldNotBeAbleToReplayMessagesFromBeforeReset0(() -> {});
+    }
+
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
+    public void shouldNotBeAbleToReplayMessagesFromBeforeReset2()
+    {
+        // reset when ReplayIndex instances do not exist
+        shouldNotBeAbleToReplayMessagesFromBeforeReset0(() ->
+        {
+            // restart
+            close();
+            clearMessages();
+            launchMediaDriverWithDirs();
+            launchWithoutConnectingSessions();
+        });
+    }
+
+    private void shouldNotBeAbleToReplayMessagesFromBeforeReset0(final Runnable beforeReset)
+    {
+        final long acceptingSessionId = acceptingSession.id();
+        exchangeMessages();
+        initiatingSession.startLogout();
+        assertSessionsDisconnected();
+
+        beforeReset.run();
+
+        testSystem.awaitCompletedReply(acceptingEngine.resetSequenceNumber(acceptingSessionId));
+
+        connectSessions(1, 1);
+
+        clearMessages();
+        final Reply<ReplayMessagesStatus> reply = acceptingSession.replayReceivedMessages(
+            1, 0,
+            MOST_RECENT_MESSAGE, 1,
+            5000);
+        testSystem.awaitCompletedReply(reply);
+        assertEquals(ReplayMessagesStatus.OK, reply.resultIfPresent());
+        assertThat(acceptingOtfAcceptor.messages(), hasSize(1));
+    }
+
     private int exchangeMessages()
     {
         OrderFactory.sendOrder(initiatingSession);
@@ -143,6 +197,13 @@ public class PersistentSequenceNumberResendRequestSystemTest extends AbstractGat
     }
 
     private void launch(final int initiatorInitialReceivedSequenceNumber)
+    {
+        launchWithoutConnectingSessions();
+
+        connectSessions(AUTOMATIC_INITIAL_SEQUENCE_NUMBER, initiatorInitialReceivedSequenceNumber);
+    }
+
+    private void launchWithoutConnectingSessions()
     {
         final EngineConfiguration acceptingConfig = acceptingConfig(port, ACCEPTOR_ID, INITIATOR_ID, nanoClock);
         acceptingConfig.sessionPersistenceStrategy(alwaysPersistent());
@@ -160,10 +221,15 @@ public class PersistentSequenceNumberResendRequestSystemTest extends AbstractGat
         final LibraryConfiguration initiatingLibraryConfig =
             initiatingLibraryConfig(libraryAeronPort, initiatingHandler, nanoClock);
         initiatingLibrary = testSystem.connect(initiatingLibraryConfig);
+    }
 
+    private void connectSessions(
+        final int initiatorInitialSentSequenceNumber,
+        final int initiatorInitialReceivedSequenceNumber)
+    {
         final Reply<Session> reply = connectPersistentSessions(
-            AUTOMATIC_INITIAL_SEQUENCE_NUMBER, initiatorInitialReceivedSequenceNumber, false);
-        assertEquals("Reply failed: " + reply, Reply.State.COMPLETED, reply.state());
+            initiatorInitialSentSequenceNumber, initiatorInitialReceivedSequenceNumber, false);
+        assertEquals(Reply.State.COMPLETED, reply.state(), "Reply failed: " + reply);
         initiatingSession = reply.resultIfPresent();
         acquireAcceptingSession();
     }

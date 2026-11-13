@@ -164,7 +164,10 @@ public interface SessionHeaderEncoder
 
     SessionHeaderEncoder lastMsgSeqNumProcessed(int value);
 
-    boolean hasLastMsgSeqNumProcessed();
+    default boolean hasLastMsgSeqNumProcessed()
+    {
+        return false;
+    }
 
     long startMessage(MutableAsciiBuffer buffer, int offset);
 
@@ -181,5 +184,13 @@ public interface SessionHeaderEncoder
     SessionHeaderEncoder msgType(byte[] value, int length);
 
     SessionHeaderEncoder msgType(byte[] value, int offset, int length);
+
+    void reset();
+
+    StringBuilder appendTo(StringBuilder builder);
+
+    StringBuilder appendTo(StringBuilder builder, int level);
+
+    SessionHeaderEncoder copyTo(Encoder encoder);
 
 }

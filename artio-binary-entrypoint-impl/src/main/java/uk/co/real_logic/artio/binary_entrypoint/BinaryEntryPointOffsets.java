@@ -15,40 +15,37 @@
  */
 package uk.co.real_logic.artio.binary_entrypoint;
 
-import b3.entrypoint.fixp.sbe.NegotiateEncoder;
 import org.agrona.DirectBuffer;
 import uk.co.real_logic.artio.fixp.AbstractFixPOffsets;
-import uk.co.real_logic.sbe.ir.Ir;
 
 public class BinaryEntryPointOffsets extends AbstractFixPOffsets
 {
-    private static final String SBE_IR_FILE = "binary_entrypoint.sbeir";
 
-    public static Ir loadSbeIr()
-    {
-        return AbstractFixPOffsets.loadSbeIr(NegotiateEncoder.class, SBE_IR_FILE);
-    }
-
+    @Override
     public int seqNumOffset(final int templateId)
     {
         return 0;
     }
 
+    @Override
     public int seqNum(final int templateId, final DirectBuffer buffer, final int messageOffset)
     {
         return 0;
     }
 
+    @Override
     public int possRetransOffset(final int templateId)
     {
         return 0;
     }
 
+    @Override
     public int possRetrans(final int templateId, final DirectBuffer buffer, final int messageOffset)
     {
         return 0;
     }
 
+    @Override
     public int sendingTimeEpochOffset(final int templateId)
     {
         return 0;

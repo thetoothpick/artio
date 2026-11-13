@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited., Monotonic Ltd.
+ * Copyright 2015-2025 Real Logic Limited., Monotonic Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,17 +17,20 @@ package uk.co.real_logic.artio.session;
 
 import org.agrona.LangUtil;
 import org.agrona.concurrent.UnsafeBuffer;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import uk.co.real_logic.artio.decoder.AbstractLogonDecoder;
 import uk.co.real_logic.artio.decoder.LogonDecoder;
 import uk.co.real_logic.artio.dictionary.FixDictionary;
 import uk.co.real_logic.artio.fields.RejectReason;
 import uk.co.real_logic.artio.library.OnMessageInfo;
+import uk.co.real_logic.artio.messages.CancelOnDisconnectOption;
 import uk.co.real_logic.artio.messages.SessionState;
 import uk.co.real_logic.artio.validation.AuthenticationStrategy;
 import uk.co.real_logic.artio.validation.MessageValidationStrategy;
 
 import static java.nio.charset.StandardCharsets.US_ASCII;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.Mockito.*;
 import static uk.co.real_logic.artio.Constants.TARGET_COMP_ID;
 import static uk.co.real_logic.artio.dictionary.generation.CodecUtil.MISSING_INT;
@@ -39,12 +42,13 @@ public class SessionParserTest
     private final AuthenticationStrategy mockAuthenticationStrategy = mock(AuthenticationStrategy.class);
     private final MessageValidationStrategy validationStrategy = MessageValidationStrategy.targetCompId("das");
     private final OnMessageInfo messageInfo = mock(OnMessageInfo.class);
+    private final AbstractLogonDecoder logon = mock(AbstractLogonDecoder.class);
 
     private final SessionParser parser = new SessionParser(
         mockSession, validationStrategy, LangUtil::rethrowUnchecked,
         false, true, messageInfo, null);
 
-    @Before
+    @BeforeEach
     public void setUp()
     {
         parser.fixDictionary(FixDictionary.of(FixDictionary.findDefault()));
@@ -97,6 +101,79 @@ public class SessionParserTest
 
         verify(mockSession).startLogout();
         verify(mockSession, never()).onInvalidMessageType(anyInt(), any(), anyInt(), eq(POSITION));
+    }
+
+    @Test
+    public void shouldGetCancelOnDisconnectFromMessage()
+    {
+        when(logon.hasCancelOnDisconnectType()).thenReturn(true);
+        when(logon.supportsCancelOnDisconnectType()).thenReturn(true);
+        when(logon.cancelOnDisconnectType()).thenReturn(CancelOnDisconnectOption.CANCEL_ON_DISCONNECT_ONLY.value());
+
+        final CancelOnDisconnectOption option = SessionParser.cancelOnDisconnectType(logon,
+            CancelOnDisconnectOption.DO_NOT_CANCEL_ON_DISCONNECT_OR_LOGOUT);
+
+        assertEquals(CancelOnDisconnectOption.CANCEL_ON_DISCONNECT_ONLY, option);
+    }
+
+    @Test
+    public void shouldGetDefaultCancelOnDisconnectWhenNotSupported()
+    {
+        when(logon.supportsCancelOnDisconnectType()).thenReturn(false);
+
+        final CancelOnDisconnectOption option = SessionParser.cancelOnDisconnectType(logon,
+            CancelOnDisconnectOption.DO_NOT_CANCEL_ON_DISCONNECT_OR_LOGOUT);
+
+        assertEquals(CancelOnDisconnectOption.DO_NOT_CANCEL_ON_DISCONNECT_OR_LOGOUT, option);
+    }
+
+    @Test
+    public void shouldGetDefaultCancelOnDisconnectWhenNotSet()
+    {
+        when(logon.supportsCancelOnDisconnectType()).thenReturn(true);
+        when(logon.hasCancelOnDisconnectType()).thenReturn(false);
+
+        final CancelOnDisconnectOption option = SessionParser.cancelOnDisconnectType(logon,
+            CancelOnDisconnectOption.DO_NOT_CANCEL_ON_DISCONNECT_OR_LOGOUT);
+
+        assertEquals(CancelOnDisconnectOption.DO_NOT_CANCEL_ON_DISCONNECT_OR_LOGOUT, option);
+    }
+
+    @Test
+    public void shouldGetCancelOnDisconnectWindow()
+    {
+        when(logon.supportsCODTimeoutWindow()).thenReturn(true);
+        when(logon.hasCODTimeoutWindow()).thenReturn(true);
+        when(logon.cODTimeoutWindow()).thenReturn(20);
+
+        final long codTimeoutInMs = SessionParser.cancelOnDisconnectTimeoutWindow(logon,
+            10);
+
+        assertEquals(20, codTimeoutInMs);
+    }
+
+    @Test
+    public void shouldGetDefaultCancelOnDisconnectWindowWhenNotSupported()
+    {
+        when(logon.supportsCODTimeoutWindow()).thenReturn(false);
+        when(logon.hasCODTimeoutWindow()).thenReturn(false);
+
+        final long codTimeoutInMs = SessionParser.cancelOnDisconnectTimeoutWindow(logon,
+            10);
+
+        assertEquals(10, codTimeoutInMs);
+    }
+
+    @Test
+    public void shouldGetDefaultCancelOnDisconnectWindowWhenNotSet()
+    {
+        when(logon.supportsCODTimeoutWindow()).thenReturn(true);
+        when(logon.hasCODTimeoutWindow()).thenReturn(false);
+
+        final long codTimeoutInMs = SessionParser.cancelOnDisconnectTimeoutWindow(logon,
+            10);
+
+        assertEquals(10, codTimeoutInMs);
     }
 
     private UnsafeBuffer bufferOf(final String str)

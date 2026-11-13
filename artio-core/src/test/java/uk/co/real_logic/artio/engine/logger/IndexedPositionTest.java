@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,18 +15,22 @@
  */
 package uk.co.real_logic.artio.engine.logger;
 
+import org.agrona.BufferUtil;
 import org.agrona.ErrorHandler;
 import org.agrona.concurrent.AtomicBuffer;
 import org.agrona.concurrent.UnsafeBuffer;
-import org.junit.After;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterEach;
+
+
+import org.junit.jupiter.api.Test;
 import uk.co.real_logic.artio.FileSystemCorruptionException;
 
-import static org.junit.Assert.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
+import static uk.co.real_logic.artio.engine.EngineConfiguration.DEFAULT_INDEX_CHECKSUM_ENABLED;
 import static uk.co.real_logic.artio.engine.SectorFramer.SECTOR_SIZE;
 import static uk.co.real_logic.artio.engine.logger.ErrorHandlerVerifier.verify;
 import static uk.co.real_logic.artio.engine.logger.IndexedPositionReader.UNKNOWN_POSITION;
@@ -40,11 +44,12 @@ public class IndexedPositionTest
     private static final int OTHER_RECORDING_ID = 4;
 
     private final ErrorHandler errorHandler = mock(ErrorHandler.class);
-    private final AtomicBuffer buffer = new UnsafeBuffer(new byte[2 * SECTOR_SIZE]);
+    private final AtomicBuffer buffer = new UnsafeBuffer(
+        BufferUtil.allocateDirectAligned(2 * SECTOR_SIZE, AtomicBuffer.ALIGNMENT));
     private final IndexedPositionWriter writer = newWriter();
     private final IndexedPositionReader reader = new IndexedPositionReader(buffer);
 
-    @After
+    @AfterEach
     public void noErrors()
     {
         verifyNoMoreInteractions(errorHandler);
@@ -165,6 +170,6 @@ public class IndexedPositionTest
     private IndexedPositionWriter newWriter()
     {
         return new IndexedPositionWriter(buffer, errorHandler, 0, "IndexedPosition",
-            null);
+            null, DEFAULT_INDEX_CHECKSUM_ENABLED);
     }
 }

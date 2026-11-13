@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,49 +15,45 @@
  */
 package uk.co.real_logic.artio.fields;
 
-import org.junit.Test;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
-import org.junit.runners.Parameterized.Parameters;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 
-import java.util.Arrays;
+import java.util.stream.Stream;
 
 import static java.nio.charset.StandardCharsets.US_ASCII;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.params.provider.Arguments.of;
 
-@RunWith(Parameterized.class)
 public class UtcTimestampDecoderInvalidCasesTest
 {
-    private final String timestamp;
-
-    @Parameters(name = "{0}")
-    public static Iterable<Object> data()
+    public static Stream<Arguments> data()
     {
-        return Arrays.asList(
-            new String[] {"-0010101-00:00:00"},
-            new String[] {"00000001-00:00:00"},
-            new String[] {"00000100-00:00:00"},
-            new String[] {"00001301-00:00:00"},
-            new String[] {"00000132-00:00:00"},
-            new String[] {"00000101-24:00:00"},
-            new String[] {"00000101-00:60:00"},
-            new String[] {"00000101-00:00:61"}
+        return Stream.of(
+            of("-0010101-00:00:00"),
+            of("00000001-00:00:00"),
+            of("00000100-00:00:00"),
+            of("00001301-00:00:00"),
+            of("00000132-00:00:00"),
+            of("00000101-24:00:00"),
+            of("00000101-00:60:00"),
+            of("00000101-00:00:61")
         );
     }
 
-    public UtcTimestampDecoderInvalidCasesTest(final String timestamp)
+    @ParameterizedTest
+    @MethodSource(value = "data")
+    public void cannotParseTimestamp(final String timestamp)
     {
-        this.timestamp = timestamp;
+        assertThrows(IllegalArgumentException.class, () ->
+            new UtcTimestampDecoder(true).decode(timestamp.getBytes(US_ASCII)));
     }
 
-    @Test(expected = IllegalArgumentException.class)
-    public void cannotParseTimestamp()
+    @ParameterizedTest
+    @MethodSource(value = "data")
+    public void cannotParseTimestampMicros(final String timestamp)
     {
-        new UtcTimestampDecoder(true).decode(timestamp.getBytes(US_ASCII));
-    }
-
-    @Test(expected = IllegalArgumentException.class)
-    public void cannotParseTimestampMicros()
-    {
-        new UtcTimestampDecoder(true).decodeMicros(timestamp.getBytes(US_ASCII));
+        assertThrows(IllegalArgumentException.class, () ->
+            new UtcTimestampDecoder(true).decodeMicros(timestamp.getBytes(US_ASCII)));
     }
 }

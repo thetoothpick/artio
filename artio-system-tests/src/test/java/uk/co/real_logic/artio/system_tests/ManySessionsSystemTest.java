@@ -15,8 +15,10 @@
  */
 package uk.co.real_logic.artio.system_tests;
 
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+
 import uk.co.real_logic.artio.Reply;
 import uk.co.real_logic.artio.engine.EngineConfiguration;
 import uk.co.real_logic.artio.engine.FixEngine;
@@ -27,14 +29,14 @@ import uk.co.real_logic.artio.validation.AuthenticationStrategy;
 
 import java.util.List;
 import java.util.stream.Collectors;
-import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
 import static io.aeron.CommonContext.IPC_CHANNEL;
 import static java.util.Collections.singletonList;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.greaterThan;
-import static org.junit.Assert.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static uk.co.real_logic.artio.TestFixtures.configureAeronArchive;
 import static uk.co.real_logic.artio.TestFixtures.launchMediaDriver;
 import static uk.co.real_logic.artio.Timing.assertEventuallyTrue;
 import static uk.co.real_logic.artio.system_tests.SystemTestUtil.*;
@@ -43,7 +45,7 @@ public class ManySessionsSystemTest extends AbstractGatewayToGatewaySystemTest
 {
     private static final int NUMBER_OF_SESSIONS = 10;
 
-    @Before
+    @BeforeEach
     public void launch()
     {
         delete(ACCEPTOR_LOGS);
@@ -51,6 +53,7 @@ public class ManySessionsSystemTest extends AbstractGatewayToGatewaySystemTest
         mediaDriver = launchMediaDriver();
 
         final EngineConfiguration configuration = new EngineConfiguration();
+        configureAeronArchive(configuration.aeronArchiveContext());
         final AuthenticationStrategy authenticationStrategy = AuthenticationStrategy.none();
         configuration.authenticationStrategy(authenticationStrategy);
 
@@ -76,12 +79,18 @@ public class ManySessionsSystemTest extends AbstractGatewayToGatewaySystemTest
     }
 
     @SuppressWarnings("unchecked")
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void shouldConnectManySessions()
     {
-        final Reply<Session>[] replies = IntStream.range(0, NUMBER_OF_SESSIONS)
-            .mapToObj(i -> initiate(initiatingLibrary, port, initId(i), accId(i)))
-            .toArray(Reply[]::new);
+        final long timeoutInMs = 5 * TEST_REPLY_TIMEOUT_IN_MS;
+
+        final Reply<Session>[] replies = new Reply[NUMBER_OF_SESSIONS];
+        for (int i = 0; i < NUMBER_OF_SESSIONS; i++)
+        {
+            replies[i] = initiate(initiatingLibrary, port, initId(i), accId(i), timeoutInMs);
+            testSystem.poll();
+        }
 
         testSystem.awaitCompletedReplies(replies);
 
@@ -92,7 +101,8 @@ public class ManySessionsSystemTest extends AbstractGatewayToGatewaySystemTest
         sessions.forEach(this::messagesCanBeExchanged);
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void shouldBeNotifiedOnSessionLogoutAndDisconnect()
     {
         final Reply<Session> sessionReply = initiate(initiatingLibrary, port, INITIATOR_ID, ACCEPTOR_ID);

@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
  */
 package uk.co.real_logic.artio.session;
 
+import org.agrona.DirectBuffer;
 import uk.co.real_logic.artio.dictionary.FixDictionary;
 import uk.co.real_logic.artio.fields.RejectReason;
 import uk.co.real_logic.artio.messages.CancelOnDisconnectOption;
@@ -23,8 +24,8 @@ import uk.co.real_logic.artio.messages.DisconnectReason;
 /**
  * A proxy that allows users to hook the sending of FIX session protocol messages through an external system. This can
  * be used to integrate Artio into a clustering system. You implement the SessionProxy interface to write the
- * session protocol messages into your clustering system. This enables you to achieve a strong concensus on the protocol
- * mesages before using the <code>SessionWriter</code> class to write them back out.
+ * session protocol messages into your clustering system. This enables you to achieve a strong consensus on the protocol
+ * messages before using the <code>SessionWriter</code> class to write them back out.
  */
 public interface SessionProxy
 {
@@ -54,7 +55,7 @@ public interface SessionProxy
         CancelOnDisconnectOption cancelOnDisconnectOption,
         int cancelOnDisconnectTimeoutWindowInMs);
 
-    long sendLogout(int msgSeqNo, int sequenceIndex, int lastMsgSeqNumProcessed);
+    long sendLogout(int msgSeqNo, int sequenceIndex, int lastMsgSeqNumProcessed, byte[] text);
 
     long sendLogout(
         int msgSeqNo, int sequenceIndex, int rejectReason, int lastMsgSeqNumProcessed);
@@ -108,4 +109,24 @@ public interface SessionProxy
     boolean seqNumResetRequested();
 
     long sendCancelOnDisconnectTrigger(long id, long timeInNs);
+
+    long sendValidResendRequest(
+        long sessionId,
+        long connectionId,
+        long beginSequenceNumber,
+        long endSequenceNumber,
+        int sequenceIndex,
+        long correlationId,
+        long overriddenBeginSequenceNumber,
+        DirectBuffer bodyBuffer,
+        int bodyOffset,
+        int bodyLength);
+
+    /**
+     * Determines whether this implementation is asynchronous, for example, that it round-trips a message
+     * via an external cluster system and then writes out the message via a follower session.
+     *
+     * @return true if asynchronous, false otherwise.
+     */
+    boolean isAsync();
 }

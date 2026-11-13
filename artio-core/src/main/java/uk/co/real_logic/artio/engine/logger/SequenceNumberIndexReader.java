@@ -1,5 +1,5 @@
 /*
- * Copyright 2015=2016 Real Logic Limited., Monotonic Ltd.
+ * Copyright 2015-2016 Real Logic Limited., Monotonic Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -32,6 +32,7 @@ import java.io.IOException;
 import java.io.RandomAccessFile;
 
 import static io.aeron.archive.status.RecordingPos.NULL_RECORDING_ID;
+import static uk.co.real_logic.artio.AtomicBuffers.checkAligned;
 import static uk.co.real_logic.artio.engine.ConnectedSessionInfo.UNK_SESSION;
 import static uk.co.real_logic.artio.engine.SectorFramer.OUT_OF_SPACE;
 import static uk.co.real_logic.artio.engine.logger.IndexedPositionReader.UNKNOWN_POSITION;
@@ -59,7 +60,7 @@ public class SequenceNumberIndexReader implements AutoCloseable
         final RecordingIdLookup recordingIdLookup,
         final String metaDataDir)
     {
-        this.inMemoryBuffer = inMemoryBuffer;
+        this.inMemoryBuffer = checkAligned(inMemoryBuffer);
         this.errorHandler = errorHandler;
         this.recordingIdLookup = recordingIdLookup;
         final int positionTableOffset = positionTableOffset(inMemoryBuffer.capacity());
@@ -102,7 +103,8 @@ public class SequenceNumberIndexReader implements AutoCloseable
 
             if (lastKnownDecoder.sessionId() == sessionId)
             {
-                return lastKnownDecoder.sequenceNumber();
+                final int sequenceNumber = lastKnownDecoder.sequenceNumber();
+                return sequenceNumber;
             }
 
             position += RECORD_SIZE;
@@ -170,6 +172,7 @@ public class SequenceNumberIndexReader implements AutoCloseable
         }
     }
 
+    @Override
     public void close()
     {
         CloseHelper.close(metaDataFile);

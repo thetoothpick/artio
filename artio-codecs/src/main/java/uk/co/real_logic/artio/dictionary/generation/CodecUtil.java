@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,10 +15,12 @@
  */
 package uk.co.real_logic.artio.dictionary.generation;
 
-import org.agrona.MutableDirectBuffer;
-import uk.co.real_logic.artio.fields.DecimalFloat;
-
 import java.util.Arrays;
+
+import org.agrona.MutableDirectBuffer;
+
+
+import uk.co.real_logic.artio.fields.ReadOnlyDecimalFloat;
 
 import static java.nio.charset.StandardCharsets.US_ASCII;
 
@@ -104,18 +106,23 @@ public final class CodecUtil
     }
 
     // NB: only valid for ASCII bytes.
-    public static void toBytes(final CharSequence value, final MutableDirectBuffer buffer)
+    public static boolean toBytes(final CharSequence value, final MutableDirectBuffer buffer)
     {
+        boolean bufferChanged = false;
+
         final int length = value.length();
         if (buffer.capacity() < length)
         {
             buffer.wrap(new byte[length]);
+            bufferChanged = true;
         }
 
         for (int i = 0; i < length; i++)
         {
             buffer.putByte(i, (byte)value.charAt(i));
         }
+
+        return bufferChanged;
     }
 
     // NB: only valid for ASCII bytes.
@@ -125,18 +132,23 @@ public final class CodecUtil
     }
 
     // NB: only valid for ASCII bytes.
-    public static void toBytes(
+    public static boolean toBytes(
         final char[] value, final MutableDirectBuffer buffer, final int offset, final int length)
     {
+        boolean bufferChanged = false;
+
         if (buffer.capacity() < length)
         {
             buffer.wrap(new byte[length]);
+            bufferChanged = true;
         }
 
         for (int i = 0; i < length; i++)
         {
             buffer.putByte(i, (byte)value[i + offset]);
         }
+
+        return bufferChanged;
     }
 
     public static boolean equals(
@@ -146,7 +158,7 @@ public final class CodecUtil
         final int expectedOffset,
         final int length)
     {
-        if (value.length < length || expected.length < length)
+        if (value.length < offset + length || expected.length < expectedOffset + length)
         {
             return false;
         }
@@ -162,8 +174,20 @@ public final class CodecUtil
         return true;
     }
 
+    /**
+     * Compares first {@code length} characters of {@code value} with all {@code expected} characters.
+     *
+     * @param value    the array containing the actual value, might be longer than the value itself
+     * @param expected the array containing the expected value, both equal in length
+     * @param length   the length of the actual value
+     * @return true if the actual value is equal to the expected one
+     */
     public static boolean equals(final char[] value, final char[] expected, final int length)
     {
+        if (length != expected.length)
+        {
+            return false;
+        }
         return equals(value, expected, 0, 0, length);
     }
 
@@ -223,17 +247,19 @@ public final class CodecUtil
         }
     }
 
-    public static void copyInto(
+    public static boolean copyInto(
         final MutableDirectBuffer buffer, final byte[] data, final int offset, final int length)
     {
         final byte[] dest = buffer.byteArray();
         if (dest != null && dest.length >= length)
         {
             System.arraycopy(data, offset, dest, 0, length);
+            return false;
         }
         else
         {
             buffer.wrap(Arrays.copyOfRange(data, offset, offset + length));
+            return true;
         }
     }
 
@@ -261,7 +287,7 @@ public final class CodecUtil
         }
     }
 
-    public static void appendFloat(final StringBuilder builder, final DecimalFloat price)
+    public static void appendFloat(final StringBuilder builder, final ReadOnlyDecimalFloat price)
     {
         final long value = price.value();
         final int scale = price.scale();

@@ -18,10 +18,10 @@ package uk.co.real_logic.artio.ilink;
 import iLinkBinary.NewOrderSingle514Decoder;
 import iLinkBinary.NotApplied513Decoder;
 import iLinkBinary.PartyDetailsDefinitionRequestAck519Decoder;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 import uk.co.real_logic.artio.fixp.AbstractFixPOffsets;
 
-import static org.junit.Assert.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
 public class ILink3OffsetsTest
 {

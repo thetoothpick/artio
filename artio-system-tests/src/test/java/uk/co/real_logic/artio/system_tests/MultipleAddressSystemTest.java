@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,8 +16,10 @@
 package uk.co.real_logic.artio.system_tests;
 
 import io.aeron.driver.MediaDriver;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+
 import uk.co.real_logic.artio.MonitoringAgentFactory;
 import uk.co.real_logic.artio.Reply;
 import uk.co.real_logic.artio.TestFixtures;
@@ -27,7 +29,7 @@ import uk.co.real_logic.artio.engine.LowResourceEngineScheduler;
 import uk.co.real_logic.artio.library.SessionConfiguration;
 import uk.co.real_logic.artio.session.Session;
 
-import static org.junit.Assert.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static uk.co.real_logic.artio.TestFixtures.*;
 import static uk.co.real_logic.artio.system_tests.SystemTestUtil.*;
 
@@ -35,7 +37,7 @@ public class MultipleAddressSystemTest extends AbstractGatewayToGatewaySystemTes
 {
     private static final int NONSENSE_PORT = 1000;
 
-    @Before
+    @BeforeEach
     public void launch()
     {
         final int libraryAeronPort = unusedPort();
@@ -57,7 +59,8 @@ public class MultipleAddressSystemTest extends AbstractGatewayToGatewaySystemTes
         testSystem = new TestSystem(initiatingLibrary);
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void shouldConnectToValidAddressIfMultipleGiven()
     {
         final SessionConfiguration config = SessionConfiguration.builder()

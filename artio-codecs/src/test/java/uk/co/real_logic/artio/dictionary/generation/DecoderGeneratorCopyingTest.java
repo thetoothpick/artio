@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,18 +15,18 @@
  */
 package uk.co.real_logic.artio.dictionary.generation;
 
-import org.junit.BeforeClass;
-import org.junit.Test;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
 import uk.co.real_logic.artio.builder.Decoder;
 import uk.co.real_logic.artio.fields.RejectReason;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static uk.co.real_logic.artio.dictionary.ExampleDictionary.*;
 
 public class DecoderGeneratorCopyingTest extends AbstractDecoderGeneratorTest
 {
-    @BeforeClass
+    @BeforeAll
     public static void generate() throws Exception
     {
         generate(false);
@@ -50,6 +50,18 @@ public class DecoderGeneratorCopyingTest extends AbstractDecoderGeneratorTest
         final Decoder decoder = newHeartbeat();
 
         decode(INVALID_FLOAT_VALUE_MESSAGE, decoder);
+
+        assertFalse(decoder.validate());
+        assertEquals(RejectReason.INCORRECT_DATA_FORMAT_FOR_VALUE.representation(), decoder.rejectReason());
+        assertEquals(FLOAT_FIELD_TAG, decoder.invalidTagId());
+    }
+
+    @Test
+    public void shouldValidateDataFormatForOutOfRangeFloats() throws Exception
+    {
+        final Decoder decoder = newHeartbeat();
+
+        decode(OUT_OF_RANGE_FLOAT_VALUE_MESSAGE, decoder);
 
         assertFalse(decoder.validate());
         assertEquals(RejectReason.INCORRECT_DATA_FORMAT_FOR_VALUE.representation(), decoder.rejectReason());

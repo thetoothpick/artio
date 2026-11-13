@@ -15,8 +15,10 @@
  */
 package uk.co.real_logic.artio.system_tests;
 
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+
 import uk.co.real_logic.artio.engine.EngineConfiguration;
 import uk.co.real_logic.artio.engine.FixEngine;
 import uk.co.real_logic.artio.library.LibraryConfiguration;
@@ -26,7 +28,7 @@ import static uk.co.real_logic.artio.system_tests.SystemTestUtil.*;
 
 public class ReliableHandoverSystemTest extends AbstractGatewayToGatewaySystemTest
 {
-    @Before
+    @BeforeEach
     public void launch()
     {
         mediaDriver = launchMediaDriver();
@@ -44,7 +46,8 @@ public class ReliableHandoverSystemTest extends AbstractGatewayToGatewaySystemTe
         testSystem = new TestSystem(acceptingLibrary, initiatingLibrary);
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void messagesCanBeSentFromInitiatorToAcceptor()
     {
         connectSessions();

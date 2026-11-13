@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ package uk.co.real_logic.artio.dictionary.generation;
 import org.agrona.collections.IntHashSet;
 import org.agrona.generation.OutputManager;
 import uk.co.real_logic.artio.dictionary.CharArraySet;
+import uk.co.real_logic.artio.dictionary.Generated;
 import uk.co.real_logic.artio.dictionary.ir.Dictionary;
 import uk.co.real_logic.artio.dictionary.ir.Field;
 
@@ -25,40 +26,65 @@ import java.util.Collection;
 
 import static java.util.stream.Collectors.joining;
 import static uk.co.real_logic.artio.dictionary.generation.DecoderGenerator.addField;
+import static uk.co.real_logic.artio.dictionary.generation.GenerationUtil.GENERATED_ANNOTATION;
 import static uk.co.real_logic.artio.dictionary.generation.GenerationUtil.fileHeader;
 import static uk.co.real_logic.artio.dictionary.generation.GenerationUtil.importFor;
 
 class ConstantGenerator
 {
     static final String CLASS_NAME = "Constants";
+    static final String SHARED_NAME = "Shared" + CLASS_NAME;
 
-    private static final String BODY = "public class " + CLASS_NAME + "\n" + "{\n\n";
     static final String VERSION = "VERSION";
 
+    private final String className;
+    private final String body;
     private final Dictionary dictionary;
     private final String builderPackage;
     private final OutputManager outputManager;
 
     ConstantGenerator(
-        final Dictionary dictionary, final String builderPackage, final OutputManager outputManager)
+        final Dictionary dictionary,
+        final String builderPackage,
+        final String sharedPackage,
+        final OutputManager outputManager)
     {
         this.dictionary = dictionary;
         this.builderPackage = builderPackage;
         this.outputManager = outputManager;
+
+        className = dictionary.shared() ? SHARED_NAME : CLASS_NAME;
+
+        final String extendsClause;
+        if (dictionary.hasSharedParent())
+        {
+            extendsClause = " extends " + sharedPackage + "." + SHARED_NAME;
+        }
+        else
+        {
+            extendsClause = "";
+        }
+
+        body = "public class " + className + extendsClause + "\n" + "{\n\n";
     }
 
     public void generate()
     {
-        outputManager.withOutput(CLASS_NAME, (out) ->
+        outputManager.withOutput(className, (out) ->
         {
             out.append(fileHeader(builderPackage));
             out.append(importFor(IntHashSet.class));
             out.append(importFor(CharArraySet.class));
-            out.append(BODY);
+            out.append(importFor(Generated.class));
+            out.append("\n" + GENERATED_ANNOTATION);
+            out.append(body);
             out.append(generateVersion());
             out.append(generateMessageTypes());
             out.append(generateFieldTags());
-            out.append(generateAllFieldsDictionary());
+            if (!dictionary.shared())
+            {
+                out.append(generateAllFieldsDictionary());
+            }
             out.append("}\n");
         });
     }
@@ -107,7 +133,8 @@ class ConstantGenerator
         return dictionary
             .messages()
             .stream()
-            .map((message) ->
+            .filter(message -> !message.isInParent())
+            .map(message ->
             {
                 final long type = message.packedType();
                 final String constantName = GenerationUtil.constantName(message.name()) + "_MESSAGE";
@@ -122,6 +149,7 @@ class ConstantGenerator
     {
         return fields()
             .stream()
+            .filter(field -> !field.isInParent())
             .map(field -> generateIntConstant(GenerationUtil.constantName(field.name()), field.number()))
             .collect(joining());
     }

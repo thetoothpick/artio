@@ -20,6 +20,7 @@ import uk.co.real_logic.artio.engine.SessionInfo;
 import uk.co.real_logic.artio.session.SessionIdStrategy;
 
 import java.io.File;
+import java.util.Comparator;
 
 /**
  * Prints out the state of a session contexts file
@@ -35,11 +36,14 @@ public final class SessionContextDumper
             mappedFile,
             SessionIdStrategy.senderAndTarget(),
             1,
-            Throwable::printStackTrace);
+            throwable -> throwable.printStackTrace(System.out),
+            false,
+            new IncrementalSessionIdGenerator());
 
-        for (final SessionInfo sess : contexts.allSessions())
-        {
-            System.out.println(sess);
-        }
+        contexts
+            .allSessions()
+            .stream()
+            .sorted(Comparator.comparing(SessionInfo::sessionId))
+            .forEach(System.out::println);
     }
 }

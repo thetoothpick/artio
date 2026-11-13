@@ -23,8 +23,8 @@ import uk.co.real_logic.artio.fixp.FixPContext;
 import uk.co.real_logic.artio.messages.FixPProtocolType;
 import uk.co.real_logic.artio.messages.SessionReplyStatus;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 
 public class FakeFixPConnectionExistsHandler implements FixPConnectionExistsHandler
 {
@@ -34,6 +34,14 @@ public class FakeFixPConnectionExistsHandler implements FixPConnectionExistsHand
     private FixPContext lastIdentification;
     private Reply<SessionReplyStatus> lastReply;
 
+    private boolean request = true;
+
+    public void request(final boolean request)
+    {
+        this.request = request;
+    }
+
+    @Override
     public ControlledFragmentHandler.Action onConnectionExists(
         final FixLibrary library,
         final long surrogateSessionId,
@@ -46,7 +54,10 @@ public class FakeFixPConnectionExistsHandler implements FixPConnectionExistsHand
         this.lastSurrogateSessionId = surrogateSessionId;
         this.lastIdentification = context;
 
-        lastReply = requestSession(library, surrogateSessionId);
+        if (request)
+        {
+            lastReply = requestSession(library, surrogateSessionId);
+        }
 
         return ControlledFragmentHandler.Action.CONTINUE;
     }

@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd., Monotonic Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd., Monotonic Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,17 +16,14 @@
 package uk.co.real_logic.artio.engine.logger;
 
 import io.aeron.ExclusivePublication;
-import io.aeron.Subscription;
+import io.aeron.driver.DutyCycleTracker;
 import io.aeron.logbuffer.BufferClaim;
-import io.aeron.logbuffer.ControlledFragmentHandler;
 import io.aeron.logbuffer.Header;
 import org.agrona.DirectBuffer;
 import org.agrona.ErrorHandler;
-import org.agrona.collections.CollectionUtil;
 import org.agrona.collections.IntHashSet;
 import org.agrona.collections.Long2ObjectHashMap;
 import org.agrona.collections.LongHashSet;
-import org.agrona.concurrent.Agent;
 import org.agrona.concurrent.EpochNanoClock;
 import org.agrona.concurrent.IdleStrategy;
 import org.agrona.concurrent.status.AtomicCounter;
@@ -34,7 +31,7 @@ import uk.co.real_logic.artio.DebugLogger;
 import uk.co.real_logic.artio.FixGatewayException;
 import uk.co.real_logic.artio.decoder.AbstractResendRequestDecoder;
 import uk.co.real_logic.artio.engine.*;
-import uk.co.real_logic.artio.engine.framer.ThrottleRejectBuilder;
+import uk.co.real_logic.artio.engine.framer.FixThrottleRejectBuilder;
 import uk.co.real_logic.artio.fields.EpochFractionFormat;
 import uk.co.real_logic.artio.fields.UtcTimestampEncoder;
 import uk.co.real_logic.artio.fixp.*;
@@ -44,15 +41,15 @@ import uk.co.real_logic.artio.util.CharFormatter;
 import uk.co.real_logic.artio.util.Lazy;
 import uk.co.real_logic.artio.util.MutableAsciiBuffer;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 
-import static io.aeron.logbuffer.ControlledFragmentHandler.Action.*;
+import static io.aeron.logbuffer.FrameDescriptor.UNFRAGMENTED;
+import static uk.co.real_logic.artio.DebugLogger.IS_REPLAY_LOG_TAG_ENABLED;
 import static uk.co.real_logic.artio.LogTag.REPLAY;
 import static uk.co.real_logic.artio.dictionary.generation.CodecUtil.MISSING_INT;
 import static uk.co.real_logic.artio.messages.MessageHeaderDecoder.ENCODED_LENGTH;
-import static uk.co.real_logic.artio.util.MessageTypeEncoding.packMessageType;
+import static uk.co.real_logic.artio.util.MessageTypeEncoding.packAllMessageTypes;
 
 /**
  * The replayer responds to resend requests with data from the log of sent messages.
@@ -61,74 +58,54 @@ import static uk.co.real_logic.artio.util.MessageTypeEncoding.packMessageType;
  * Resend Request messages and searches the log, using the replay index to find
  * relevant messages to resend.
  */
-public class Replayer implements Agent, ControlledFragmentHandler
+public class Replayer extends AbstractReplayer
 {
     public static final int MOST_RECENT_MESSAGE = 0;
 
     static final int MESSAGE_FRAME_BLOCK_LENGTH =
         ENCODED_LENGTH + FixMessageDecoder.BLOCK_LENGTH + FixMessageDecoder.bodyHeaderLength();
     static final int SIZE_OF_LENGTH_FIELD = FixMessageDecoder.bodyHeaderLength();
-    private static final int POLL_LIMIT = 10;
-
-    private final AsciiBuffer asciiBuffer = new MutableAsciiBuffer();
-    private final BufferClaim bufferClaim;
-
-    // Safe to share between multiple ReplayerSession instances due to single threaded nature of the Replayer
-    final MessageHeaderDecoder messageHeaderDecoder = new MessageHeaderDecoder();
-    final MessageHeaderEncoder messageHeaderEncoder = new MessageHeaderEncoder();
-    final ReplayCompleteEncoder replayCompleteEncoder = new ReplayCompleteEncoder();
 
     // FIX specific state.
     private final LongHashSet gapFillMessageTypes;
     private final FixSessionCodecsFactory fixSessionCodecsFactory;
     private final CharFormatter receivedResendFormatter = new CharFormatter(
-        "Received Resend Request for inclusive range: [%s, %s]");
-    private final CharFormatter alreadyDisconnectedFormatter = new CharFormatter(
-        "Not processing Resend Request for %s because it has already disconnected");
+        "Received Resend Request for inclusive range: [%s, %s] gapfillingTo=%s connId=%s");
 
     // For FixReplayerSession, safe to share rather than allocate for each FixReplayerSession
     final CharFormatter completeNotRecentFormatter = new CharFormatter(
         "ReplayerSession: completeReplay-!upToMostRecent replayedMessages=%s " +
-        "endSeqNo=%s beginSeqNo=%s expectedCount=%s");
-    final CharFormatter completeReplayGapfillFormatter = new CharFormatter(
-        "ReplayerSession: completeReplay-sendGapFill action=%s, replayedMessages=%s, " +
-        "beginGapFillSeqNum=%s, newSequenceNumber=%s");
+        "endSeqNo=%s beginSeqNo=%s overriddenBeginSeqNo=%s expectedCount=%s connId=%s");
+    final FixMessageEncoder fixMessageEncoder = new FixMessageEncoder();
+    final FixMessageDecoder fixMessageDecoder = new FixMessageDecoder();
+    final ThrottleRejectDecoder throttleRejectDecoder = new ThrottleRejectDecoder();
+    final AsciiBuffer sessionAsciiBuffer = new MutableAsciiBuffer();
+    final AsciiBuffer asciiBuffer = new MutableAsciiBuffer();
 
     // Binary FIXP specific state
     private final IntHashSet gapfillOnRetransmitILinkTemplateIds;
     private final Lazy<FixPProtocol> binaryFixPProtocol;
+    private final Lazy<FixPMessageDissector> binaryFixPDissector;
     private final Lazy<AbstractFixPParser> binaryFixPParser;
     private final Lazy<AbstractFixPProxy> binaryFixPProxy;
     private final Lazy<AbstractFixPOffsets> abstractBinaryFixPOffsets;
-    private final LongHashSet fixPConnectionIds = new LongHashSet();
-    private final ILinkConnectDecoder iLinkConnect = new ILinkConnectDecoder();
-    private final InboundFixPConnectDecoder inboundFixPConnect = new InboundFixPConnectDecoder();
     private final FixPMessageEncoder fixPMessageEncoder = new FixPMessageEncoder();
     private final ReplayTimestamper timestamper;
 
-    private final List<ReplayChannel> closingChannels = new ArrayList<>();
     private final Long2ObjectHashMap<ReplayChannel> connectionIdToReplayerChannel = new Long2ObjectHashMap<>();
-    private final MessageHeaderDecoder messageHeader = new MessageHeaderDecoder();
-    private final ValidResendRequestDecoder validResendRequest = new ValidResendRequestDecoder();
-    private final RequestDisconnectDecoder requestDisconnect = new RequestDisconnectDecoder();
-    private final DisconnectDecoder disconnect = new DisconnectDecoder();
 
     private final int maxBytesInBuffer;
     private final ReplayerCommandQueue replayerCommandQueue;
     private final AtomicCounter currentReplayCount;
     private final int maxConcurrentSessionReplays;
-    private final EpochNanoClock clock;
     private final EngineConfiguration configuration;
     private final ReplayQuery outboundReplayQuery;
-    private final ExclusivePublication publication;
     private final IdleStrategy idleStrategy;
     private final ErrorHandler errorHandler;
     private final int maxClaimAttempts;
-    private final Subscription inboundSubscription;
     private final String agentNamePrefix;
     private final ReplayHandler replayHandler;
     private final FixPRetransmitHandler fixPRetransmitHandler;
-    private final SenderSequenceNumbers senderSequenceNumbers;
     private final UtcTimestampEncoder utcTimestampEncoder;
 
     public Replayer(
@@ -138,7 +115,6 @@ public class Replayer implements Agent, ControlledFragmentHandler
         final IdleStrategy idleStrategy,
         final ErrorHandler errorHandler,
         final int maxClaimAttempts,
-        final Subscription inboundSubscription,
         final String agentNamePrefix,
         final Set<String> gapfillOnReplayMessageTypes,
         final IntHashSet gapfillOnRetransmitILinkTemplateIds,
@@ -153,53 +129,51 @@ public class Replayer implements Agent, ControlledFragmentHandler
         final int maxConcurrentSessionReplays,
         final EpochNanoClock clock,
         final FixPProtocolType fixPProtocolType,
-        final EngineConfiguration configuration)
+        final EngineConfiguration configuration,
+        final DutyCycleTracker dutyCycleTracker)
     {
+        super(publication, fixSessionCodecsFactory, bufferClaim, senderSequenceNumbers, clock, dutyCycleTracker);
         this.outboundReplayQuery = outboundReplayQuery;
-        this.publication = publication;
-        this.bufferClaim = bufferClaim;
         this.idleStrategy = idleStrategy;
         this.errorHandler = errorHandler;
         this.maxClaimAttempts = maxClaimAttempts;
-        this.inboundSubscription = inboundSubscription;
         this.agentNamePrefix = agentNamePrefix;
         this.gapfillOnRetransmitILinkTemplateIds = gapfillOnRetransmitILinkTemplateIds;
         this.replayHandler = replayHandler;
         this.fixPRetransmitHandler = fixPRetransmitHandler;
-        this.senderSequenceNumbers = senderSequenceNumbers;
         this.fixSessionCodecsFactory = fixSessionCodecsFactory;
         this.maxBytesInBuffer = maxBytesInBuffer;
         this.replayerCommandQueue = replayerCommandQueue;
         this.currentReplayCount = currentReplayCount;
         this.maxConcurrentSessionReplays = maxConcurrentSessionReplays;
-        this.clock = clock;
         this.configuration = configuration;
 
-        gapFillMessageTypes = new LongHashSet();
-        gapfillOnReplayMessageTypes.forEach(messageTypeAsString ->
-            gapFillMessageTypes.add(packMessageType(messageTypeAsString)));
+        gapFillMessageTypes = packAllMessageTypes(gapfillOnReplayMessageTypes);
         utcTimestampEncoder = new UtcTimestampEncoder(epochFractionFormat);
 
         binaryFixPProtocol = new Lazy<>(() -> FixPProtocolFactory.make(fixPProtocolType, errorHandler));
+        binaryFixPDissector = new Lazy<>(() -> new FixPMessageDissector(binaryFixPProtocol.get().messageDecoders()));
         binaryFixPParser = new Lazy<>(() -> binaryFixPProtocol.get().makeParser(null));
-        binaryFixPProxy = new Lazy<>(() -> binaryFixPProtocol.get().makeProxy(publication, clock));
+        binaryFixPProxy = new Lazy<>(() -> binaryFixPProtocol.get().makeProxy(
+            binaryFixPDissector.get(), publication, clock));
         abstractBinaryFixPOffsets = new Lazy<>(() -> binaryFixPProtocol.get().makeOffsets());
 
         timestamper = new ReplayTimestamper(publication, clock);
     }
 
-    public Action onFragment(
+    @Override
+    public void onFragment(
         final DirectBuffer buffer, final int start, final int length, final Header header)
     {
-        messageHeader.wrap(buffer, start);
-        final int templateId = messageHeader.templateId();
-        final int offset = start + ENCODED_LENGTH;
-        final int blockLength = messageHeader.blockLength();
-        final int version = messageHeader.version();
-
-        switch (templateId)
+        if ((header.flags() & UNFRAGMENTED) == UNFRAGMENTED)
         {
-            case ValidResendRequestDecoder.TEMPLATE_ID:
+            messageHeader.wrap(buffer, start);
+            final int templateId = messageHeader.templateId();
+            final int offset = start + ENCODED_LENGTH;
+            final int blockLength = messageHeader.blockLength();
+            final int version = messageHeader.version();
+
+            if (ValidResendRequestDecoder.TEMPLATE_ID == templateId)
             {
                 validResendRequest.wrap(
                     buffer,
@@ -212,106 +186,45 @@ public class Replayer implements Agent, ControlledFragmentHandler
                 final long beginSeqNo = validResendRequest.beginSequenceNumber();
                 final long endSeqNo = validResendRequest.endSequenceNumber();
                 final int sequenceIndex = validResendRequest.sequenceIndex();
+                final long correlationId = validResendRequest.correlationId();
+                final long overriddenBeginSeqNo = validResendRequest.overriddenBeginSequenceNumber();
                 validResendRequest.wrapBody(asciiBuffer);
 
-                return onResendRequest(sessionId, connectionId, beginSeqNo, endSeqNo, sequenceIndex, asciiBuffer);
+                if (IS_REPLAY_LOG_TAG_ENABLED)
+                {
+                    DebugLogger.logSbeDecoder(REPLAY, "Replayer:", validResendRequestAppendTo);
+                }
+
+                onResendRequest(sessionId, connectionId, correlationId,
+                    beginSeqNo, endSeqNo, sequenceIndex, overriddenBeginSeqNo, asciiBuffer);
             }
 
-            case ILinkConnectDecoder.TEMPLATE_ID:
+            else
             {
-                iLinkConnect.wrap(
-                    buffer,
-                    offset,
-                    blockLength,
-                    version);
-
-                fixPConnectionIds.add(iLinkConnect.connection());
-
-                return CONTINUE;
-            }
-
-            case InboundFixPConnectDecoder.TEMPLATE_ID:
-            {
-                inboundFixPConnect.wrap(
-                    buffer,
-                    offset,
-                    blockLength,
-                    version);
-
-                fixPConnectionIds.add(inboundFixPConnect.connection());
-
-                return CONTINUE;
-            }
-
-            case RequestDisconnectDecoder.TEMPLATE_ID:
-            {
-                requestDisconnect.wrap(
-                    buffer,
-                    offset,
-                    blockLength,
-                    version);
-
-                final long connectionId = requestDisconnect.connection();
-
-                onDisconnect(connectionId);
-
-                return CONTINUE;
-            }
-
-            case DisconnectDecoder.TEMPLATE_ID:
-            {
-                disconnect.wrap(
-                    buffer,
-                    offset,
-                    blockLength,
-                    version);
-
-                final long connectionId = disconnect.connection();
-
-                onDisconnect(connectionId);
-
-                return CONTINUE;
-            }
-
-            default:
-            {
-                return fixSessionCodecsFactory.onFragment(buffer, start, length, header);
+                fixSessionCodecsFactory.onFragment(buffer, start, length, header);
             }
         }
     }
 
-    private void onDisconnect(final long connectionId)
-    {
-        fixPConnectionIds.remove(connectionId);
 
-        final ReplayChannel replayChannel = connectionIdToReplayerChannel.remove(connectionId);
-        if (replayChannel != null)
-        {
-            currentReplayCount.decrement();
-            // replay was in progress at the time of disconnect
-            if (!replayChannel.startClose())
-            {
-                closingChannels.add(replayChannel);
-            }
-        }
-    }
-
-    Action onResendRequest(
+    void onResendRequest(
         final long sessionId,
         final long connectionId,
+        final long correlationId,
         final long beginSeqNo,
         final long endSeqNo,
         final int sequenceIndex,
+        final long overriddenBeginSeqNo,
         final AsciiBuffer asciiBuffer)
     {
-        if (senderSequenceNumbers.hasDisconnected(connectionId))
+        if (checkDisconnected(connectionId))
         {
-            DebugLogger.log(REPLAY,
-                alreadyDisconnectedFormatter,
-                connectionId);
-
-            return CONTINUE;
+            return;
         }
+
+        final int adjustedBeginSeqNo = adjustBeginningSequenceNo((int)beginSeqNo, (int)overriddenBeginSeqNo);
+        final List<RecordingRange> recordingRanges = outboundReplayQuery.query(
+            sessionId, adjustedBeginSeqNo, sequenceIndex, (int)endSeqNo, sequenceIndex, REPLAY);
 
         final ReplayChannel replayChannel = connectionIdToReplayerChannel.get(connectionId);
         if (replayChannel != null)
@@ -324,7 +237,7 @@ public class Replayer implements Agent, ControlledFragmentHandler
                     sessionId,
                     connectionId,
                     enqueuedReplayCount)));
-                return CONTINUE;
+                return;
             }
 
             // Existing replay in progress
@@ -332,33 +245,38 @@ public class Replayer implements Agent, ControlledFragmentHandler
             final MutableAsciiBuffer copiedBuffer = new MutableAsciiBuffer(new byte[length]);
             copiedBuffer.putBytes(0, asciiBuffer, 0, length);
 
-            replayChannel.enqueueReplay(
-                new EnqueuedReplay(sessionId, connectionId, beginSeqNo, endSeqNo, sequenceIndex, copiedBuffer));
-
-            return COMMIT;
+            replayChannel.enqueueReplay(new EnqueuedReplay(sessionId, connectionId, correlationId,
+                beginSeqNo, endSeqNo, sequenceIndex, overriddenBeginSeqNo, copiedBuffer, recordingRanges));
         }
         else
         {
             // New replay
             try
             {
-                final ReplayerSession session = processResendRequest(
-                    sessionId, connectionId, beginSeqNo, endSeqNo, sequenceIndex, asciiBuffer);
-                if (session == null)
-                {
-                    return ABORT;
-                }
-
-                final ReplayChannel channel = new ReplayChannel(session);
+                final ReplayChannel channel = new ReplayChannel();
                 connectionIdToReplayerChannel.put(connectionId, channel);
                 currentReplayCount.increment();
 
-                return COMMIT;
+                final ReplayerSession session = processResendRequest(sessionId, connectionId, correlationId,
+                    beginSeqNo, endSeqNo, sequenceIndex, overriddenBeginSeqNo, asciiBuffer, recordingRanges);
+
+                if (session == null)
+                {
+                    final int length = asciiBuffer.capacity();
+                    final MutableAsciiBuffer copiedBuffer = new MutableAsciiBuffer(new byte[length]);
+                    copiedBuffer.putBytes(0, asciiBuffer, 0, length);
+
+                    channel.enqueueReplay(new EnqueuedReplay(sessionId, connectionId, correlationId,
+                        beginSeqNo, endSeqNo, sequenceIndex, overriddenBeginSeqNo, copiedBuffer, recordingRanges));
+                }
+                else
+                {
+                    channel.startReplay(session);
+                }
             }
             catch (final IllegalStateException e)
             {
                 errorHandler.onError(e);
-                return CONTINUE;
             }
         }
     }
@@ -366,57 +284,73 @@ public class Replayer implements Agent, ControlledFragmentHandler
     private ReplayerSession processResendRequest(
         final long sessionId,
         final long connectionId,
+        final long correlationId,
         final long beginSeqNo,
         final long endSeqNo,
         final int sequenceIndex,
-        final AsciiBuffer asciiBuffer)
+        final long overriddenBeginSeqNo,
+        final AsciiBuffer asciiBuffer,
+        final List<RecordingRange> recordingRanges)
     {
-        final FixReplayerCodecs sessionCodecs = fixSessionCodecsFactory.get(sessionId);
-        if (sessionCodecs != null)
+        final SenderSequenceNumber senderSequenceNumber = senderSequenceNumbers.senderSequenceNumber(connectionId);
+        if (null == senderSequenceNumber)
         {
-            return processFixResendRequest(
-                sessionId, connectionId, (int)beginSeqNo, (int)endSeqNo, sequenceIndex, asciiBuffer, sessionCodecs);
+            return null;
         }
-        else if (fixPConnectionIds.contains(connectionId))
+
+        final AtomicCounter bytesInBuffer = senderSequenceNumber.bytesInBuffer();
+        if (senderSequenceNumber.fixP())
         {
             DebugLogger.log(REPLAY,
                 receivedResendFormatter,
                 beginSeqNo,
-                endSeqNo);
+                endSeqNo,
+                overriddenBeginSeqNo,
+                connectionId);
 
-            final FixPReplayerSession session = new FixPReplayerSession(
-                connectionId, bufferClaim, idleStrategy, maxClaimAttempts, publication, outboundReplayQuery,
+            return new FixPReplayerSession(
+                connectionId, correlationId, bufferClaim, idleStrategy, maxClaimAttempts, publication,
+                outboundReplayQuery,
                 (int)beginSeqNo, (int)endSeqNo, sessionId, this, gapfillOnRetransmitILinkTemplateIds,
                 fixPMessageEncoder, binaryFixPParser.get(), binaryFixPProxy.get(), abstractBinaryFixPOffsets.get(),
-                fixPRetransmitHandler);
-
-            session.query();
-
-            return session;
+                fixPRetransmitHandler, bytesInBuffer, configuration.senderMaxBytesInBuffer(), recordingRanges);
         }
 
-        throw new IllegalStateException("Unknown session: sessionId=" + sessionId + ",connectionId=" + connectionId);
+        else
+        {
+            final FixReplayerCodecs sessionCodecs = fixSessionCodecsFactory.get(sessionId);
+            if (sessionCodecs != null)
+            {
+                return processFixResendRequest(
+                    sessionId, connectionId, correlationId, (int)beginSeqNo, (int)endSeqNo, sequenceIndex,
+                    (int)overriddenBeginSeqNo, asciiBuffer, sessionCodecs, bytesInBuffer, recordingRanges);
+            }
+
+            // ManageSession and ValidResendRequest might race each other (different sessions), so it's possible we see
+            // VRR before MS and sessionCodecs is null, simply wait in this case for the other image to catch up.
+            return null;
+        }
     }
 
     private FixReplayerSession processFixResendRequest(
         final long sessionId,
         final long connectionId,
+        final long correlationId,
         final int beginSeqNo,
         final int endSeqNo,
         final int sequenceIndex,
+        final int overriddenBeginSeqNo,
         final AsciiBuffer asciiBuffer,
-        final FixReplayerCodecs sessionCodecs)
+        final FixReplayerCodecs sessionCodecs,
+        final AtomicCounter bytesInBuffer,
+        final List<RecordingRange> recordingRanges)
     {
-        final AtomicCounter bytesInBuffer = senderSequenceNumbers.bytesInBufferCounter(connectionId);
-        if (bytesInBuffer == null)
-        {
-            return null;
-        }
-
         DebugLogger.log(REPLAY,
             receivedResendFormatter,
             beginSeqNo,
-            endSeqNo);
+            endSeqNo,
+            overriddenBeginSeqNo,
+            connectionId);
 
         final AbstractResendRequestDecoder resendRequest = sessionCodecs.resendRequest();
         resendRequest.reset();
@@ -425,7 +359,7 @@ public class Replayer implements Agent, ControlledFragmentHandler
         final GapFillEncoder encoder = sessionCodecs.makeGapFillEncoder();
         encoder.setupMessage(resendRequest.header());
 
-        final ThrottleRejectBuilder throttleRejectBuilder;
+        final FixThrottleRejectBuilder throttleRejectBuilder;
 
         if (configuration.throttleWindowInMs() == MISSING_INT)
         {
@@ -433,18 +367,20 @@ public class Replayer implements Agent, ControlledFragmentHandler
         }
         else
         {
-            throttleRejectBuilder = new ThrottleRejectBuilder(
+            throttleRejectBuilder = new FixThrottleRejectBuilder(
                 sessionCodecs.dictionary(),
                 errorHandler,
                 sessionId,
                 connectionId,
                 utcTimestampEncoder,
-                clock, configuration.throttleWindowInMs(), configuration.throttleLimitOfMessages());
+                clock, configuration.throttleWindowInMs(), configuration.throttleLimitOfMessages(),
+                configuration.throttleBusinessRejectReason());
             HeaderSetup.setup(resendRequest.header(), throttleRejectBuilder.header());
         }
 
         final String message = asciiBuffer.getAscii(0, asciiBuffer.capacity());
-        final FixReplayerSession fixReplayerSession = new FixReplayerSession(
+
+        return new FixReplayerSession(
             bufferClaim,
             idleStrategy,
             replayHandler,
@@ -455,8 +391,10 @@ public class Replayer implements Agent, ControlledFragmentHandler
             beginSeqNo,
             endSeqNo,
             connectionId,
+            correlationId,
             sessionId,
             sequenceIndex,
+            overriddenBeginSeqNo,
             outboundReplayQuery,
             message,
             errorHandler,
@@ -465,20 +403,21 @@ public class Replayer implements Agent, ControlledFragmentHandler
             maxBytesInBuffer,
             utcTimestampEncoder,
             this,
-            throttleRejectBuilder);
-
-        fixReplayerSession.query();
-
-        return fixReplayerSession;
+            throttleRejectBuilder,
+            recordingRanges);
     }
 
+    @Override
     public int doWork()
     {
-        timestamper.sendTimestampMessage();
+        final long timeInNs = clock.nanoTime();
+
+        trackDutyCycleTime(timeInNs);
+        timestamper.sendTimestampMessage(timeInNs);
 
         int work = replayerCommandQueue.poll();
         work += pollReplayerChannels();
-        return work + inboundSubscription.controlledPoll(this, POLL_LIMIT);
+        return work;
     }
 
     private int pollReplayerChannels()
@@ -489,54 +428,88 @@ public class Replayer implements Agent, ControlledFragmentHandler
 
         while (replayerChannels.hasNext())
         {
-            final ReplayChannel channel = replayerChannels.next().getValue();
-            if (channel.attemptReplay())
-            {
-                // Replay complete
-                final EnqueuedReplay enqueuedReplay = channel.pollReplay();
-                if (enqueuedReplay == null)
-                {
-                    currentReplayCount.decrementOrdered();
-                    replayerChannels.remove();
-                }
-                else
-                {
-                    try
-                    {
-                        final ReplayerSession session = processResendRequest(
-                            enqueuedReplay.sessionId(),
-                            enqueuedReplay.connectionId(),
-                            enqueuedReplay.beginSeqNo(),
-                            enqueuedReplay.endSeqNo(),
-                            enqueuedReplay.sequenceIndex(),
-                            enqueuedReplay.asciiBuffer());
+            replayerChannels.next();
 
-                        channel.startReplay(session);
-                    }
-                    catch (final IllegalStateException e)
+            final long connectionId = replayerChannels.getLongKey();
+            final ReplayChannel channel = replayerChannels.getValue();
+
+            if (checkDisconnected(connectionId))
+            {
+                replayerChannels.remove();
+
+                currentReplayCount.decrement();
+                // replay was in progress at the time of disconnect
+                channel.closeSession();
+            }
+            else
+            {
+                if (channel.attemptReplay())
+                {
+                    channel.closeSession();
+                    // Replay complete
+                    final EnqueuedReplay enqueuedReplay = channel.pollReplay();
+                    if (enqueuedReplay == null)
                     {
-                        errorHandler.onError(e);
+                        currentReplayCount.decrementOrdered();
+                        replayerChannels.remove();
+                    }
+                    else
+                    {
+                        try
+                        {
+                            final ReplayerSession session = processResendRequest(
+                                enqueuedReplay.sessionId(),
+                                enqueuedReplay.connectionId(),
+                                enqueuedReplay.correlationId(),
+                                enqueuedReplay.beginSeqNo(),
+                                enqueuedReplay.endSeqNo(),
+                                enqueuedReplay.sequenceIndex(),
+                                enqueuedReplay.overriddenBeginSeqNo(),
+                                enqueuedReplay.asciiBuffer(),
+                                enqueuedReplay.recordingRanges());
+
+                            if (null == session)
+                            {
+                                channel.startReplay(null);
+                                channel.reEnqueueReplay(enqueuedReplay);
+                            }
+                            else
+                            {
+                                channel.startReplay(session);
+                            }
+                        }
+                        catch (final IllegalStateException e)
+                        {
+                            errorHandler.onError(e);
+                        }
                     }
                 }
             }
         }
 
-        return size + CollectionUtil.removeIf(closingChannels, ReplayChannel::attemptReplay);
+        return size;
     }
 
+    @Override
     public void onClose()
     {
-        connectionIdToReplayerChannel.values().forEach(ReplayChannel::closeNow);
+        connectionIdToReplayerChannel.values().forEach(ReplayChannel::closeSession);
         connectionIdToReplayerChannel.clear();
         currentReplayCount.set(0);
         currentReplayCount.close();
-        publication.close();
         outboundReplayQuery.close();
+        super.onClose();
     }
 
+    @Override
     public String roleName()
     {
         return agentNamePrefix + "Replayer";
     }
 
+    static int adjustBeginningSequenceNo(final int beginSeqNo, final int overriddenBeginSeqNo)
+    {
+        return overriddenBeginSeqNo != (int)ValidResendRequestEncoder.overriddenBeginSequenceNumberNullValue() ?
+            overriddenBeginSeqNo : beginSeqNo;
+    }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,18 +20,19 @@ import org.agrona.CloseHelper;
 import org.agrona.ErrorHandler;
 import org.agrona.concurrent.EpochClock;
 import org.agrona.concurrent.status.AtomicCounter;
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.util.Collections;
 
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.greaterThan;
-import static org.junit.Assert.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.Mockito.*;
 import static uk.co.real_logic.artio.CommonConfiguration.DEFAULT_NAME_PREFIX;
 
@@ -51,12 +52,12 @@ public class HistogramLoggingTest
     private HistogramLogAgent writer;
     private HistogramLogReader reader;
 
-    @Before
+    @BeforeEach
     public void setUp() throws Exception
     {
         when(clock.time()).thenReturn(110L, 220L, 330L, 440L);
 
-        file = File.createTempFile("histogram", "tmp");
+        file = Files.createTempFile("histogram", "tmp").toFile();
         timer = new Timer(clock::time, NAME, 1, mock(AtomicCounter.class));
         writer = new HistogramLogAgent(
             Collections.singletonList(timer),
@@ -69,7 +70,7 @@ public class HistogramLoggingTest
         reader = new HistogramLogReader(file);
     }
 
-    @After
+    @AfterEach
     public void tearDown()
     {
         try
@@ -118,7 +119,7 @@ public class HistogramLoggingTest
 
     private void readsNothing() throws IOException
     {
-        assertEquals("Tried to read more data again after first read", 0, reader.read(logHandler));
+        assertEquals(0, reader.read(logHandler), "Tried to read more data again after first read");
     }
 
     private void readsHistogram(final int expectedCount) throws IOException
@@ -126,7 +127,7 @@ public class HistogramLoggingTest
         reset(logHandler);
         assertEquals(1, reader.read(logHandler));
         verify(logHandler, times(1)).onHistogram(anyLong(), eq(NAME), histogramCaptor.capture());
-        assertEquals("Histogram returns unexpected count", expectedCount, histogram().getTotalCount());
+        assertEquals(expectedCount, histogram().getTotalCount(), "Histogram returns unexpected count");
     }
 
     private void recordValues()

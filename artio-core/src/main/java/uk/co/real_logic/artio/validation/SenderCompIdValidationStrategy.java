@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited., Monotonic Ltd.
+ * Copyright 2015-2025 Real Logic Limited., Monotonic Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -35,6 +35,7 @@ class SenderCompIdValidationStrategy implements MessageValidationStrategy
         this.validSenderIds = new CharArraySet(validSenderIds);
     }
 
+    @Override
     public boolean validate(final SessionHeaderDecoder header)
     {
         final char[] senderCompID = header.senderCompID();
@@ -43,11 +44,13 @@ class SenderCompIdValidationStrategy implements MessageValidationStrategy
         return validSenderIds.contains(senderCompID, senderCompIDLength);
     }
 
+    @Override
     public int invalidTagId()
     {
         return SessionConstants.SENDER_COMP_ID;
     }
 
+    @Override
     public int rejectReason()
     {
         return COMPID_PROBLEM.representation();

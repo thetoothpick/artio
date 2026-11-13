@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,11 +15,11 @@
  */
 package uk.co.real_logic.artio.engine.framer;
 
-import org.agrona.collections.Long2ObjectHashMap;
 import uk.co.real_logic.artio.LivenessDetector;
 import uk.co.real_logic.artio.engine.ConnectedSessionInfo;
 import uk.co.real_logic.artio.engine.FixPConnectedSessionInfo;
-import uk.co.real_logic.artio.engine.framer.SubscriptionSlowPeeker.LibrarySlowPeeker;
+import org.agrona.ErrorHandler;
+import org.agrona.collections.Long2ObjectHashMap;
 
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -29,11 +29,11 @@ import static java.util.Collections.unmodifiableList;
 
 final class LiveLibraryInfo implements LibraryInfo
 {
+    private final ErrorHandler errorHandler;
     private final int libraryId;
     private final String libraryName;
     private final LivenessDetector livenessDetector;
     private final int aeronSessionId;
-    private final LibrarySlowPeeker librarySlowPeeker;
     private final List<GatewaySession> allSessions = new CopyOnWriteArrayList<>();
     private final List<ConnectedSessionInfo> unmodifiableFixSessions;
     private final List<FixPConnectedSessionInfo> unmodifiableFixPConnections;
@@ -43,18 +43,18 @@ final class LiveLibraryInfo implements LibraryInfo
 
     @SuppressWarnings("unchecked")
     LiveLibraryInfo(
+        final ErrorHandler errorHandler,
         final int libraryId,
         final String libraryName,
         final LivenessDetector livenessDetector,
         final int aeronSessionId,
-        final LibrarySlowPeeker librarySlowPeeker,
         final boolean isFixP)
     {
+        this.errorHandler = errorHandler;
         this.libraryId = libraryId;
         this.libraryName = libraryName;
         this.livenessDetector = livenessDetector;
         this.aeronSessionId = aeronSessionId;
-        this.librarySlowPeeker = librarySlowPeeker;
 
         if (isFixP)
         {
@@ -69,26 +69,31 @@ final class LiveLibraryInfo implements LibraryInfo
         }
     }
 
+    @Override
     public int libraryId()
     {
         return libraryId;
     }
 
+    @Override
     public String libraryName()
     {
         return libraryName;
     }
 
+    @Override
     public List<ConnectedSessionInfo> sessions()
     {
         return unmodifiableFixSessions;
     }
 
+    @Override
     public List<FixPConnectedSessionInfo> fixPConnections()
     {
         return unmodifiableFixPConnections;
     }
 
+    @Override
     public String toString()
     {
         return "LibraryInfo{" +
@@ -124,6 +129,14 @@ final class LiveLibraryInfo implements LibraryInfo
 
     void addSession(final GatewaySession session)
     {
+        final GatewaySession existingSession = removeSessionBySessionId(session.sessionId());
+        if (existingSession != null && !existingSession.isOffline())
+        {
+            final IllegalStateException exception = new IllegalStateException(
+                "Session already exists for session id: " + session.sessionId() + " and it is not offline."
+            );
+            errorHandler.onError(exception);
+        }
         allSessions.add(session);
     }
 
@@ -172,11 +185,7 @@ final class LiveLibraryInfo implements LibraryInfo
         return acquireAtPosition;
     }
 
-    LibrarySlowPeeker librarySlowPeeker()
-    {
-        return librarySlowPeeker;
-    }
-
+    @Override
     public boolean equals(final Object o)
     {
         if (this == o)
@@ -193,14 +202,10 @@ final class LiveLibraryInfo implements LibraryInfo
         return libraryId == that.libraryId;
     }
 
+    @Override
     public int hashCode()
     {
         return libraryId;
-    }
-
-    void releaseSlowPeeker()
-    {
-        librarySlowPeeker.removeLibrary();
     }
 
     void connectionStartsConnecting(final long correlationId, final ConnectingSession connectingSession)

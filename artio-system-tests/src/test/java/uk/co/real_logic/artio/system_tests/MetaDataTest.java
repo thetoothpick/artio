@@ -17,8 +17,10 @@ package uk.co.real_logic.artio.system_tests;
 
 import org.agrona.DirectBuffer;
 import org.agrona.concurrent.UnsafeBuffer;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+
 import uk.co.real_logic.artio.MonitoringAgentFactory;
 import uk.co.real_logic.artio.Reply;
 import uk.co.real_logic.artio.builder.TestRequestEncoder;
@@ -33,7 +35,8 @@ import java.util.concurrent.locks.LockSupport;
 import static org.agrona.BitUtil.*;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.greaterThan;
-import static org.junit.Assert.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static uk.co.real_logic.artio.TestFixtures.largeTestReqId;
 import static uk.co.real_logic.artio.TestFixtures.launchMediaDriver;
 import static uk.co.real_logic.artio.Timing.assertEventuallyTrue;
 import static uk.co.real_logic.artio.system_tests.SystemTestUtil.*;
@@ -43,7 +46,7 @@ public class MetaDataTest extends AbstractGatewayToGatewaySystemTest
     private static final int UPDATE_OFFSET = 1;
     private static final short UPDATE_VALUE = 128;
 
-    @Before
+    @BeforeEach
     public void launch()
     {
         mediaDriver = launchMediaDriver();
@@ -60,17 +63,18 @@ public class MetaDataTest extends AbstractGatewayToGatewaySystemTest
         final EngineConfiguration acceptingConfig = acceptingConfig(port, ACCEPTOR_ID, INITIATOR_ID, nanoClock)
             .deleteLogFileDirOnStart(deleteLogFileDirOnStart);
         acceptingConfig.monitoringAgentFactory(MonitoringAgentFactory.none());
+        acceptingConfig.messageTimingHandler(messageTimingHandler);
         acceptingEngine = FixEngine.launch(acceptingConfig);
         acceptingLibrary = testSystem.connect(acceptingLibraryConfig(acceptingHandler, nanoClock));
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void shouldReadWrittenSessionMetaData()
     {
         connectSessions();
 
-        final UnsafeBuffer writeBuffer = new UnsafeBuffer(new byte[SIZE_OF_INT]);
-        writeBuffer.putInt(0, META_DATA_VALUE);
+        final UnsafeBuffer writeBuffer = writeBuffer(META_DATA_VALUE);
 
         writeMetaData(writeBuffer);
 
@@ -78,13 +82,13 @@ public class MetaDataTest extends AbstractGatewayToGatewaySystemTest
         assertEquals(META_DATA_VALUE, readBuffer.getInt(0));
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void shouldReadWrittenSessionMetaDataForFollowerSession()
     {
         createFollowerSession(TEST_REPLY_TIMEOUT_IN_MS);
 
-        final UnsafeBuffer writeBuffer = new UnsafeBuffer(new byte[SIZE_OF_INT]);
-        writeBuffer.putInt(0, META_DATA_VALUE);
+        final UnsafeBuffer writeBuffer = writeBuffer(META_DATA_VALUE);
 
         retryableWriteMetadata(writeBuffer);
 
@@ -92,7 +96,8 @@ public class MetaDataTest extends AbstractGatewayToGatewaySystemTest
         assertEquals(META_DATA_VALUE, readBuffer.getInt(0));
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void shouldReadWrittenSessionMetaDataForFollowerSessionAfterRestart()
     {
         createFollowerSession(TEST_REPLY_TIMEOUT_IN_MS);
@@ -100,8 +105,7 @@ public class MetaDataTest extends AbstractGatewayToGatewaySystemTest
         final SessionReplyStatus status = requestSession(acceptingLibrary, META_DATA_SESSION_ID, testSystem);
         assertEquals(SessionReplyStatus.OK, status);
 
-        final UnsafeBuffer writeBuffer = new UnsafeBuffer(new byte[SIZE_OF_INT]);
-        writeBuffer.putInt(0, META_DATA_VALUE);
+        final UnsafeBuffer writeBuffer = writeBuffer(META_DATA_VALUE);
 
         retryableWriteMetadata(writeBuffer);
 
@@ -111,27 +115,26 @@ public class MetaDataTest extends AbstractGatewayToGatewaySystemTest
         assertEquals(META_DATA_VALUE, readBuffer.getInt(0));
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void shouldReadWrittenSessionSendMetaData()
     {
         connectSessions();
 
         acquireAcceptingSession();
 
-        final UnsafeBuffer writeBuffer = new UnsafeBuffer(new byte[SIZE_OF_INT]);
-        writeBuffer.putInt(0, META_DATA_VALUE);
+        final UnsafeBuffer writeBuffer = writeBuffer(META_DATA_VALUE);
 
         final TestRequestEncoder testRequest = new TestRequestEncoder();
         testRequest.testReqID(testReqId());
         send(writeBuffer, testRequest, 0);
 
-        assertEventuallyTrue("Failed to read meta data", () ->
-        {
-            final UnsafeBuffer readBuffer = readSuccessfulMetaData(writeBuffer);
-            assertEquals(META_DATA_VALUE, readBuffer.getInt(0));
+        readMetaDataEqualTo(writeBuffer);
 
-            LockSupport.parkNanos(10_000L);
-        });
+        testSystem.await("Metadata not called", () -> messageTimingHandler.count() >= 2);
+        messageTimingHandler.verifyConsecutiveSequenceNumbers(acceptingSession.lastSentMsgSeqNum());
+        final DirectBuffer timingBuffer = messageTimingHandler.getMetaData(1);
+        assertEquals(writeBuffer, timingBuffer);
 
         final UnsafeBuffer updateBuffer = updateBuffer();
 
@@ -149,13 +152,32 @@ public class MetaDataTest extends AbstractGatewayToGatewaySystemTest
         });
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    public void shouldWriteMessageMetaDataWithFragmentedMessage()
+    {
+        connectSessions();
+
+        acquireAcceptingSession();
+
+        final UnsafeBuffer writeBuffer = writeBuffer(META_DATA_VALUE);
+
+        final String testReqID = largeTestReqId();
+        final TestRequestEncoder testRequest = new TestRequestEncoder();
+        testRequest.testReqID(testReqID);
+        send(writeBuffer, testRequest, 0);
+
+        readMetaDataEqualTo(writeBuffer);
+
+        assertReceivedSingleHeartbeat(testSystem, acceptingOtfAcceptor, testReqID);
+    }
+
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void shouldReceiveSessionMetaDataWhenSessionAcquired()
     {
         connectSessions();
 
-        final UnsafeBuffer writeBuffer = new UnsafeBuffer(new byte[SIZE_OF_INT]);
-        writeBuffer.putInt(0, META_DATA_VALUE);
+        final UnsafeBuffer writeBuffer = writeBuffer(META_DATA_VALUE);
         writeMetaData(writeBuffer);
 
         acquireAcceptingSession();
@@ -165,7 +187,8 @@ public class MetaDataTest extends AbstractGatewayToGatewaySystemTest
         assertEquals(SIZE_OF_INT, readBuffer.capacity());
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void shouldNotReceiveSessionMetaDataWhenSessionAcquiredWithNoMetaData()
     {
         connectSessions();
@@ -176,14 +199,13 @@ public class MetaDataTest extends AbstractGatewayToGatewaySystemTest
         assertEquals(0, readBuffer.capacity());
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void shouldUpdateWrittenSessionMetaDataFittingWithinSlot()
     {
         connectSessions();
 
-        final UnsafeBuffer writeBuffer = new UnsafeBuffer(new byte[SIZE_OF_INT]);
-
-        writeBuffer.putInt(0, META_DATA_WRONG_VALUE);
+        final UnsafeBuffer writeBuffer = writeBuffer(META_DATA_WRONG_VALUE);
         writeMetaData(writeBuffer);
 
         writeBuffer.putInt(0, META_DATA_VALUE);
@@ -203,14 +225,13 @@ public class MetaDataTest extends AbstractGatewayToGatewaySystemTest
         assertEquals(writeBuffer, readBuffer);
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void shouldUpdateWrittenSessionMetaDataTooBigForOldSlot()
     {
         connectSessions();
 
-        final UnsafeBuffer writeBuffer = new UnsafeBuffer(new byte[SIZE_OF_INT]);
-
-        writeBuffer.putInt(0, META_DATA_WRONG_VALUE);
+        final UnsafeBuffer writeBuffer = writeBuffer(META_DATA_WRONG_VALUE);
         writeMetaData(writeBuffer);
 
         final UnsafeBuffer bigWriteBuffer = new UnsafeBuffer(new byte[SIZE_OF_LONG]);
@@ -234,7 +255,8 @@ public class MetaDataTest extends AbstractGatewayToGatewaySystemTest
         assertEquals(aggregatedBuffer, readBuffer);
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void shouldReceiveReadErrorForUnwrittenSessionMetaData()
     {
         connectSessions();
@@ -242,7 +264,8 @@ public class MetaDataTest extends AbstractGatewayToGatewaySystemTest
         assertNoMetaData();
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void shouldReceiveReadErrorForMetaDataWithUnknownSession()
     {
         connectSessions();
@@ -250,7 +273,8 @@ public class MetaDataTest extends AbstractGatewayToGatewaySystemTest
         assertUnknownSessionMetaData(META_DATA_WRONG_SESSION_ID);
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void shouldReceiveWriteErrorForMetaDataWithUnknownSession()
     {
         connectSessions();
@@ -260,7 +284,8 @@ public class MetaDataTest extends AbstractGatewayToGatewaySystemTest
         assertEquals(MetaDataStatus.UNKNOWN_SESSION, reply.resultIfPresent());
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void shouldResetMetaDataWhenSequenceNumberResetsWithLogon()
     {
         connectSessions();
@@ -276,15 +301,15 @@ public class MetaDataTest extends AbstractGatewayToGatewaySystemTest
         assertNoMetaData();
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void shouldResetMetaDataWhenSequenceNumberResetsWhenSessionIdExplicitlyReset()
     {
         connectSessions();
 
         writeMetaDataThenDisconnect();
 
-        final Reply<?> reply = acceptingEngine.resetSequenceNumber(META_DATA_SESSION_ID);
-        testSystem.awaitCompletedReplies(reply);
+        testSystem.resetSequenceNumber(acceptingEngine, META_DATA_SESSION_ID);
 
         assertNoMetaData();
 
@@ -292,7 +317,8 @@ public class MetaDataTest extends AbstractGatewayToGatewaySystemTest
         acceptingSession = null;
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void shouldResetMetaDataWhenSequenceNumberResetsWithExplicitResetSessionIds()
     {
         connectSessions();
@@ -370,5 +396,23 @@ public class MetaDataTest extends AbstractGatewayToGatewaySystemTest
     private void updateExpectedBuffer(final UnsafeBuffer writeBuffer, final UnsafeBuffer updateBuffer)
     {
         writeBuffer.putBytes(UPDATE_OFFSET, updateBuffer, 0, SIZE_OF_SHORT);
+    }
+
+    private void readMetaDataEqualTo(final UnsafeBuffer writeBuffer)
+    {
+        assertEventuallyTrue("Failed to read meta data", () ->
+        {
+            final UnsafeBuffer readBuffer = readSuccessfulMetaData(writeBuffer);
+            assertEquals(META_DATA_VALUE, readBuffer.getInt(0));
+
+            LockSupport.parkNanos(10_000L);
+        });
+    }
+
+    private UnsafeBuffer writeBuffer(final int metaDataValue)
+    {
+        final UnsafeBuffer writeBuffer = new UnsafeBuffer(new byte[SIZE_OF_INT]);
+        writeBuffer.putInt(0, metaDataValue);
+        return writeBuffer;
     }
 }

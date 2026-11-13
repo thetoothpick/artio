@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,9 +15,13 @@
  */
 package uk.co.real_logic.artio.system_tests;
 
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterEach;
+
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+
 import uk.co.real_logic.artio.Reply;
 import uk.co.real_logic.artio.engine.FixEngine;
 import uk.co.real_logic.artio.library.SessionConfiguration;
@@ -29,7 +33,7 @@ import java.net.ServerSocket;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.anyOf;
 import static org.hamcrest.Matchers.is;
-import static org.junit.Assert.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static uk.co.real_logic.artio.Reply.State.ERRORED;
 import static uk.co.real_logic.artio.Reply.State.TIMED_OUT;
 import static uk.co.real_logic.artio.TestFixtures.launchMediaDriver;
@@ -38,28 +42,29 @@ import static uk.co.real_logic.artio.system_tests.SystemTestUtil.*;
 public class InitiatingEngineNoLogonConnectionTest extends AbstractGatewayToGatewaySystemTest
 {
     private final ServerSocket serverSocket;
+    private final Thread serverThread;
 
     public InitiatingEngineNoLogonConnectionTest() throws IOException
     {
         serverSocket = new ServerSocket(port);
-        final Thread serverThread = new Thread(() ->
-        {
-            try
+        serverThread = new Thread(
+            () ->
             {
-                while (true)
+                try
                 {
-                    serverSocket.accept();
+                    while (true)
+                    {
+                        serverSocket.accept();
+                    }
                 }
-            }
-            catch (final Exception e)
-            {
-                // Deliberately blank as closing the socket will cause an exception to be thrown.
-            }
-        });
-        serverThread.start();
+                catch (final IOException ignore)
+                {
+                    // Deliberately blank as closing the socket will cause an exception to be thrown.
+                }
+            });
     }
 
-    @Before
+    @BeforeEach
     public void launch()
     {
         deleteLogs();
@@ -68,15 +73,23 @@ public class InitiatingEngineNoLogonConnectionTest extends AbstractGatewayToGate
         initiatingEngine = FixEngine.launch(initiatingConfig(libraryAeronPort, nanoClock));
         initiatingLibrary = newInitiatingLibrary(libraryAeronPort, initiatingHandler, nanoClock);
         testSystem = new TestSystem(initiatingLibrary);
+
+        serverThread.setDaemon(true);
+        serverThread.start();
     }
 
-    @After
-    public void stopServerThread() throws IOException
+    @AfterEach
+    public void stopServerThread() throws Exception
     {
         serverSocket.close();
+        if (serverThread.isAlive())
+        {
+            serverThread.join();
+        }
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void shouldTimeoutWhenConnectingToUnresponsiveEngine()
     {
         final Reply<Session> secondConnectReply = initiateSession();

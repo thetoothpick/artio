@@ -21,8 +21,8 @@ import org.agrona.concurrent.UnsafeBuffer;
 import uk.co.real_logic.artio.engine.EngineConfiguration;
 import uk.co.real_logic.artio.engine.logger.SequenceNumberIndexReader;
 import uk.co.real_logic.artio.fixp.AbstractFixPProxy;
-import uk.co.real_logic.artio.fixp.FixPContext;
 import uk.co.real_logic.artio.fixp.FixPFirstMessageResponse;
+import uk.co.real_logic.artio.fixp.InternalFixPContext;
 import uk.co.real_logic.artio.messages.DisconnectReason;
 import uk.co.real_logic.artio.messages.FixPProtocolType;
 import uk.co.real_logic.artio.messages.InboundFixPConnectEncoder;
@@ -30,6 +30,10 @@ import uk.co.real_logic.artio.messages.MessageHeaderEncoder;
 import uk.co.real_logic.artio.protocol.GatewayPublication;
 import uk.co.real_logic.artio.util.MutableAsciiBuffer;
 import uk.co.real_logic.artio.validation.FixPAuthenticationProxy;
+
+import java.io.IOException;
+
+import static uk.co.real_logic.artio.engine.framer.TcpChannel.UNKNOWN_SEQ_NUM;
 
 public class FixPGatewaySessions extends GatewaySessions
 {
@@ -60,6 +64,7 @@ public class FixPGatewaySessions extends GatewaySessions
         this.fixPContexts = fixPContexts;
     }
 
+    @Override
     protected void setLastSequenceResetTime(final GatewaySession gatewaySession)
     {
     }
@@ -74,8 +79,9 @@ public class FixPGatewaySessions extends GatewaySessions
         final TcpChannel channel,
         final Framer framer,
         final FixPProtocolType protocolType,
-        final FixPContext identification,
-        final AbstractFixPProxy fixPProxy)
+        final InternalFixPContext identification,
+        final AbstractFixPProxy fixPProxy,
+        final ReceiverEndPoint receiverEndPoint)
     {
         return new FixPPendingAcceptorLogon(
             sessionId,
@@ -88,7 +94,8 @@ public class FixPGatewaySessions extends GatewaySessions
             framer,
             protocolType,
             identification,
-            fixPProxy);
+            fixPProxy,
+            receiverEndPoint);
     }
 
     public FixPContexts fixPContexts()
@@ -105,10 +112,11 @@ public class FixPGatewaySessions extends GatewaySessions
         private final int offset;
         private final int messageSize;
         private final FixPProtocolType protocolType;
-        private final FixPContext identification;
+        private final InternalFixPContext identification;
         private final AbstractFixPProxy fixPProxy;
 
         private FixPFirstMessageResponse fixPFirstMessageResponse;
+        private Enum<?> rejectCode;
 
         FixPPendingAcceptorLogon(
             final long sessionId,
@@ -120,10 +128,11 @@ public class FixPGatewaySessions extends GatewaySessions
             final TcpChannel channel,
             final Framer framer,
             final FixPProtocolType protocolType,
-            final FixPContext identification,
-            final AbstractFixPProxy fixPProxy)
+            final InternalFixPContext identification,
+            final AbstractFixPProxy fixPProxy,
+            final ReceiverEndPoint receiverEndPoint)
         {
-            super(gatewaySession, connectionId, channel, framer);
+            super(gatewaySession, connectionId, channel, framer, receiverEndPoint);
             this.sessionId = sessionId;
             this.buffer = buffer;
             this.offset = offset;
@@ -133,14 +142,14 @@ public class FixPGatewaySessions extends GatewaySessions
             this.fixPProxy = fixPProxy;
 
             final FixPFirstMessageResponse rejectReason = fixPContexts.onAcceptorLogon(
-                sessionId, identification, connectionId);
+                sessionId, identification, connectionId, false);
             if (rejectReason == FixPFirstMessageResponse.OK)
             {
                 authenticate(connectionId);
             }
             else
             {
-                reject(rejectReason);
+                internalReject(rejectReason, null);
             }
         }
 
@@ -162,50 +171,93 @@ public class FixPGatewaySessions extends GatewaySessions
             }
         }
 
+        @Override
         protected void onAuthenticated()
         {
-            ((FixPGatewaySession)session).authenticated();
+            final FixPGatewaySession session = (FixPGatewaySession)this.session;
+            session.authenticated();
 
-            final MessageHeaderEncoder header = new MessageHeaderEncoder();
-            final InboundFixPConnectEncoder inboundFixPConnect = new InboundFixPConnectEncoder();
-            final UnsafeBuffer logonBuffer = new UnsafeBuffer(new byte[ACCEPTED_HEADER_LENGTH]);
-            inboundFixPConnect
-                .wrapAndApplyHeader(logonBuffer, 0, header)
-                .connection(connectionId)
-                .sessionId(sessionId)
-                .protocolType(protocolType)
-                .messageLength(messageSize);
-
-            final long position = inboundPublication.dataPublication().offer(
-                logonBuffer, 0, ACCEPTED_HEADER_LENGTH,
-                buffer, offset, messageSize);
-
-            if (position < 0)
+            if (framer.onFixPLogonMessageReceived(session, sessionId))
             {
-                System.out.println("position = " + position); // TODO
+                setState(AuthenticationState.ACCEPTED);
             }
             else
             {
-                state = AuthenticationState.ACCEPTED;
+                final MessageHeaderEncoder header = new MessageHeaderEncoder();
+                final InboundFixPConnectEncoder inboundFixPConnect = new InboundFixPConnectEncoder();
+                final UnsafeBuffer logonBuffer = new UnsafeBuffer(new byte[ACCEPTED_HEADER_LENGTH]);
+                inboundFixPConnect
+                    .wrapAndApplyHeader(logonBuffer, 0, header)
+                    .connection(connectionId)
+                    .sessionId(sessionId)
+                    .protocolType(protocolType)
+                    .messageLength(messageSize);
+
+                final long position = inboundPublication.dataPublication().offer(
+                    logonBuffer, 0, ACCEPTED_HEADER_LENGTH,
+                    buffer, offset, messageSize);
+
+                if (position < 0)
+                {
+                    System.out.println("position = " + position); // TODO
+                }
+                else
+                {
+                    setState(AuthenticationState.ACCEPTED);
+                }
             }
         }
 
+        @Override
         protected void encodeRejectMessage()
         {
-            rejectEncodeBuffer = fixPProxy.encodeReject(identification, fixPFirstMessageResponse);
+            rejectEncodeBuffer = fixPProxy.encodeReject(identification, fixPFirstMessageResponse, rejectCode);
         }
 
+        @Override
+        protected SendRejectResult sendReject()
+        {
+            try
+            {
+                channel.write(rejectEncodeBuffer, UNKNOWN_SEQ_NUM, false);
+                return rejectEncodeBuffer.hasRemaining() ? SendRejectResult.BACK_PRESSURED : SendRejectResult.INFLIGHT;
+            }
+            catch (final IOException e)
+            {
+                return SendRejectResult.DISCONNECTED;
+            }
+        }
+
+        @Override
         public void reject()
         {
-            reject(FixPFirstMessageResponse.CREDENTIALS);
+            reject((Enum<?>)null);
         }
 
-        private void reject(final FixPFirstMessageResponse response)
+        @Override
+        public void reject(final Enum<?> rejectCode)
         {
+            internalReject(FixPFirstMessageResponse.CREDENTIALS, rejectCode);
+        }
+
+        private void internalReject(final FixPFirstMessageResponse response, final Enum<?> rejectCode)
+        {
+            if (rejectCode != null)
+            {
+                identification.validate(rejectCode);
+            }
+
             this.reason = DisconnectReason.FAILED_AUTHENTICATION;
             this.fixPFirstMessageResponse = response;
+            this.rejectCode = rejectCode;
             this.lingerTimeoutInMs = LINGER_TIMEOUT_IN_MS;
-            this.state = AuthenticationState.SENDING_REJECT_MESSAGE;
+            setState(AuthenticationState.SAVING_REJECTED_LOGON_WITH_REPLY);
+        }
+
+        @Override
+        public String remoteAddress()
+        {
+            return channel.remoteAddr();
         }
     }
 }

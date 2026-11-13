@@ -43,6 +43,7 @@ public class FixMessageTracker extends MessageTracker
         this.sessionId = sessionId;
     }
 
+    @Override
     public Action onFragment(
         final DirectBuffer buffer, final int offset, final int length, final Header header)
     {
@@ -75,7 +76,7 @@ public class FixMessageTracker extends MessageTracker
             {
                 messageDecoder.skipMetaData();
                 final int bodyLength = messageDecoder.bodyLength();
-                final int bodyOffset = messageDecoder.limit();
+                final int bodyOffset = messageDecoder.limit() + FixMessageDecoder.bodyHeaderLength();
                 final CharFormatter formatter = FOUND_REPLAY_MESSAGE.get();
                 formatter.clear();
                 DebugLogger.log(logTag, formatter, buffer, bodyOffset, bodyLength);

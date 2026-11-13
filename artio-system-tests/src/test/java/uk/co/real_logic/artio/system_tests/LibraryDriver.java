@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ import uk.co.real_logic.artio.engine.FixEngine;
 import uk.co.real_logic.artio.engine.framer.LibraryInfo;
 import uk.co.real_logic.artio.library.FixLibrary;
 import uk.co.real_logic.artio.library.LibraryConfiguration;
+import uk.co.real_logic.artio.session.Session;
 
 import java.util.List;
 import java.util.function.Function;
@@ -64,6 +65,7 @@ final class LibraryDriver implements AutoCloseable
         return handler.awaitCompleteSessionId(this::poll);
     }
 
+    @Override
     public void close()
     {
         testSystem.close(library);
@@ -91,4 +93,8 @@ final class LibraryDriver implements AutoCloseable
         testSystem.poll();
     }
 
+    public Session requestSession(final long sessionId)
+    {
+        return SystemTestUtil.acquireSession(handler, library, sessionId, testSystem);
+    }
 }

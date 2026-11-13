@@ -16,11 +16,14 @@
 package uk.co.real_logic.artio.engine;
 
 import org.agrona.IoUtil;
-import org.junit.*;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 
 import java.io.File;
 
-import static org.junit.Assert.*;
+import static org.junit.jupiter.api.Assertions.*;
 import static uk.co.real_logic.artio.engine.EngineConfiguration.DEFAULT_DUPLICATE_ENGINE_TIMEOUT_IN_MS;
 
 public class DuplicateEngineCheckerTest
@@ -31,13 +34,13 @@ public class DuplicateEngineCheckerTest
     private DuplicateEngineChecker oldEngine;
     private DuplicateEngineChecker newEngine;
 
-    @Before
+    @BeforeEach
     public void startup()
     {
         IoUtil.deleteIfExists(FILE);
     }
 
-    @After
+    @AfterEach
     public void teardown()
     {
         if (oldEngine != null)
@@ -118,9 +121,9 @@ public class DuplicateEngineCheckerTest
 
     private void assertCheckThrows(final DuplicateEngineChecker newEngine)
     {
-        Assert.assertThrows(
-            "Error starting Engine a duplicate Artio Engine instance might be running",
+        Assertions.assertThrows(
             IllegalStateException.class,
-            newEngine::check);
+            newEngine::check,
+            "Error starting Engine a duplicate Artio Engine instance might be running");
     }
 }

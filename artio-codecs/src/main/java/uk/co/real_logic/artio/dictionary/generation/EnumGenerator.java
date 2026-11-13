@@ -23,6 +23,7 @@ import uk.co.real_logic.artio.builder.IntRepresentable;
 import uk.co.real_logic.artio.builder.StringRepresentable;
 import uk.co.real_logic.artio.dictionary.CharArrayMap;
 import uk.co.real_logic.artio.dictionary.CharArrayWrapper;
+import uk.co.real_logic.artio.dictionary.Generated;
 import uk.co.real_logic.artio.dictionary.ir.Dictionary;
 import uk.co.real_logic.artio.dictionary.ir.Field;
 import uk.co.real_logic.artio.dictionary.ir.Field.Type;
@@ -73,6 +74,11 @@ final class EnumGenerator
 
     public void generate()
     {
+        if (dictionary.hasSharedParent())
+        {
+            return;
+        }
+
         dictionary
             .fields()
             .values()
@@ -138,6 +144,8 @@ final class EnumGenerator
                 out.append(importFor(Map.class));
                 out.append(importFor(HashMap.class));
                 out.append(interfaceToImport);
+                out.append(importFor(Generated.class));
+                out.append("\n" + GENERATED_ANNOTATION);
                 out.append(generateEnumDeclaration(enumName, interfaceToImplement));
 
                 out.append(generateEnumValues(valuesWithSentinels, type));
@@ -176,7 +184,17 @@ final class EnumGenerator
     {
         return allValues
             .stream()
-            .map((value) -> format("%s%s(%s)", INDENT, value.description(), literal(value, type)))
+            .map((value) ->
+            {
+                String javadoc = "";
+                final List<String> alternativeNames = value.alternativeNames();
+                if (alternativeNames != null)
+                {
+                    javadoc = alternativeNames.stream().collect(
+                        joining(", ", "/** Altnames: ", " */ "));
+                }
+                return format("%1$s%4$s%2$s(%3$s)", INDENT, value.description(), literal(value, type), javadoc);
+            })
             .collect(joining(",\n"));
     }
 
@@ -364,7 +382,14 @@ final class EnumGenerator
             case NUMINGROUP:
             case DAYOFMONTH:
                 // Validate that the representation genuinely is a parseable int
+                //noinspection ResultOfMethodCallIgnored
                 Integer.parseInt(representation);
+                return representation;
+
+            case LONG:
+                // Validate that the representation genuinely is a parseable int
+                //noinspection ResultOfMethodCallIgnored
+                Long.parseLong(representation);
                 return representation;
 
             case STRING:

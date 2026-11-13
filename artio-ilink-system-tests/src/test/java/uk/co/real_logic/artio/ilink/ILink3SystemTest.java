@@ -25,8 +25,10 @@ import org.agrona.LangUtil;
 import org.agrona.collections.IntArrayList;
 import org.agrona.collections.IntHashSet;
 import org.hamcrest.Matcher;
-import org.junit.After;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterEach;
+
+
+import org.junit.jupiter.api.Test;
 import org.mockito.InOrder;
 import org.mockito.Mockito;
 import uk.co.real_logic.artio.MonitoringAgentFactory;
@@ -54,7 +56,7 @@ import static java.util.Collections.singletonList;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.*;
-import static org.junit.Assert.*;
+import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.*;
 import static uk.co.real_logic.artio.TestFixtures.*;
@@ -118,6 +120,7 @@ public class ILink3SystemTest
             .gapfillOnRetransmitILinkTemplateIds(gapfillOnRetransmitILinkTemplateIds)
             .fixPRetransmitHandler(retransmitHandler)
             .messageTimingHandler(messageTimingCaptor);
+        configureAeronArchive(engineConfig.aeronArchiveContext());
 
         engine = FixEngine.launch(engineConfig);
 
@@ -130,7 +133,7 @@ public class ILink3SystemTest
         library = testSystem.connect(libraryConfig);
     }
 
-    @After
+    @AfterEach
     public void close()
     {
         closeArtio();
@@ -224,8 +227,7 @@ public class ILink3SystemTest
         shouldEstablishConnectionAtBeginningOfWeek();
 
         abortNewOrderSingle();
-        assertEquals("Sequence number has been incorrectly updated for aborted message",
-            1, connection.nextSentSeqNo());
+        assertEquals(1, connection.nextSentSeqNo(), "Sequence number has been incorrectly updated for aborted message");
 
         sendNewOrderSingle();
 
@@ -281,7 +283,7 @@ public class ILink3SystemTest
             .avgPxGroupID(0, PartyDetailsDefinitionRequest518Encoder.avgPxGroupIDNullValue())
             .selfMatchPreventionID(PartyDetailsDefinitionRequest518Encoder.selfMatchPreventionIDNullValue())
             .cmtaGiveupCD(CmtaGiveUpCD.GiveUp)
-            .custOrderCapacity(CustOrderCapacity.Clearingfirmtradingforitsproprietaryaccount)
+            .custOrderCapacity(CustOrderCapacity.Memberfirmtradingforitsproprietaryaccount)
             .clearingAccountType(ClearingAcctType.Firm)
             .selfMatchPreventionInstruction(SMPI.CancelOldest)
             .avgPxIndicator(AvgPxInd.NoAveragePricing)
@@ -378,6 +380,7 @@ public class ILink3SystemTest
         rejectNegotiate();
     }
 
+    // Operation deprecated as of 17th October 2021
     private void rejectNegotiate()
     {
         readNegotiate();
@@ -388,6 +391,44 @@ public class ILink3SystemTest
         assertDisconnected();
     }
 
+    // New Behaviour from October 2021
+    private void rejectNegotiateWithTerminate()
+    {
+        readNegotiate();
+
+        testServer.writeTerminate();
+
+        testServer.readTerminate();
+
+        assertConnectError(containsString("Connection Terminated"));
+        assertDisconnected();
+    }
+
+    @Test
+    public void shouldSupportNegotiationRejectionWithTerminate() throws IOException
+    {
+        launch(true);
+
+        connectToTestServer(connectionConfiguration());
+
+        rejectNegotiateWithTerminate();
+    }
+
+    @Test
+    public void shouldSupportReestablishingConnectionsAfterNegotiateRejectWithTerminate() throws IOException
+    {
+        // Reject Negotiate
+        launch(true);
+        connectToTestServer(connectionConfiguration());
+        rejectNegotiateWithTerminate();
+
+        connectToTestServer(connectionConfiguration().reEstablishLastConnection(true));
+
+        establishConnection();
+
+        acquireSession();
+    }
+
     @Test
     public void shouldSupportEstablishmentReject() throws IOException
     {
@@ -396,10 +437,33 @@ public class ILink3SystemTest
         connectToTestServer(connectionConfiguration());
 
         readNegotiate();
+        testServer.writeNegotiateResponse();
+
+        readEstablish();
 
         testServer.writeEstablishmentReject();
 
         assertConnectError(containsString("Establishment rejected"));
+        assertDisconnected();
+    }
+
+    @Test
+    public void shouldSupportEstablishmentRejectWithTerminate() throws IOException
+    {
+        launch(true);
+
+        connectToTestServer(connectionConfiguration());
+
+        readNegotiate();
+        testServer.writeNegotiateResponse();
+
+        readEstablish();
+
+        testServer.writeTerminate();
+
+        testServer.readTerminate();
+
+        assertConnectError(containsString("Connection Terminated"));
         assertDisconnected();
     }
 
@@ -531,7 +595,7 @@ public class ILink3SystemTest
         // and no other message is sent to CME
         sleepHalfInterval();
         testServer.writeSequence(1, NotLapsed);
-        testServer.readSequence(1, NotLapsed);
+        testServer.readSequence(1);
 
         // From CME - as a heartbeat message to be sent when a KeepAliveInterval interval from CME lapses and
         // no other message is sent to customer
@@ -586,7 +650,7 @@ public class ILink3SystemTest
             return handler.hasReceivedNotApplied();
         });
 
-        testServer.readSequence(4, NotLapsed);
+        testServer.readSequence(4);
     }
 
     @Test
@@ -649,9 +713,9 @@ public class ILink3SystemTest
         // Let's pretend we haven't received 1-3 and initiate a resend.
         testServer.writeNotApplied(1, 3);
 
-        testServer.readSequence(2, NotLapsed);
+        testServer.readSequence(2);
         testServer.readPartyDetailsDefinitionRequest(2, 1);
-        testServer.readSequence(4, NotLapsed);
+        testServer.readSequence(4);
 
         assertEventuallyTrue("Session never re-establishes", () ->
         {
@@ -738,7 +802,7 @@ public class ILink3SystemTest
         agreeRecvSeqNo(4);
 
         // Check there's no second retransmission
-        testServer.readSequence(2, NotLapsed);
+        testServer.readSequence(2);
 
         testServer.writeExecutionReportStatus(4, false);
         agreeRecvSeqNo(5);

@@ -16,10 +16,16 @@
 package uk.co.real_logic.artio.binary_entrypoint;
 
 import b3.entrypoint.fixp.sbe.*;
+import io.aeron.logbuffer.ControlledFragmentHandler.Action;
 import org.agrona.DirectBuffer;
+import uk.co.real_logic.artio.DebugLogger;
 import uk.co.real_logic.artio.fixp.AbstractFixPParser;
 import uk.co.real_logic.artio.fixp.SimpleOpenFramingHeader;
 
+import java.util.function.Consumer;
+
+import static uk.co.real_logic.artio.LogTag.FIXP_SESSION;
+import static uk.co.real_logic.artio.binary_entrypoint.BinaryEntryPointSequenceExtractor.LOWEST_APP_TEMPLATE_ID;
 import static uk.co.real_logic.artio.fixp.SimpleOpenFramingHeader.SOFH_LENGTH;
 
 public class BinaryEntryPointParser extends AbstractFixPParser
@@ -33,32 +39,44 @@ public class BinaryEntryPointParser extends AbstractFixPParser
     private final FinishedReceivingDecoder finishedReceiving = new FinishedReceivingDecoder();
     private final RetransmitRequestDecoder retransmitRequest = new RetransmitRequestDecoder();
 
-    private final InternalBinaryEntrypointConnection handler;
+    private final Consumer<StringBuilder> negotiateAppendTo = negotiate::appendTo;
+    private final Consumer<StringBuilder> establishAppendTo = establish::appendTo;
+    private final Consumer<StringBuilder> terminateAppendTo = terminate::appendTo;
+    private final Consumer<StringBuilder> sequenceAppendTo = sequence::appendTo;
+    private final Consumer<StringBuilder> finishedSendingAppendTo = finishedSending::appendTo;
+    private final Consumer<StringBuilder> finishedReceivingAppendTo = finishedReceiving::appendTo;
+    private final Consumer<StringBuilder> retransmitRequestAppendTo = retransmitRequest::appendTo;
 
-    public BinaryEntryPointParser(final InternalBinaryEntrypointConnection handler)
+    private final InternalBinaryEntryPointConnection handler;
+
+    public BinaryEntryPointParser(final InternalBinaryEntryPointConnection handler)
     {
         this.handler = handler;
     }
 
+    @Override
     public int templateId(final DirectBuffer buffer, final int offset)
     {
         header.wrap(buffer, offset);
         return header.templateId();
     }
 
+    @Override
     public int blockLength(final DirectBuffer buffer, final int offset)
     {
         header.wrap(buffer, offset);
         return header.blockLength();
     }
 
+    @Override
     public int version(final DirectBuffer buffer, final int offset)
     {
         header.wrap(buffer, offset);
         return header.version();
     }
 
-    public long onMessage(final DirectBuffer buffer, final int start)
+    @Override
+    public Action onMessage(final DirectBuffer buffer, final int start)
     {
         int offset = start + SOFH_LENGTH;
 
@@ -100,11 +118,13 @@ public class BinaryEntryPointParser extends AbstractFixPParser
         }
     }
 
-    private long onRetransmitRequest(
+    private Action onRetransmitRequest(
         final DirectBuffer buffer, final int offset, final int blockLength, final int version)
     {
         final RetransmitRequestDecoder retransmitRequest = this.retransmitRequest;
         retransmitRequest.wrap(buffer, offset, blockLength, version);
+
+        DebugLogger.logSbeDecoder(FIXP_SESSION, "> ", retransmitRequestAppendTo);
 
         return handler.onRetransmitRequest(
             retransmitRequest.sessionID(),
@@ -113,11 +133,13 @@ public class BinaryEntryPointParser extends AbstractFixPParser
             retransmitRequest.count());
     }
 
-    private long onFinishedSending(
+    private Action onFinishedSending(
         final DirectBuffer buffer, final int offset, final int blockLength, final int version)
     {
         final FinishedSendingDecoder finishedSending = this.finishedSending;
         finishedSending.wrap(buffer, offset, blockLength, version);
+
+        DebugLogger.logSbeDecoder(FIXP_SESSION, "> ", finishedSendingAppendTo);
 
         return handler.onFinishedSending(
             finishedSending.sessionID(),
@@ -125,27 +147,33 @@ public class BinaryEntryPointParser extends AbstractFixPParser
             finishedSending.lastSeqNo());
     }
 
-    private long onFinishedReceiving(
+    private Action onFinishedReceiving(
         final DirectBuffer buffer, final int offset, final int blockLength, final int version)
     {
         final FinishedReceivingDecoder finishedReceiving = this.finishedReceiving;
         finishedReceiving.wrap(buffer, offset, blockLength, version);
+
+        DebugLogger.logSbeDecoder(FIXP_SESSION, "> ", finishedReceivingAppendTo);
 
         return handler.onFinishedReceiving(
             finishedReceiving.sessionID(),
             finishedReceiving.sessionVerID());
     }
 
-    private long onSequence(final DirectBuffer buffer, final int offset, final int blockLength, final int version)
+    private Action onSequence(final DirectBuffer buffer, final int offset, final int blockLength, final int version)
     {
         sequence.wrap(buffer, offset, blockLength, version);
+
+        DebugLogger.logSbeDecoder(FIXP_SESSION, "> ", sequenceAppendTo);
 
         return handler.onSequence(sequence.nextSeqNo());
     }
 
-    private long onTerminate(final DirectBuffer buffer, final int offset, final int blockLength, final int version)
+    private Action onTerminate(final DirectBuffer buffer, final int offset, final int blockLength, final int version)
     {
         terminate.wrap(buffer, offset, blockLength, version);
+
+        DebugLogger.logSbeDecoder(FIXP_SESSION, "> ", terminateAppendTo);
 
         return handler.onTerminate(
             terminate.sessionID(),
@@ -153,9 +181,11 @@ public class BinaryEntryPointParser extends AbstractFixPParser
             terminate.terminationCode());
     }
 
-    private long onEstablish(final DirectBuffer buffer, final int offset, final int blockLength, final int version)
+    private Action onEstablish(final DirectBuffer buffer, final int offset, final int blockLength, final int version)
     {
         establish.wrap(buffer, offset, blockLength, version);
+
+        DebugLogger.logSbeDecoder(FIXP_SESSION, "> ", establishAppendTo);
 
         return handler.onEstablish(
             establish.sessionID(),
@@ -167,19 +197,21 @@ public class BinaryEntryPointParser extends AbstractFixPParser
             establish.codTimeoutWindow().time());
     }
 
-    private long onNegotiate(final DirectBuffer buffer, final int offset, final int blockLength, final int version)
+    private Action onNegotiate(final DirectBuffer buffer, final int offset, final int blockLength, final int version)
     {
         negotiate.wrap(buffer, offset, blockLength, version);
+
+        DebugLogger.logSbeDecoder(FIXP_SESSION, "> ", negotiateAppendTo);
 
         return handler.onNegotiate(
             negotiate.sessionID(),
             negotiate.sessionVerID(),
             negotiate.timestamp().time(),
             negotiate.enteringFirm(),
-            negotiate.onbehalfFirm(),
-            negotiate.senderLocation());
+            negotiate.onbehalfFirm());
     }
 
+    @Override
     public BinaryEntryPointContext lookupContext(
         final DirectBuffer messageBuffer,
         final int messageOffset,
@@ -203,7 +235,11 @@ public class BinaryEntryPointParser extends AbstractFixPParser
                     negotiate.sessionVerID(),
                     negotiate.timestamp().time(),
                     negotiate.enteringFirm(),
-                    true);
+                    true,
+                    negotiate.credentials(),
+                    negotiate.clientIP(),
+                    negotiate.clientAppName(),
+                    negotiate.clientAppVersion());
 
             case EstablishDecoder.TEMPLATE_ID:
                 establish.wrap(messageBuffer, offset, blockLength, version);
@@ -212,13 +248,18 @@ public class BinaryEntryPointParser extends AbstractFixPParser
                     establish.sessionVerID(),
                     establish.timestamp().time(),
                     NegotiateDecoder.enteringFirmNullValue(),
-                    false);
+                    false,
+                    establish.credentials(),
+                    "",
+                    "",
+                    "");
         }
 
         // TODO: deal with this scenario more politely
         throw new IllegalArgumentException("Template id: " + templateId + " isn't a negotiate or establish");
     }
 
+    @Override
     public long sessionId(final DirectBuffer buffer, final int start)
     {
         int offset = start + SOFH_LENGTH;
@@ -242,5 +283,17 @@ public class BinaryEntryPointParser extends AbstractFixPParser
         }
 
         throw new IllegalArgumentException("Template id: " + templateId + " isn't a negotiate or establish");
+    }
+
+    @Override
+    public int retransmissionTemplateId()
+    {
+        return RetransmissionDecoder.TEMPLATE_ID;
+    }
+
+    @Override
+    public boolean isRetransmittedMessage(final DirectBuffer buffer, final int offset)
+    {
+        return templateId(buffer, offset) >= LOWEST_APP_TEMPLATE_ID;
     }
 }

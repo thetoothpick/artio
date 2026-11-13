@@ -15,16 +15,27 @@
  */
 package uk.co.real_logic.artio.engine.logger;
 
+import io.aeron.Aeron;
+import io.aeron.driver.status.ReceiverPos;
+import org.agrona.collections.MutableInteger;
 import org.agrona.concurrent.UnsafeBuffer;
-import org.junit.Before;
+import org.agrona.concurrent.status.CountersReader;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 import uk.co.real_logic.artio.decoder.LogonDecoder;
 import uk.co.real_logic.artio.messages.MessageStatus;
 import uk.co.real_logic.artio.protocol.GatewayPublication;
 
 import java.util.stream.IntStream;
 
+import static io.aeron.driver.status.StreamCounter.STREAM_ID_OFFSET;
 import static java.nio.charset.StandardCharsets.US_ASCII;
 import static java.util.stream.Collectors.joining;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.contains;
+import static uk.co.real_logic.artio.CommonConfiguration.DEFAULT_INBOUND_LIBRARY_STREAM;
+import static uk.co.real_logic.artio.CommonConfiguration.DEFAULT_OUTBOUND_LIBRARY_STREAM;
+import static uk.co.real_logic.artio.Timing.assertEventuallyTrue;
 
 public class FixMessageLoggerTest extends AbstractFixMessageLoggerTest
 {
@@ -38,16 +49,23 @@ public class FixMessageLoggerTest extends AbstractFixMessageLoggerTest
         compactionSize = 500;
     }
 
-    @Before
+    @BeforeEach
     public void setup()
     {
         setup(null);
     }
 
-    void onMessage(final GatewayPublication inboundPublication, final long timestamp)
+    @Override
+    long onMessage(final GatewayPublication publication, final long timestamp)
+    {
+        return onMessage(publication, timestamp, (int)timestamp);
+    }
+
+    private long onMessage(
+        final GatewayPublication publication, final long timestamp, final int sequenceNumber)
     {
         fakeMessageBuffer.putLongAscii(0, timestamp);
-        untilComplete(() -> inboundPublication.saveMessage(
+        return untilComplete(() -> publication.saveMessage(
             fakeMessageBuffer,
             0,
             fakeMessageBuffer.capacity(),
@@ -57,7 +75,122 @@ public class FixMessageLoggerTest extends AbstractFixMessageLoggerTest
             SEQUENCE_INDEX,
             CONNECTION_ID,
             MessageStatus.OK,
-            (int)timestamp,
+            sequenceNumber,
             timestamp));
+    }
+
+    @Test
+    public void shouldForciblyDumpMessagesRatherThanOom()
+    {
+        // If we hit the maximum buffer size then we should just dump the messages to the handler rather than OOM.
+
+        final int dumpCount = 109;
+        for (int i = 0; i <= dumpCount + 1; i++)
+        {
+            onMessage(inboundPublication, i);
+            logger.doWork();
+        }
+
+        assertEventuallyReceives(dumpCount);
+        timestamps.clear();
+
+        // A messages arriving later are still received
+        onMessage(inboundPublication, dumpCount + 2);
+        onMessage(outboundPublication, dumpCount + 3);
+        onReplayerTimestamp(replayPublication, dumpCount + 4);
+        assertEventuallyReceives(2);
+    }
+
+    @Test
+    public void shouldNotReorderMessagesWithinABufferWithEqualTimestamps()
+    {
+        onMessage(inboundPublication, 1, 1);
+        onMessage(inboundPublication, 1, 2);
+
+        logger.doWork();
+
+        onMessage(outboundPublication, 3, 1);
+
+        onReplayerTimestamp(replayPublication, 4);
+
+        assertEventuallyReceives(2);
+        assertThat(timestamps, contains(1L, 1L));
+        assertThat(sequenceNumbers, contains(1, 2));
+    }
+
+    @Test
+    public void shouldDumpingBufferMaintainOriginalOwner()
+    {
+        for (int i = 1; i <= 55; ++i)
+        {
+            onMessage(inboundPublication, i);
+            onMessage(outboundPublication, i);
+        }
+
+        onReplayerTimestamp(replayPublication, 100);
+
+        assertReceivePositionsMatchPublicationPositions();
+        assertEventuallyReceives(110);
+    }
+
+    @Test
+    public void shouldDumpingUpdateMinAndMaxTimestamps()
+    {
+        for (int i = 1; i <= 50; ++i)
+        {
+            onMessage(inboundPublication, i);
+            onMessage(outboundPublication, i);
+        }
+
+        for (int i = 51; i <= 60; ++i)
+        {
+            onMessage(outboundPublication, i);
+        }
+
+        onReplayerTimestamp(replayPublication, 100);
+
+        assertReceivePositionsMatchPublicationPositions();
+        assertEventuallyReceives(109);
+
+        onMessage(inboundPublication, 100);
+        assertEventuallyReceives(110);
+    }
+
+    void assertReceivePositionsMatchPublicationPositions()
+    {
+        assertEventuallyTrue(
+            () -> "Receive Positions don't match publication positions",
+            () ->
+            {
+                final MutableInteger inboundReceiveCounterId = new MutableInteger(Aeron.NULL_VALUE);
+                final MutableInteger outboundReceiveCounterId = new MutableInteger(Aeron.NULL_VALUE);
+
+                final CountersReader countersReader = aeron.countersReader();
+                countersReader.forEach((counterId, typeId, keyBuffer, label) ->
+                {
+                    if (ReceiverPos.RECEIVER_POS_TYPE_ID == typeId)
+                    {
+                        if (keyBuffer.getInt(STREAM_ID_OFFSET) == DEFAULT_INBOUND_LIBRARY_STREAM)
+                        {
+                            inboundReceiveCounterId.set(counterId);
+                        }
+                        if (keyBuffer.getInt(STREAM_ID_OFFSET) == DEFAULT_OUTBOUND_LIBRARY_STREAM)
+                        {
+                            outboundReceiveCounterId.set(counterId);
+                        }
+                    }
+                });
+
+                final int inboundCounterId = inboundReceiveCounterId.get();
+                final int outboundCounterId = outboundReceiveCounterId.get();
+
+                return Aeron.NULL_VALUE != inboundCounterId && Aeron.NULL_VALUE != outboundCounterId &&
+                    countersReader.getCounterValue(inboundCounterId) == inboundPublication.position() &&
+                    countersReader.getCounterValue(outboundCounterId) == outboundPublication.position();
+            },
+            10_000,
+            () ->
+            {
+            });
     }
 }

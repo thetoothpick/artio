@@ -23,12 +23,13 @@ import uk.co.real_logic.artio.util.CharFormatter;
 public abstract class MessageTracker implements ControlledFragmentHandler
 {
     static final ThreadLocal<CharFormatter> FOUND_REPLAY_MESSAGE =
-        ThreadLocal.withInitial(() -> new CharFormatter("Found Replay Message [%s]%n"));
+        ThreadLocal.withInitial(() -> new CharFormatter("Found Replay Message [%s]"));
 
     final MessageHeaderDecoder messageHeaderDecoder = new MessageHeaderDecoder();
     final LogTag logTag;
     final ControlledFragmentHandler messageHandler;
 
+    int maxCount;
     int count;
 
     MessageTracker(final LogTag logTag, final ControlledFragmentHandler messageHandler)
@@ -37,8 +38,9 @@ public abstract class MessageTracker implements ControlledFragmentHandler
         this.messageHandler = messageHandler;
     }
 
-    void reset()
+    void reset(final int maxCount)
     {
-        count = 0;
+        this.maxCount = maxCount;
+        this.count = 0;
     }
 }

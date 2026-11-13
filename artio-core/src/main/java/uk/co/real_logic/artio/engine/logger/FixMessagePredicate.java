@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited., Monotonic Ltd.
+ * Copyright 2015-2025 Real Logic Limited., Monotonic Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,8 @@ import uk.co.real_logic.artio.messages.FixMessageDecoder;
 /**
  * A criteria for filtering fix messages.
  *
+ * Predicates should not be shared between different concurrent calls to <code>scan()</code>.
+ *
  * @see FixMessagePredicates for different useful implementations
  */
 @FunctionalInterface
@@ -27,37 +29,20 @@ public interface FixMessagePredicate
 {
     boolean test(FixMessageDecoder message);
 
+    /**
+     * Invoked when a scan begins, can be used to reset any internal state.
+     */
+    default void reset()
+    {
+    }
+
     default FixMessagePredicate and(final FixMessagePredicate other)
     {
-        return (message) ->
-        {
-            final int limit = message.limit();
-
-            if (!test(message))
-            {
-                return false;
-            }
-
-            message.limit(limit);
-
-            return other.test(message);
-        };
+        return new FixMessageAnd(this, other);
     }
 
     default FixMessagePredicate or(final FixMessagePredicate other)
     {
-        return (message) ->
-        {
-            final int limit = message.limit();
-
-            if (test(message))
-            {
-                return true;
-            }
-
-            message.limit(limit);
-
-            return other.test(message);
-        };
+        return new FixMessageOr(this, other);
     }
 }

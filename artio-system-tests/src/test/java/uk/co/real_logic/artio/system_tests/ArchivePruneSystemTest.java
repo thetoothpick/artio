@@ -16,34 +16,41 @@
 package uk.co.real_logic.artio.system_tests;
 
 import io.aeron.archive.client.AeronArchive;
-import org.agrona.LangUtil;
 import org.agrona.collections.Long2LongHashMap;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+
 import uk.co.real_logic.artio.DebugLogger;
 import uk.co.real_logic.artio.LogTag;
 import uk.co.real_logic.artio.MonitoringAgentFactory;
-import uk.co.real_logic.artio.Reply;
 import uk.co.real_logic.artio.engine.EngineConfiguration;
 import uk.co.real_logic.artio.engine.FixEngine;
+import uk.co.real_logic.artio.engine.RecordingCoordinator;
 import uk.co.real_logic.artio.engine.SessionInfo;
 
+import java.io.File;
 import java.util.Map;
 
 import static io.aeron.Aeron.NULL_VALUE;
 import static io.aeron.logbuffer.LogBufferDescriptor.TERM_MIN_LENGTH;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.*;
-import static org.junit.Assert.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static uk.co.real_logic.artio.FixMatchers.hasSequenceIndex;
 import static uk.co.real_logic.artio.TestFixtures.launchMediaDriver;
 import static uk.co.real_logic.artio.system_tests.SystemTestUtil.*;
 
 public class ArchivePruneSystemTest extends AbstractGatewayToGatewaySystemTest
 {
-    @Before
+    private boolean saveOnShutdownTesting = true;
+
+    @BeforeEach
     public void launch()
     {
+        deleteLogs();
+
         mediaDriver = launchMediaDriver(TERM_MIN_LENGTH);
 
         newAcceptingEngine(true);
@@ -70,7 +77,8 @@ public class ArchivePruneSystemTest extends AbstractGatewayToGatewaySystemTest
         acceptingEngine = FixEngine.launch(acceptingConfig);
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void shouldPruneAwayOldArchivePositions()
     {
         setupSessionWithSegmentOfFiles();
@@ -80,7 +88,8 @@ public class ArchivePruneSystemTest extends AbstractGatewayToGatewaySystemTest
         assertPruneWorks(false, true);
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void shouldPruneAwayOldArchivePositionsWithFreeLibraryIds()
     {
         setupSessionWithSegmentOfFiles();
@@ -100,7 +109,8 @@ public class ArchivePruneSystemTest extends AbstractGatewayToGatewaySystemTest
         assertPruneWorks(false, false);
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void shouldPruneAwayOldArchivePositionsForFixEngineResetSequenceNumbers()
     {
         setupSessionWithSegmentOfFiles();
@@ -110,7 +120,8 @@ public class ArchivePruneSystemTest extends AbstractGatewayToGatewaySystemTest
         assertPruneWorks(true, true);
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void shouldPruneAwayOldArchivePositionsForSessionTrySendSequenceReset()
     {
         setupSessionWithSegmentOfFiles();
@@ -136,7 +147,8 @@ public class ArchivePruneSystemTest extends AbstractGatewayToGatewaySystemTest
             () -> sessionInfo.sequenceIndex() == sequenceIndex);
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void shouldPruneAwayOldArchivePositionsForSessionTryResetSequenceNumbers()
     {
         acquireAcceptingSession();
@@ -151,7 +163,26 @@ public class ArchivePruneSystemTest extends AbstractGatewayToGatewaySystemTest
         assertAcceptingSessionHasSequenceIndex(1);
         assertInitiatingSequenceIndexIs(1);
 
+        final File file = RecordingCoordinator.recordingIdsFile(acceptingEngine.configuration());
+        assertTrue(file.exists(), "Failed to create recording coordinator file");
+
         assertPruneWorks(false, true);
+    }
+
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
+    public void shouldPruneAwayOldArchivePositionsForSessionTryResetSequenceNumbersProcessTerminated()
+    {
+        RecordingCoordinator.saveOnShutdownTesting(false);
+        saveOnShutdownTesting = false;
+        try
+        {
+            shouldPruneAwayOldArchivePositionsForSessionTryResetSequenceNumbers();
+        }
+        finally
+        {
+            RecordingCoordinator.saveOnShutdownTesting(true);
+        }
     }
 
     private void assertPruneWorks(final boolean reconnectSession, final boolean hasConnectedLibrary)
@@ -194,6 +225,9 @@ public class ArchivePruneSystemTest extends AbstractGatewayToGatewaySystemTest
             closeAcceptingEngine();
             closeAcceptingLibrary();
 
+            final File file = RecordingCoordinator.recordingIdsFile(acceptingEngine.configuration());
+            assertTrue(file.exists(), "Failed to create recording coordinator file");
+
             newAcceptingEngine(false);
             newAcceptingLibrary();
             testSystem.add(acceptingLibrary);
@@ -203,6 +237,14 @@ public class ArchivePruneSystemTest extends AbstractGatewayToGatewaySystemTest
 
             // Ensure that the recordings have been extended
             final Long2LongHashMap endRecordingIdToStartPos = getRecordingStartPos(archive);
+
+            if (!saveOnShutdownTesting)
+            {
+                // If we didn't save the file it's reasonable to continue to operate the prune but have extra
+                // unknown recordings
+                endRecordingIdToStartPos.keySet().retainAll(prunedRecordingIdToStartPos.keySet());
+            }
+
             assertEquals(prunedRecordingIdToStartPos, endRecordingIdToStartPos);
         }
     }
@@ -272,10 +314,6 @@ public class ArchivePruneSystemTest extends AbstractGatewayToGatewaySystemTest
         final long sessionId = acceptingSession.id();
         acceptingSession = null;
 
-        final Reply<?> reply = testSystem.awaitReply(acceptingEngine.resetSequenceNumber(sessionId));
-        if (reply.hasErrored())
-        {
-            LangUtil.rethrowUnchecked(reply.error());
-        }
+        testSystem.resetSequenceNumber(acceptingEngine, sessionId);
     }
 }

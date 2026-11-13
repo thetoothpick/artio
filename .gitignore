@@ -25,8 +25,10 @@ out
 
 # the build
 build-local.properties
-.gradle
-build
+build/
+!buildSrc/
+!buildSrc/src/**/build
+.gradle/
 
 # Benchmark timings
 timings.log
@@ -66,3 +68,7 @@ client-aeron/
 artio-ilink3-codecs/src/main/resources/uk/co/real_logic/artio/ilink/ilinkbinary.xml
 artio-system-tests/generated/
 
+artio-system-tests/src/perf/java/br/
+benchmark-client-archive/
+latencies.csv
+latencies.png

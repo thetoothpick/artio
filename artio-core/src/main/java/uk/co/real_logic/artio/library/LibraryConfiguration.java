@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,14 +15,28 @@
  */
 package uk.co.real_logic.artio.library;
 
+import io.aeron.CommonContext;
+import org.agrona.Strings;
+import org.agrona.concurrent.EpochNanoClock;
 import org.agrona.concurrent.IdleStrategy;
+import org.agrona.concurrent.errors.ErrorConsumer;
 import uk.co.real_logic.artio.CommonConfiguration;
+import uk.co.real_logic.artio.ErrorHandlerFactory;
+import uk.co.real_logic.artio.MonitoringAgentFactory;
+import uk.co.real_logic.artio.ReproductionClock;
+import uk.co.real_logic.artio.engine.FixEngine;
+import uk.co.real_logic.artio.fields.EpochFractionFormat;
 import uk.co.real_logic.artio.session.DirectSessionProxy;
+import uk.co.real_logic.artio.session.ResendRequestController;
+import uk.co.real_logic.artio.session.SessionCustomisationStrategy;
 import uk.co.real_logic.artio.session.SessionIdStrategy;
 import uk.co.real_logic.artio.session.SessionProxyFactory;
+import uk.co.real_logic.artio.timing.HistogramHandler;
+import uk.co.real_logic.artio.validation.MessageValidationStrategy;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadLocalRandom;
 
 import static io.aeron.logbuffer.ControlledFragmentHandler.Action.CONTINUE;
@@ -54,10 +68,12 @@ public final class LibraryConfiguration extends CommonConfiguration
         logonSequenceIndex) -> {};
     public static final LibraryConnectHandler DEFAULT_LIBRARY_CONNECT_HANDLER = new LibraryConnectHandler()
     {
+        @Override
         public void onConnect(final FixLibrary library)
         {
         }
 
+        @Override
         public void onDisconnect(final FixLibrary library)
         {
         }
@@ -65,18 +81,7 @@ public final class LibraryConfiguration extends CommonConfiguration
 
     public static final SessionProxyFactory DEFAULT_SESSION_PROXY_FACTORY = DirectSessionProxy::new;
 
-    private final int libraryId;
-
-    {
-        int libraryId;
-        do
-        {
-            libraryId = ThreadLocalRandom.current().nextInt();
-        }
-        while (libraryId == ENGINE_LIBRARY_ID);
-
-        this.libraryId = libraryId;
-    }
+    private int libraryId = ENGINE_LIBRARY_ID;
 
     private SessionAcquireHandler sessionAcquireHandler;
     private IdleStrategy libraryIdleStrategy = backoffIdleStrategy();
@@ -89,15 +94,18 @@ public final class LibraryConfiguration extends CommonConfiguration
     private SessionProxyFactory sessionProxyFactory = DEFAULT_SESSION_PROXY_FACTORY;
     private FixPConnectionExistsHandler fixPConnectionExistsHandler;
     private FixPConnectionAcquiredHandler fixPConnectionAcquiredHandler;
+    private LibraryReproductionConfiguration reproductionConfiguration;
+    private long libraryCycleThresholdNs = DEFAULT_CYCLE_THRESHOLD_NS;
 
     /**
-     * When a new session connects to the gateway you register a callback handler to find
+     * When a new FIX session connects to the gateway you register a callback handler to find
      * out about the event. This method sets the handler for this library instance.
      *
      * Only needed if this is the accepting library instance.
      *
      * @param sessionAcquireHandler the new session handler
      * @return this
+     * @see #fixPConnectionAcquiredHandler(FixPConnectionAcquiredHandler) for the FIXP equivalent
      */
     public LibraryConfiguration sessionAcquireHandler(final SessionAcquireHandler sessionAcquireHandler)
     {
@@ -105,6 +113,16 @@ public final class LibraryConfiguration extends CommonConfiguration
         return this;
     }
 
+    /**
+     * When a new FIXP session connects to the gateway you register a callback handler to find
+     * out about the event. This method sets the handler for this library instance.
+     *
+     * Only needed if this is the accepting library instance.
+     *
+     * @param fixPConnectionAcquiredHandler the new session handler
+     * @return this
+     * @see #sessionAcquireHandler(SessionAcquireHandler) for the FIX equivalent
+     */
     public LibraryConfiguration fixPConnectionAcquiredHandler(
         final FixPConnectionAcquiredHandler fixPConnectionAcquiredHandler)
     {
@@ -155,6 +173,25 @@ public final class LibraryConfiguration extends CommonConfiguration
         return this;
     }
 
+    /**
+     * Sets the library id to be used by this library. This is especially useful when in reproduction mode, as it
+     * allows a library to have the same library id as a previous run. Under normal circumstances it isn't necessary to
+     * set a library id - a random one will be assigned.
+     *
+     * @param libraryId the id to be used by this library.
+     * @return this
+     */
+    public LibraryConfiguration libraryId(final int libraryId)
+    {
+        if (libraryId == ENGINE_LIBRARY_ID || libraryId < ENGINE_LIBRARY_ID)
+        {
+            throw new IllegalArgumentException("Invalid library id: " + libraryId);
+        }
+
+        this.libraryId = libraryId;
+        return this;
+    }
+
     public SessionAcquireHandler sessionAcquireHandler()
     {
         return sessionAcquireHandler;
@@ -193,6 +230,7 @@ public final class LibraryConfiguration extends CommonConfiguration
     /**
      * {@inheritDoc}
      */
+    @Override
     public LibraryConfiguration sessionIdStrategy(final SessionIdStrategy sessionIdStrategy)
     {
         super.sessionIdStrategy(sessionIdStrategy);
@@ -202,6 +240,38 @@ public final class LibraryConfiguration extends CommonConfiguration
     /**
      * {@inheritDoc}
      */
+    @Override
+    public LibraryConfiguration sessionCustomisationStrategy(
+            final SessionCustomisationStrategy sessionCustomisationStrategy)
+    {
+        super.sessionCustomisationStrategy(sessionCustomisationStrategy);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public LibraryConfiguration messageValidationStrategy(final MessageValidationStrategy messageValidationStrategy)
+    {
+        super.messageValidationStrategy(messageValidationStrategy);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public LibraryConfiguration reasonableTransmissionTimeInMs(final long reasonableTransmissionTimeInMs)
+    {
+        super.reasonableTransmissionTimeInMs(reasonableTransmissionTimeInMs);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
     public LibraryConfiguration monitoringBuffersLength(final Integer monitoringBuffersLength)
     {
         super.monitoringBuffersLength(monitoringBuffersLength);
@@ -211,9 +281,74 @@ public final class LibraryConfiguration extends CommonConfiguration
     /**
      * {@inheritDoc}
      */
+    @Override
     public LibraryConfiguration monitoringFile(final String monitoringFile)
     {
         super.monitoringFile(monitoringFile);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    @SuppressWarnings("Deprecated")
+    @Deprecated
+    public LibraryConfiguration printErrorMessages(final boolean printErrorMessages)
+    {
+        super.printErrorMessages(printErrorMessages);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    @SuppressWarnings("Deprecated")
+    @Deprecated
+    public LibraryConfiguration customErrorConsumer(final ErrorConsumer customErrorConsumer)
+    {
+        super.customErrorConsumer(customErrorConsumer);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public LibraryConfiguration errorHandlerFactory(final ErrorHandlerFactory errorHandlerFactory)
+    {
+        super.errorHandlerFactory(errorHandlerFactory);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public LibraryConfiguration monitoringAgentFactory(final MonitoringAgentFactory monitoringAgentFactory)
+    {
+        super.monitoringAgentFactory(monitoringAgentFactory);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public LibraryConfiguration monitoringThreadIdleStrategy(final IdleStrategy errorPrinterIdleStrategy)
+    {
+        super.monitoringThreadIdleStrategy(errorPrinterIdleStrategy);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public LibraryConfiguration gatewayId(final long gatewayId)
+    {
+        super.gatewayId(gatewayId);
         return this;
     }
 
@@ -244,21 +379,338 @@ public final class LibraryConfiguration extends CommonConfiguration
     }
 
     /**
+     * Enable inbound reproduction mode for the Library.
+     *
+     * Inbound reproduction mode needs to be started using: {@link FixEngine#startReproduction()}. In order to use this
+     * then the Engine that this library connects to must also have its
+     * {@link uk.co.real_logic.artio.engine.EngineConfiguration#reproduceInbound(long, long)} mode enabled.
+     *
+     * @param startInNs the start time to reproduce from.
+     * @param endInNs the end time to reproduce until.
+     * @return this
+     */
+    public LibraryConfiguration reproduceInbound(
+        final long startInNs, final long endInNs)
+    {
+        final ReproductionClock clock = new ReproductionClock(startInNs);
+        epochNanoClock(clock);
+        this.reproductionConfiguration = new LibraryReproductionConfiguration(startInNs, endInNs, clock);
+        return this;
+    }
+
+    /**
+     * Set a threshold for the library work cycle time which when exceeded it will increment the
+     * library cycle time exceeded count.
+     *
+     * @param libraryCycleThresholdNs value in nanoseconds. The value 0 will disable duty cycle tracking on the library.
+     * @return this for fluent API.
+     */
+    public LibraryConfiguration libraryCycleThresholdNs(final long libraryCycleThresholdNs)
+    {
+        this.libraryCycleThresholdNs = libraryCycleThresholdNs;
+        return this;
+    }
+
+    // ------------------------
+    // BEGIN INHERITED SETTERS
+    // ------------------------
+
+    @Override
+    public LibraryConfiguration sendingTimeWindowInMs(final long sendingTimeWindowInMs)
+    {
+        super.sendingTimeWindowInMs(sendingTimeWindowInMs);
+        return this;
+    }
+
+    /**
      * {@inheritDoc}
      */
+    @Override
     public LibraryConfiguration replyTimeoutInMs(final long replyTimeoutInMs)
     {
         super.replyTimeoutInMs(replyTimeoutInMs);
         return this;
     }
 
-    void conclude()
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public LibraryConfiguration inboundMaxClaimAttempts(final int inboundMaxClaimAttempts)
     {
+        super.inboundMaxClaimAttempts(inboundMaxClaimAttempts);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public LibraryConfiguration outboundMaxClaimAttempts(final int outboundMaxClaimAttempts)
+    {
+        super.outboundMaxClaimAttempts(outboundMaxClaimAttempts);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public LibraryConfiguration sessionBufferSize(final int bufferSize)
+    {
+        super.sessionBufferSize(bufferSize);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public LibraryConfiguration histogramPollPeriodInMs(final long histogramPollPeriodInMs)
+    {
+        super.histogramPollPeriodInMs(histogramPollPeriodInMs);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public LibraryConfiguration histogramLoggingFile(final String histogramLoggingFile)
+    {
+        super.histogramLoggingFile(histogramLoggingFile);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public LibraryConfiguration histogramHandler(final HistogramHandler histogramHandler)
+    {
+        super.histogramHandler(histogramHandler);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public LibraryConfiguration agentNamePrefix(final String agentNamePrefix)
+    {
+        super.agentNamePrefix(agentNamePrefix);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public LibraryConfiguration printAeronStreamIdentifiers(final boolean printAeronStreamIdentifiers)
+    {
+        super.printAeronStreamIdentifiers(printAeronStreamIdentifiers);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public LibraryConfiguration inboundLibraryStream(final int inboundLibraryStream)
+    {
+        super.inboundLibraryStream(inboundLibraryStream);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public LibraryConfiguration outboundLibraryStream(final int outboundLibraryStream)
+    {
+        super.outboundLibraryStream(outboundLibraryStream);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public LibraryConfiguration threadFactory(final ThreadFactory threadFactory)
+    {
+        super.threadFactory(threadFactory);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public LibraryConfiguration validateCompIdsOnEveryMessage(final boolean validateCompIdsOnEveryMessage)
+    {
+        super.validateCompIdsOnEveryMessage(validateCompIdsOnEveryMessage);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public LibraryConfiguration validateTimeStrictly(final boolean validateTimeStrictly)
+    {
+        super.validateTimeStrictly(validateTimeStrictly);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public LibraryConfiguration sessionEpochFractionFormat(final EpochFractionFormat sessionEpochFractionFormat)
+    {
+        super.sessionEpochFractionFormat(sessionEpochFractionFormat);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public LibraryConfiguration maxFixPKeepaliveTimeoutInMs(final long maxFixpKeepaliveTimeoutInMs)
+    {
+        super.maxFixPKeepaliveTimeoutInMs(maxFixpKeepaliveTimeoutInMs);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public LibraryConfiguration minFixPKeepaliveTimeoutInMs(final long minFixPKeepaliveTimeoutInMs)
+    {
+        super.minFixPKeepaliveTimeoutInMs(minFixPKeepaliveTimeoutInMs);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public LibraryConfiguration acceptorFixPKeepaliveTimeoutInMs(final long acceptorFixPKeepaliveTimeoutInMs)
+    {
+        super.acceptorFixPKeepaliveTimeoutInMs(acceptorFixPKeepaliveTimeoutInMs);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public LibraryConfiguration noEstablishFixPTimeoutInMs(final long noEstablishFixPTimeoutInMs)
+    {
+        super.noEstablishFixPTimeoutInMs(noEstablishFixPTimeoutInMs);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public LibraryConfiguration fixPAcceptedSessionMaxRetransmissionRange(
+        final int fixPAcceptedSessionMaxRetransmissionRange)
+    {
+        super.fixPAcceptedSessionMaxRetransmissionRange(fixPAcceptedSessionMaxRetransmissionRange);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public LibraryConfiguration epochNanoClock(final EpochNanoClock epochNanoClock)
+    {
+        super.epochNanoClock(epochNanoClock);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public LibraryConfiguration resendRequestController(final ResendRequestController resendRequestController)
+    {
+        super.resendRequestController(resendRequestController);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public LibraryConfiguration defaultHeartbeatIntervalInS(final int value)
+    {
+        super.defaultHeartbeatIntervalInS(value);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public LibraryConfiguration forcedHeartbeatIntervalInS(final int value)
+    {
+        super.forcedHeartbeatIntervalInS(value);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public CommonConfiguration disableHeartbeatRepliesToTestRequests(
+        final boolean disableHeartbeatRepliesToTestRequests)
+    {
+        return super.disableHeartbeatRepliesToTestRequests(disableHeartbeatRepliesToTestRequests);
+    }
+
+    // ------------------------
+    // END INHERITED SETTERS
+    // ------------------------
+
+    LibraryConfiguration conclude()
+    {
+        concludeLibraryId();
+
         super.conclude("library-" + libraryId());
+
+        if (isReproductionEnabled() && reproductionConfiguration.clock() != epochNanoClock())
+        {
+            throw new IllegalArgumentException("Do no set the nano clock when using reproduction mode");
+        }
 
         if (libraryAeronChannels.isEmpty())
         {
             throw new IllegalArgumentException("You must specify at least one channel to connect to");
+        }
+
+        if (Strings.isEmpty(aeronContext().clientName()))
+        {
+            aeronContext().clientName("fix-library-" + gatewayId() + "-" + libraryId);
+        }
+
+        if (CommonContext.shouldPrintConfigurationOnStart())
+        {
+            System.out.println(this);
+        }
+
+        return this;
+    }
+
+    private void concludeLibraryId()
+    {
+        while (libraryId == ENGINE_LIBRARY_ID || libraryId < ENGINE_LIBRARY_ID)
+        {
+            libraryId = ThreadLocalRandom.current().nextInt();
         }
     }
 
@@ -287,9 +739,48 @@ public final class LibraryConfiguration extends CommonConfiguration
         return libraryName;
     }
 
+    LibraryReproductionConfiguration reproductionConfiguration()
+    {
+        return reproductionConfiguration;
+    }
+
+    boolean isReproductionEnabled()
+    {
+        return reproductionConfiguration != null;
+    }
+
+    public long libraryCycleThresholdNs()
+    {
+        return libraryCycleThresholdNs;
+    }
+
     public LibraryConfiguration libraryName(final String libraryName)
     {
         this.libraryName = libraryName;
         return this;
+    }
+
+    @Override
+    public String toString()
+    {
+        return "LibraryConfiguration" +
+            "\n{" +
+            "\n    libraryId=" + libraryId +
+            "\n    sessionAcquireHandler=" + sessionAcquireHandler +
+            "\n    libraryIdleStrategy=" + libraryIdleStrategy +
+            "\n    sessionExistsHandler=" + sessionExistsHandler +
+            "\n    gatewayErrorHandler=" + gatewayErrorHandler +
+            "\n    libraryAeronChannels=" + libraryAeronChannels +
+            "\n    libraryConnectHandler=" + libraryConnectHandler +
+            "\n    scheduler=" + scheduler +
+            "\n    libraryName='" + libraryName + '\'' +
+            "\n    sessionProxyFactory=" + sessionProxyFactory +
+            "\n    fixPConnectionExistsHandler=" + fixPConnectionExistsHandler +
+            "\n    fixPConnectionAcquiredHandler=" + fixPConnectionAcquiredHandler +
+            "\n    reproductionConfiguration=" + reproductionConfiguration +
+            "\n    libraryCycleThresholdNs=" + libraryCycleThresholdNs +
+            "\n}" +
+            "\nLibraryConfiguration." + super.toString();
+
     }
 }

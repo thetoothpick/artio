@@ -15,49 +15,68 @@
  */
 package uk.co.real_logic.artio.system_tests;
 
+import io.aeron.logbuffer.ControlledFragmentHandler.Action;
 import org.agrona.DirectBuffer;
 import uk.co.real_logic.artio.fixp.FixPConnection;
+import uk.co.real_logic.artio.fixp.FixPMessageHeader;
 import uk.co.real_logic.artio.ilink.ILink3ConnectionHandler;
 import uk.co.real_logic.artio.library.NotAppliedResponse;
 import uk.co.real_logic.artio.messages.DisconnectReason;
 
+import static io.aeron.logbuffer.ControlledFragmentHandler.Action.CONTINUE;
+
 public class FakeILink3ConnectionHandler implements ILink3ConnectionHandler
 {
-    public void onNotApplied(
+    @Override
+    public Action onNotApplied(
         final FixPConnection connection,
         final long fromSequenceNumber, final long msgCount, final NotAppliedResponse response)
     {
+        return CONTINUE;
     }
 
-    public void onRetransmitReject(
+    @Override
+    public Action onRetransmitReject(
         final FixPConnection connection, final String reason, final long requestTimestamp, final int errorCodes)
     {
+        return CONTINUE;
     }
 
-    public void onRetransmitTimeout(final FixPConnection connection)
+    @Override
+    public Action onRetransmitTimeout(final FixPConnection connection)
     {
+        return CONTINUE;
     }
 
-    public void onSequence(final FixPConnection connection, final long nextSeqNo)
+    @Override
+    public Action onSequence(final FixPConnection connection, final long nextSeqNo)
     {
+        return CONTINUE;
     }
 
-    public void onError(final FixPConnection connection, final Exception ex)
+    @Override
+    public Action onError(final FixPConnection connection, final Exception ex)
     {
+        return CONTINUE;
     }
 
-    public void onDisconnect(final FixPConnection connection, final DisconnectReason reason)
+    @Override
+    public Action onDisconnect(final FixPConnection connection, final DisconnectReason reason)
     {
+        return CONTINUE;
     }
 
-    public void onBusinessMessage(
+    @Override
+    public Action onBusinessMessage(
         final FixPConnection connection,
         final int templateId,
         final DirectBuffer buffer,
         final int offset,
         final int blockLength,
         final int version,
-        final boolean possRetrans)
+        final boolean possRetrans,
+        final FixPMessageHeader messageHeader)
     {
+        return CONTINUE;
     }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@ import uk.co.real_logic.artio.util.MutableAsciiBuffer;
 import java.time.Month;
 
 import static uk.co.real_logic.artio.fields.CalendricalUtil.isValidDayOfMonth;
+import static uk.co.real_logic.artio.fields.CalendricalUtil.isValidWeekOfMonth;
 import static uk.co.real_logic.artio.fields.CalendricalUtil.isValidMonth;
 
 /**
@@ -157,7 +158,7 @@ public final class MonthYear
                 final int endWeek = startWeek + SIZE_OF_WEEK_OF_MONTH;
                 final int weekOfMonth = buffer.getNatural(startWeek, endWeek);
 
-                if (!isValidDayOfMonth(weekOfMonth))
+                if (!isValidWeekOfMonth(weekOfMonth))
                 {
                     return false;
                 }
@@ -218,6 +219,7 @@ public final class MonthYear
         return SHORT_LENGTH;
     }
 
+    @Override
     public boolean equals(final Object o)
     {
         if (this == o)
@@ -238,6 +240,7 @@ public final class MonthYear
             weekOfMonth == monthYear.weekOfMonth;
     }
 
+    @Override
     public int hashCode()
     {
         int result = year;
@@ -247,6 +250,7 @@ public final class MonthYear
         return result;
     }
 
+    @Override
     public String toString()
     {
         if (hasDayOfMonth())

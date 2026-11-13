@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd., Monotonic Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd., Monotonic Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,12 +16,13 @@
 package uk.co.real_logic.artio.engine.logger;
 
 import io.aeron.logbuffer.Header;
-import io.aeron.protocol.DataHeaderFlyweight;
 import org.agrona.CloseHelper;
 import org.agrona.DirectBuffer;
 import org.agrona.ErrorHandler;
 import org.agrona.LangUtil;
-import org.agrona.collections.*;
+import org.agrona.collections.CollectionUtil;
+import org.agrona.collections.Long2LongHashMap;
+import org.agrona.collections.Long2ObjectHashMap;
 import org.agrona.concurrent.AtomicBuffer;
 import org.agrona.concurrent.EpochClock;
 import uk.co.real_logic.artio.dictionary.generation.Exceptions;
@@ -37,6 +38,7 @@ import uk.co.real_logic.artio.storage.messages.LastKnownSequenceNumberEncoder;
 import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
+import java.nio.file.CopyOption;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -45,7 +47,10 @@ import java.util.List;
 import java.util.function.Predicate;
 
 import static io.aeron.archive.status.RecordingPos.NULL_RECORDING_ID;
+import static io.aeron.logbuffer.FrameDescriptor.FRAME_ALIGNMENT;
 import static io.aeron.protocol.DataHeaderFlyweight.BEGIN_FLAG;
+import static org.agrona.BitUtil.align;
+import static uk.co.real_logic.artio.AtomicBuffers.checkAligned;
 import static uk.co.real_logic.artio.CommonConfiguration.RUNNING_ON_WINDOWS;
 import static uk.co.real_logic.artio.engine.SectorFramer.*;
 import static uk.co.real_logic.artio.engine.SequenceNumberExtractor.NO_SEQUENCE_NUMBER;
@@ -61,6 +66,7 @@ import static uk.co.real_logic.artio.storage.messages.LastKnownSequenceNumberEnc
 public class SequenceNumberIndexWriter implements Index
 {
     private static final long MISSING_RECORD = -1L;
+    private static final CopyOption[] ATOMIC_MOVE_OPTIONS = { StandardCopyOption.ATOMIC_MOVE };
     private static final long UNINITIALISED = -1;
     public static final long NO_REQUIRED_POSITION = -1000;
 
@@ -91,7 +97,7 @@ public class SequenceNumberIndexWriter implements Index
     private final RandomAccessFile metaDataFile;
     private final SequenceNumberIndexReader reader;
     private byte[] metaDataWriteBuffer = new byte[0];
-    private final Long2ObjectHashMap<LongHashSet> sessionIdToRedactPositions = new Long2ObjectHashMap<>();
+    private final Long2ObjectHashMap<Long2LongHashMap> sessionIdToRedactPositions = new Long2ObjectHashMap<>();
 
     private final SequenceNumberExtractor sequenceNumberExtractor;
     private FramerContext framerContext;
@@ -109,14 +115,17 @@ public class SequenceNumberIndexWriter implements Index
 
     private MappedFile writableFile;
     private MappedFile indexFile;
-    private long nextRollPosition = UNINITIALISED;
+    private final Long2LongHashMap nextRollPositions = new Long2LongHashMap(UNINITIALISED);
 
     private final EpochClock clock;
+    private final SessionOwnershipTracker sessionOwnershipTracker;
     private final long indexFileStateFlushTimeoutInMs;
     private long lastUpdatedFileTimeInMs;
+    private long fileUpdateCount;
     private boolean hasSavedRecordSinceFileUpdate = false;
 
     public SequenceNumberIndexWriter(
+        final SequenceNumberExtractor sequenceNumberExtractor,
         final AtomicBuffer inMemoryBuffer,
         final MappedFile indexFile,
         final ErrorHandler errorHandler,
@@ -126,9 +135,12 @@ public class SequenceNumberIndexWriter implements Index
         final EpochClock clock,
         final String metaDataDir,
         final Long2LongHashMap connectionIdToFixPSessionId,
-        final FixPProtocolType fixPProtocolType)
+        final FixPProtocolType fixPProtocolType,
+        final boolean indexChecksumEnabled,
+        final boolean logMessages)
     {
-        this.inMemoryBuffer = inMemoryBuffer;
+        this.sequenceNumberExtractor = sequenceNumberExtractor;
+        this.inMemoryBuffer = checkAligned(inMemoryBuffer);
         this.indexFile = indexFile;
         this.errorHandler = errorHandler;
         this.streamId = streamId;
@@ -136,27 +148,35 @@ public class SequenceNumberIndexWriter implements Index
         this.indexFileStateFlushTimeoutInMs = indexFileStateFlushTimeoutInMs;
         this.clock = clock;
 
+        this.sessionOwnershipTracker = new SessionOwnershipTracker();
         final String indexFilePath = indexFile.file().getAbsolutePath();
         indexPath = indexFile.file().toPath();
         final File writeableFile = writableFile(indexFilePath);
         writablePath = writeableFile.toPath();
         passingPlacePath = passingFile(indexFilePath).toPath();
         writableFile = MappedFile.map(writeableFile, fileCapacity);
-        sequenceNumberExtractor = new SequenceNumberExtractor(errorHandler);
 
         // TODO: Fsync parent directory
         indexedPositionsOffset = positionTableOffset(fileCapacity);
         checksumFramer = new ChecksumFramer(
-            inMemoryBuffer, indexedPositionsOffset, errorHandler, 0, "SequenceNumberIndex");
+            inMemoryBuffer, indexedPositionsOffset, errorHandler, 0, "SequenceNumberIndex",
+            indexChecksumEnabled);
         try
         {
             initialiseBuffer();
-            positionWriter = new IndexedPositionWriter(
-                positionsBuffer(inMemoryBuffer, indexedPositionsOffset),
-                errorHandler,
-                indexedPositionsOffset,
-                "SequenceNumberIndex",
-                recordingIdLookup);
+            if (logMessages)
+            {
+                positionWriter = new IndexedPositionWriter(
+                    positionsBuffer(inMemoryBuffer, indexedPositionsOffset),
+                    errorHandler,
+                    indexedPositionsOffset,
+                    "SequenceNumberIndex",
+                    recordingIdLookup, indexChecksumEnabled);
+            }
+            else
+            {
+                positionWriter = null;
+            }
 
             if (metaDataDir != null)
             {
@@ -179,7 +199,7 @@ public class SequenceNumberIndexWriter implements Index
         reader = new SequenceNumberIndexReader(inMemoryBuffer, errorHandler, recordingIdLookup, metaDataDir);
         fixPSequenceIndexer = new FixPSequenceIndexer(
             connectionIdToFixPSessionId, errorHandler, fixPProtocolType, reader,
-            (seqNum, uuid, messageSize, endPosition, aeronSessionId, possRetrans) ->
+            (seqNum, uuid, messageSize, endPosition, aeronSessionId, possRetrans, timestamp, forNextSession) ->
                 // When possRetrans=true we should only update if the number is actually higher as
                 // possRetrans=true messages can be interleaved with normal messages /or/ the last message
                 saveRecord(seqNum, uuid, endPosition, NO_REQUIRED_POSITION, possRetrans));
@@ -228,6 +248,7 @@ public class SequenceNumberIndexWriter implements Index
         file.getFD().sync();
     }
 
+    @Override
     public void onCatchup(
         final DirectBuffer buffer,
         final int offset,
@@ -238,6 +259,7 @@ public class SequenceNumberIndexWriter implements Index
         onFragment(buffer, offset, length, header, recordingId);
     }
 
+    @Override
     public void onFragment(
         final DirectBuffer buffer,
         final int srcOffset,
@@ -275,7 +297,7 @@ public class SequenceNumberIndexWriter implements Index
             {
                 case FixMessageEncoder.TEMPLATE_ID:
                 {
-                    if (!onFixMessage(buffer, offset, actingBlockLength, version, endPosition))
+                    if (!onFixMessage(buffer, offset, actingBlockLength, version, aeronSessionId, endPosition))
                     {
                         return;
                     }
@@ -336,6 +358,12 @@ public class SequenceNumberIndexWriter implements Index
                     break;
                 }
 
+                case ManageSessionDecoder.TEMPLATE_ID:
+                {
+                    sessionOwnershipTracker.onManageSession(buffer, offset, actingBlockLength, version);
+                    break;
+                }
+
                 default:
                 {
                     fixPSequenceIndexer.onFragment(buffer, srcOffset, length, header);
@@ -344,8 +372,11 @@ public class SequenceNumberIndexWriter implements Index
             }
         }
 
-        checkTermRoll(buffer, srcOffset, endPosition, length);
-        positionWriter.update(aeronSessionId, templateId, endPosition, recordingId);
+        checkTermRoll(aeronSessionId, buffer, srcOffset, endPosition, length);
+        if (positionWriter != null)
+        {
+            positionWriter.update(aeronSessionId, templateId, endPosition, recordingId);
+        }
     }
 
     private void onFollowerSessionReply()
@@ -363,8 +394,9 @@ public class SequenceNumberIndexWriter implements Index
         final ThrottleRejectDecoder throttleReject = this.throttleReject;
         final long sessionId = throttleReject.session();
         final int sequenceNumber = throttleReject.sequenceNumber();
+        final int libraryId = throttleReject.libraryId();
 
-        return onThrottle(position, sessionId, sequenceNumber);
+        return onThrottle(position, sessionId, sequenceNumber, libraryId);
     }
 
     private boolean onThrottleNotification(final long position)
@@ -372,17 +404,24 @@ public class SequenceNumberIndexWriter implements Index
         final ThrottleNotificationDecoder throttleNotification = this.throttleNotification;
         final long sessionId = throttleNotification.session();
         final int sequenceNumber = throttleNotification.refSeqNum();
+        final int libraryId = throttleNotification.libraryId();
 
-        return onThrottle(position, sessionId, sequenceNumber);
+        return onThrottle(position, sessionId, sequenceNumber, libraryId);
     }
 
-    private boolean onThrottle(final long position, final long sessionId, final int sequenceNumber)
+    private boolean onThrottle(
+        final long position, final long sessionId, final int msgSequenceNumber, final int libraryId)
     {
-        if (checkRedactPosition(position, sessionId))
+        if (sessionOwnershipTracker.messageFromWrongLibrary(sessionId, libraryId))
         {
             return false;
         }
 
+        int sequenceNumber = checkRedactPosition(position, sessionId);
+        if (sequenceNumber == NO_SEQUENCE_NUMBER)
+        {
+            sequenceNumber = msgSequenceNumber;
+        }
         saveRecord(
             sequenceNumber,
             sessionId,
@@ -421,6 +460,7 @@ public class SequenceNumberIndexWriter implements Index
         final int start,
         final int actingBlockLength,
         final int version,
+        final long aeronSessionId,
         final long messagePosition)
     {
         int offset = start;
@@ -452,13 +492,28 @@ public class SequenceNumberIndexWriter implements Index
         }
 
         final long sessionId = messageFrame.session();
-        if (checkRedactPosition(messagePosition, sessionId))
+        final int redactSequenceNumber = checkRedactPosition(messagePosition, sessionId);
+
+        final int libraryId = messageFrame.libraryId();
+
+        if (sessionOwnershipTracker.messageFromWrongLibrary(sessionId, libraryId))
         {
             return false;
         }
 
         offset += FixMessageDecoder.bodyHeaderLength();
-        final int msgSeqNum = sequenceNumberExtractor.extract(buffer, offset, messageFrame.bodyLength());
+
+        final int msgSeqNum;
+        if (redactSequenceNumber == NO_SEQUENCE_NUMBER)
+        {
+            msgSeqNum = sequenceNumberExtractor.extractCached(
+                buffer, offset, messageFrame.bodyLength(), aeronSessionId, messagePosition);
+        }
+        else
+        {
+            msgSeqNum = redactSequenceNumber;
+        }
+
         if (msgSeqNum != NO_SEQUENCE_NUMBER)
         {
             final int position = saveRecord(msgSeqNum, sessionId, messagePosition, NO_REQUIRED_POSITION, false);
@@ -470,21 +525,22 @@ public class SequenceNumberIndexWriter implements Index
         return true;
     }
 
-    private boolean checkRedactPosition(final long messagePosition, final long sessionId)
+    private int checkRedactPosition(final long messagePosition, final long sessionId)
     {
-        final LongHashSet redactPositions = sessionIdToRedactPositions.get(sessionId);
-        if (redactPositions != null)
+        final Long2LongHashMap redactPositionToSeqNum = sessionIdToRedactPositions.get(sessionId);
+        if (redactPositionToSeqNum != null)
         {
-            if (redactPositions.remove(messagePosition))
+            final int newSequenceNumber = (int)redactPositionToSeqNum.remove(messagePosition);
+            if (newSequenceNumber != NO_SEQUENCE_NUMBER)
             {
-                if (redactPositions.isEmpty())
+                if (redactPositionToSeqNum.isEmpty())
                 {
                     sessionIdToRedactPositions.remove(sessionId);
                 }
-                return true;
+                return newSequenceNumber;
             }
         }
-        return false;
+        return NO_SEQUENCE_NUMBER;
     }
 
     private void resizeMetaDataBuffer(final int metaDataLength)
@@ -606,9 +662,10 @@ public class SequenceNumberIndexWriter implements Index
         }
     }
 
+    @Override
     public int doWork()
     {
-        int work = positionWriter.checkRecordings();
+        int work = positionWriter != null ? positionWriter.checkRecordings() : 0;
 
         if (hasSavedRecordSinceFileUpdate)
         {
@@ -658,17 +715,25 @@ public class SequenceNumberIndexWriter implements Index
         }
     }
 
-    private void checkTermRoll(final DirectBuffer buffer, final int offset, final long endPosition, final int length)
+    private void checkTermRoll(
+        final int aeronSessionId,
+        final DirectBuffer buffer,
+        final int offset,
+        final long endPosition,
+        final int length)
     {
         final long termBufferLength = buffer.capacity();
+        long nextRollPosition = nextRollPositions.get(aeronSessionId);
         if (nextRollPosition == UNINITIALISED)
         {
-            final long startPosition = endPosition - (length + DataHeaderFlyweight.HEADER_LENGTH);
+            final long startPosition = endPosition - align(length, FRAME_ALIGNMENT);
             nextRollPosition = startPosition + termBufferLength - offset;
+            nextRollPositions.put(aeronSessionId, nextRollPosition);
         }
         else if (endPosition > nextRollPosition)
         {
             nextRollPosition += termBufferLength;
+            nextRollPositions.put(aeronSessionId, nextRollPosition);
             updateFile();
         }
     }
@@ -676,11 +741,15 @@ public class SequenceNumberIndexWriter implements Index
     private void updateFile()
     {
         checksumFramer.updateChecksums();
-        positionWriter.updateChecksums();
+        if (positionWriter != null)
+        {
+            positionWriter.updateChecksums();
+        }
         saveFile();
         flipFiles();
         hasSavedRecordSinceFileUpdate = false;
         lastUpdatedFileTimeInMs = clock.time();
+        fileUpdateCount++;
     }
 
     private void saveFile()
@@ -735,7 +804,7 @@ public class SequenceNumberIndexWriter implements Index
     {
         try
         {
-            Files.move(src, dest, StandardCopyOption.ATOMIC_MOVE);
+            Files.move(src, dest, ATOMIC_MOVE_OPTIONS);
             return true;
         }
         catch (final IOException e)
@@ -755,6 +824,7 @@ public class SequenceNumberIndexWriter implements Index
         return writableFile.isOpen();
     }
 
+    @Override
     public void close()
     {
         try
@@ -766,29 +836,31 @@ public class SequenceNumberIndexWriter implements Index
         }
         finally
         {
-            indexFile.close();
-            writableFile.close();
-
-            if (metaDataFile != null)
+            Exceptions.closeAll(indexFile, writableFile, reader, () ->
             {
-                try
+                if (metaDataFile != null)
                 {
-                    metaDataFile.close();
+                    try
+                    {
+                        metaDataFile.close();
+                    }
+                    catch (final IOException e)
+                    {
+                        errorHandler.onError(e);
+                    }
                 }
-                catch (final IOException e)
-                {
-                    errorHandler.onError(e);
-                }
-            }
-
-            reader.close();
+            });
         }
     }
 
+    @Override
     public void readLastPosition(final IndexedPositionConsumer consumer)
     {
-        // Inefficient, but only run once on startup, so not a big deal.
-        new IndexedPositionReader(positionWriter.buffer()).readLastPosition(consumer);
+        if (positionWriter != null)
+        {
+            // Inefficient, but only run once on startup, so not a big deal.
+            new IndexedPositionReader(positionWriter.buffer()).readLastPosition(consumer);
+        }
     }
 
     private int saveRecord(
@@ -820,6 +892,10 @@ public class SequenceNumberIndexWriter implements Index
                     {
                         createNewRecord(newSequenceNumber, sessionId, position, messagePosition);
                         hasSavedRecordSinceFileUpdate = true;
+                    }
+                    else
+                    {
+                        saveRedactForLater(newSequenceNumber, requiredPosition, sessionId);
                     }
                     return position;
                 }
@@ -862,9 +938,7 @@ public class SequenceNumberIndexWriter implements Index
             {
                 // We've not processed the message that needs redacting yet, so keep track that we need to
                 // redact this message when it arrives.
-                final LongHashSet redactPositions = sessionIdToRedactPositions.computeIfAbsent(
-                    sessionId, ignore -> new LongHashSet());
-                redactPositions.add(requiredPosition);
+                saveRedactForLater(newSequenceNumber, requiredPosition, sessionId);
                 return;
             }
         }
@@ -905,6 +979,13 @@ public class SequenceNumberIndexWriter implements Index
             }
             hasSavedRecordSinceFileUpdate = true;
         }
+    }
+
+    private void saveRedactForLater(final int newSequenceNumber, final long requiredPosition, final long sessionId)
+    {
+        final Long2LongHashMap redactPositionToSeqNum = sessionIdToRedactPositions.computeIfAbsent(
+            sessionId, ignore -> new Long2LongHashMap(NO_SEQUENCE_NUMBER));
+        redactPositionToSeqNum.put(requiredPosition, newSequenceNumber);
     }
 
     private void createNewRecord(
@@ -1046,5 +1127,10 @@ public class SequenceNumberIndexWriter implements Index
     public SequenceNumberIndexReader reader()
     {
         return reader;
+    }
+
+    long fileUpdateCount()
+    {
+        return fileUpdateCount;
     }
 }

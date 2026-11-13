@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,8 +15,10 @@
  */
 package uk.co.real_logic.artio;
 
-import org.junit.After;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterEach;
+
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Test;
 
 public class CloseCheckerTest
 {
@@ -28,18 +30,20 @@ public class CloseCheckerTest
         System.setProperty("fix.core.close_checker", "true");
     }
 
-    @After
+    @AfterEach
     public void tearDown()
     {
         CloseChecker.onClose(RESOURCE_ID, OWNER_ID);
     }
 
-    @Test(expected = Error.class)
+    @Test
     public void shouldNotifyWhenALibraryIsOpenedWhenOpen()
     {
-        CloseChecker.onOpen(RESOURCE_ID, OWNER_ID);
-
-        CloseChecker.validate(RESOURCE_ID);
+        Assertions.assertThrows(Error.class, () ->
+        {
+            CloseChecker.onOpen(RESOURCE_ID, OWNER_ID);
+            CloseChecker.validate(RESOURCE_ID);
+        });
     }
 
     @Test
@@ -48,15 +52,18 @@ public class CloseCheckerTest
         CloseChecker.onOpen(RESOURCE_ID, OWNER_ID);
     }
 
-    @Test(expected = Error.class)
+    @Test
     public void shouldRecogniseDoubleOpens()
     {
-        CloseChecker.onOpen(RESOURCE_ID, OWNER_ID);
+        Assertions.assertThrows(Error.class, () ->
+        {
+            CloseChecker.onOpen(RESOURCE_ID, OWNER_ID);
 
-        CloseChecker.onOpen(RESOURCE_ID, OWNER_ID);
+            CloseChecker.onOpen(RESOURCE_ID, OWNER_ID);
 
-        CloseChecker.onClose(RESOURCE_ID, OWNER_ID);
+            CloseChecker.onClose(RESOURCE_ID, OWNER_ID);
 
-        CloseChecker.validate(RESOURCE_ID);
+            CloseChecker.validate(RESOURCE_ID);
+        });
     }
 }

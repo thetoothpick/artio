@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ import org.agrona.IoUtil;
 import org.agrona.LangUtil;
 import org.agrona.concurrent.AtomicBuffer;
 import org.agrona.concurrent.UnsafeBuffer;
+import uk.co.real_logic.artio.CloseChecker;
 import uk.co.real_logic.artio.CommonConfiguration;
 
 import java.io.File;
@@ -30,6 +31,7 @@ import java.nio.channels.FileChannel;
 
 import static java.nio.channels.FileChannel.MapMode.READ_WRITE;
 import static java.nio.file.StandardOpenOption.WRITE;
+import static uk.co.real_logic.artio.AtomicBuffers.checkAligned;
 
 public class MappedFile implements AutoCloseable
 {
@@ -69,9 +71,10 @@ public class MappedFile implements AutoCloseable
 
     public MappedFile(final File file, final FileChannel fileChannel, final AtomicBuffer buffer)
     {
+        CloseChecker.onOpen(file.getAbsolutePath(), this);
         this.file = file;
         this.fileChannel = fileChannel;
-        this.buffer = buffer;
+        this.buffer = checkAligned(buffer);
     }
 
     public AtomicBuffer buffer()
@@ -115,8 +118,10 @@ public class MappedFile implements AutoCloseable
         this.buffer = remappedFile.buffer;
     }
 
+    @Override
     public void close()
     {
+        CloseChecker.onClose(file.getAbsolutePath(), this);
         IoUtil.unmap(buffer.byteBuffer());
         CloseHelper.close(fileChannel);
     }
@@ -139,5 +144,13 @@ public class MappedFile implements AutoCloseable
                 LangUtil.rethrowUnchecked(ex);
             }
         }
+    }
+
+    @Override
+    public String toString()
+    {
+        return "MappedFile{" +
+            "file=" + file +
+            '}';
     }
 }

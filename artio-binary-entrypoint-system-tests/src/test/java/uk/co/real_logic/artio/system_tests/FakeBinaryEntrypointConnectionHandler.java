@@ -15,38 +15,64 @@
  */
 package uk.co.real_logic.artio.system_tests;
 
+import b3.entrypoint.fixp.sbe.Boolean;
 import b3.entrypoint.fixp.sbe.*;
+import io.aeron.logbuffer.ControlledFragmentHandler;
 import org.agrona.DirectBuffer;
 import org.agrona.collections.IntArrayList;
+import org.agrona.collections.LongArrayList;
 import uk.co.real_logic.artio.fixp.FixPConnection;
 import uk.co.real_logic.artio.fixp.FixPConnectionHandler;
+import uk.co.real_logic.artio.fixp.FixPMessageHeader;
+import uk.co.real_logic.artio.fixp.RetransmissionInfo;
 import uk.co.real_logic.artio.library.NotAppliedResponse;
 import uk.co.real_logic.artio.messages.DisconnectReason;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
+
+import static io.aeron.logbuffer.ControlledFragmentHandler.Action.ABORT;
+import static io.aeron.logbuffer.ControlledFragmentHandler.Action.CONTINUE;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 
 public class FakeBinaryEntrypointConnectionHandler implements FixPConnectionHandler
 {
     private final IntArrayList messageIds = new IntArrayList();
+    private final LongArrayList sessionIds = new LongArrayList();
     private final List<Exception> exceptions = new ArrayList<>();
     private final Consumer<NotAppliedResponse> notAppliedResponse;
 
-    private boolean hasReceivedNotApplied;
     private DisconnectReason disconnectReason;
     private boolean replyToOrder = true;
     private boolean abortReport;
     private boolean finishedSending = false;
+    private long lastPosition;
+    private RetransmissionInfo retransmissionInfo;
+    private RetransmitRejectCode retransmitRejectCode;
+    private final AtomicInteger retransmissionCallbacks = new AtomicInteger(0);
+    private int retransmissionBackpressureAttempts = 0;
 
-    public FakeBinaryEntrypointConnectionHandler(final Consumer<NotAppliedResponse> notAppliedResponse)
+    public void retransmissionBackpressureAttempts(final int retransmissionBackpressureAttempts)
     {
-        this.notAppliedResponse = notAppliedResponse;
+        this.retransmissionBackpressureAttempts = retransmissionBackpressureAttempts;
     }
 
-    public boolean hasReceivedNotApplied()
+    public void retransmitRejectCode(final RetransmitRejectCode retransmitRejectCode)
     {
-        return hasReceivedNotApplied;
+        this.retransmitRejectCode = retransmitRejectCode;
+    }
+
+    public int retransmissionCallbacks()
+    {
+        return retransmissionCallbacks.get();
+    }
+
+    public FakeBinaryEntrypointConnectionHandler()
+    {
+        this.notAppliedResponse = ignore -> {};
     }
 
     public void abortReport(final boolean abortReport)
@@ -64,16 +90,21 @@ public class FakeBinaryEntrypointConnectionHandler implements FixPConnectionHand
         return finishedSending;
     }
 
-    public void onBusinessMessage(
+    @Override
+    public ControlledFragmentHandler.Action onBusinessMessage(
         final FixPConnection connection,
         final int templateId,
         final DirectBuffer buffer,
         final int offset,
         final int blockLength,
         final int version,
-        final boolean possRetrans)
+        final boolean possRetrans,
+        final FixPMessageHeader header)
     {
         messageIds.add(templateId);
+        sessionIds.add(connection.key().sessionIdIfExists());
+
+        assertThat(header.messageSize(), greaterThanOrEqualTo(blockLength));
 
         if (replyToOrder && templateId == NewOrderSingleDecoder.TEMPLATE_ID)
         {
@@ -83,23 +114,30 @@ public class FakeBinaryEntrypointConnectionHandler implements FixPConnectionHand
             final long clOrderID = newOrderSingle.clOrdID();
             final long securityID = newOrderSingle.securityID();
 
-            sendExecutionReportNew(connection, clOrderID, securityID, abortReport);
+            lastPosition = sendExecutionReportNew(connection, clOrderID, securityID, abortReport);
         }
+
+        return CONTINUE;
     }
 
-    public void onFinishedSending(final FixPConnection connection)
+    @Override
+    public ControlledFragmentHandler.Action onFinishedSending(final FixPConnection connection)
     {
         finishedSending = true;
+
+        return CONTINUE;
     }
 
-    static void sendExecutionReportNew(
+    static long sendExecutionReportNew(
         final FixPConnection connection, final long clOrderID, final long securityID, final boolean abortReport)
     {
         final ExecutionReport_NewEncoder executionReport = new ExecutionReport_NewEncoder();
 
+        long position;
+
         while (true)
         {
-            final long position = connection.tryClaim(executionReport);
+            position = connection.tryClaim(executionReport, 0);
             if (position >= 0)
             {
                 break;
@@ -118,12 +156,11 @@ public class FakeBinaryEntrypointConnectionHandler implements FixPConnectionHand
             .ordStatus(OrdStatus.NEW)
             .execRestatementReason(ExecRestatementReason.NULL_VAL)
             .multiLegReportingType(MultiLegReportingType.NULL_VAL)
-            .workingIndicator(Bool.NULL_VAL)
+            .workingIndicator(Boolean.NULL_VAL)
             .transactTime().time(System.nanoTime());
         executionReport
-            .putTradeDate(1, 2)
             .protectionPrice().mantissa(1234);
-        executionReport.receivedTime().time(System.nanoTime());
+        executionReport.marketSegmentReceivedTime().time(System.nanoTime());
 
         if (abortReport)
         {
@@ -133,42 +170,58 @@ public class FakeBinaryEntrypointConnectionHandler implements FixPConnectionHand
         {
             connection.commit();
         }
+
+        return position;
     }
 
-    public void onNotApplied(
+    @Override
+    public ControlledFragmentHandler.Action onNotApplied(
         final FixPConnection connection,
         final long fromSequenceNumber,
         final long msgCount,
         final NotAppliedResponse response)
     {
-        hasReceivedNotApplied = true;
         notAppliedResponse.accept(response);
+
+        return CONTINUE;
     }
 
-    public void onRetransmitReject(
+    @Override
+    public ControlledFragmentHandler.Action onRetransmitReject(
         final FixPConnection connection,
         final String reason,
         final long requestTimestamp,
         final int errorCodes)
     {
+        return CONTINUE;
     }
 
-    public void onRetransmitTimeout(final FixPConnection connection)
+    @Override
+    public ControlledFragmentHandler.Action onRetransmitTimeout(final FixPConnection connection)
     {
+        return CONTINUE;
     }
 
-    public void onSequence(final FixPConnection connection, final long nextSeqNo)
+    @Override
+    public ControlledFragmentHandler.Action onSequence(final FixPConnection connection, final long nextSeqNo)
     {
+        return CONTINUE;
     }
 
-    public void onError(final FixPConnection connection, final Exception ex)
+    @Override
+    public ControlledFragmentHandler.Action onError(final FixPConnection connection, final Exception ex)
     {
         exceptions.add(ex);
+
+        return CONTINUE;
     }
 
-    public void onDisconnect(final FixPConnection connection, final DisconnectReason reason)
+    @Override
+    public ControlledFragmentHandler.Action onDisconnect(final FixPConnection connection, final DisconnectReason reason)
     {
         this.disconnectReason = reason;
+
+        return CONTINUE;
     }
 
     public DisconnectReason disconnectReason()
@@ -181,15 +234,62 @@ public class FakeBinaryEntrypointConnectionHandler implements FixPConnectionHand
         return messageIds;
     }
 
+    public LongArrayList sessionIds()
+    {
+        return sessionIds;
+    }
+
     public List<Exception> exceptions()
     {
         return exceptions;
     }
 
+    public long lastPosition()
+    {
+        return lastPosition;
+    }
+
     public void reset()
     {
+        lastPosition = 0;
         disconnectReason = null;
+        retransmissionInfo = null;
         messageIds.clear();
         exceptions.clear();
+        sessionIds.clear();
+    }
+
+    @Override
+    public ControlledFragmentHandler.Action onRetransmitRequest(
+        final FixPConnection connection, final RetransmissionInfo retransmissionInfo)
+    {
+        this.retransmissionInfo = retransmissionInfo;
+
+        retransmissionCallbacks.incrementAndGet();
+
+        if (retransmissionBackpressureAttempts <= 0)
+        {
+            if (retransmitRejectCode != null)
+            {
+                retransmissionInfo.reject(retransmitRejectCode);
+            }
+
+            return CONTINUE;
+        }
+        else
+        {
+            retransmissionBackpressureAttempts--;
+            return ABORT;
+        }
+    }
+
+    public RetransmissionInfo retransmissionInfo()
+    {
+        return retransmissionInfo;
+    }
+
+    public boolean hasRetransmissionInfo()
+    {
+        return retransmissionInfo != null;
     }
 }

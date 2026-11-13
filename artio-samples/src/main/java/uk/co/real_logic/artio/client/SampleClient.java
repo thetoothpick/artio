@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -74,6 +74,7 @@ public final class SampleClient
 
         archiveContext
             .controlChannel(CONTROL_REQUEST_CHANNEL)
+            .replicationChannel(REPLICATION_CHANNEL)
             .recordingEventsChannel(RECORDING_EVENTS_CHANNEL);
 
         try (ArchivingMediaDriver driver = ArchivingMediaDriver.launch(context, archiveContext))
@@ -109,7 +110,7 @@ public final class SampleClient
                         10_000,
                         idleStrategy);
 
-                    while (!session.canSendMessage())
+                    while (!session.isActive())
                     {
                         idleStrategy.idle(library.poll(1));
                     }
@@ -153,4 +154,5 @@ public final class SampleClient
     private static final String CONTROL_REQUEST_CHANNEL = "aeron:udp?endpoint=localhost:7010";
     private static final String CONTROL_RESPONSE_CHANNEL = "aeron:udp?endpoint=localhost:7020";
     private static final String RECORDING_EVENTS_CHANNEL = "aeron:udp?control-mode=dynamic|control=localhost:7030";
+    private static final String REPLICATION_CHANNEL = "aeron:udp?endpoint=localhost:0";
 }

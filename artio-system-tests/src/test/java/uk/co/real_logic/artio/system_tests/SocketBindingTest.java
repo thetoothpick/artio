@@ -15,14 +15,14 @@
  */
 package uk.co.real_logic.artio.system_tests;
 
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 import uk.co.real_logic.artio.Reply;
 import uk.co.real_logic.artio.library.FixLibrary;
 
 import java.io.IOException;
 import java.net.ConnectException;
 
-import static org.junit.Assert.*;
+import static org.junit.jupiter.api.Assertions.*;
 import static uk.co.real_logic.artio.messages.InitialAcceptedSessionOwner.SOLE_LIBRARY;
 import static uk.co.real_logic.artio.system_tests.SystemTestUtil.*;
 
@@ -63,7 +63,7 @@ public class SocketBindingTest extends AbstractMessageBasedAcceptorSystemTest
 
         final Reply<?> reply = engine.bind();
         awaitReply(reply);
-        assertEquals(reply.toString(), Reply.State.ERRORED, reply.state());
+        assertEquals(Reply.State.ERRORED, reply.state(), reply.toString());
 
         assertEquals("Missing address: EngineConfiguration.bindTo()", reply.error().getMessage());
     }
@@ -129,10 +129,13 @@ public class SocketBindingTest extends AbstractMessageBasedAcceptorSystemTest
         assertConnectable();
     }
 
-    @Test(expected = IllegalArgumentException.class)
+    @Test
     public void shouldValidateBindOnStartupConfiguration()
     {
-        setup(true, true, false);
+        assertThrows(IllegalArgumentException.class, () ->
+        {
+            setup(true, true, false);
+        });
     }
 
     @Test
@@ -229,7 +232,7 @@ public class SocketBindingTest extends AbstractMessageBasedAcceptorSystemTest
     private void completeBind()
     {
         final Reply<?> bindReply = Reply.await(engine.bind());
-        assertEquals(bindReply.toString(), Reply.State.COMPLETED, bindReply.state());
+        assertEquals(Reply.State.COMPLETED, bindReply.state(), bindReply.toString());
     }
 
     private void completeUnbind()
@@ -240,7 +243,7 @@ public class SocketBindingTest extends AbstractMessageBasedAcceptorSystemTest
     private void completeUnbind(final boolean disconnect)
     {
         final Reply<?> unbindReply = Reply.await(engine.unbind(disconnect));
-        assertEquals(unbindReply.toString(), Reply.State.COMPLETED, unbindReply.state());
+        assertEquals(Reply.State.COMPLETED, unbindReply.state(), unbindReply.toString());
     }
 
     private void assertCannotConnect() throws IOException

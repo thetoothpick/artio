@@ -21,98 +21,151 @@ import io.aeron.logbuffer.Header;
 import org.agrona.DirectBuffer;
 import org.agrona.ExpandableArrayBuffer;
 import uk.co.real_logic.artio.ArtioLogHeader;
-import uk.co.real_logic.artio.ilink.ILinkMessageConsumer;
-import uk.co.real_logic.artio.messages.FixMessageDecoder;
-import uk.co.real_logic.artio.messages.FixPMessageDecoder;
-import uk.co.real_logic.artio.messages.MessageHeaderDecoder;
-import uk.co.real_logic.artio.messages.ReplayerTimestampDecoder;
+import uk.co.real_logic.artio.fixp.FixPMessageConsumer;
+import uk.co.real_logic.artio.messages.*;
 
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.Iterator;
 import java.util.List;
 
 import static java.lang.Math.min;
-import static uk.co.real_logic.artio.messages.FixMessageDecoder.metaDataHeaderLength;
-import static uk.co.real_logic.artio.messages.FixMessageDecoder.metaDataSinceVersion;
+import static uk.co.real_logic.artio.messages.FixMessageDecoder.*;
 
-public class StreamTimestampZipper
+public class StreamTimestampZipper implements AutoCloseable
 {
     private static final TimestampComparator TIMESTAMP_COMPARATOR = new TimestampComparator();
+    private static final UnstableReverseTimestampComparator REVERSE_TIMESTAMP_COMPARATOR =
+        new UnstableReverseTimestampComparator();
     private static final OffsetComparator OFFSET_COMPARATOR = new OffsetComparator();
 
+    private final int maximumBufferSize;
     private final int compactionSize;
     private final StreamPoller[] pollers;
     private final FragmentAssembler fragmentAssembler;
     private final LogEntryHandler logEntryHandler;
+    private final ExpandableArrayBuffer reorderBuffer;
+    private final boolean lazilyCompact;
 
-    private final List<BufferedPosition> positions = new ArrayList<>();
-    private final ExpandableArrayBuffer reorderBuffer = new ExpandableArrayBuffer();
+    private final ArrayList<BufferedPosition> positions = new ArrayList<>();
+
     private int reorderBufferOffset;
 
     public StreamTimestampZipper(
         final FixMessageConsumer fixMessageConsumer,
-        final ILinkMessageConsumer iLinkMessageConsumer,
+        final FixPMessageConsumer fixPMessageConsumer,
         final int compactionSize,
+        final int maximumBufferSize,
+        final boolean lazilyCompact,
         final Poller... pollers)
     {
+        this.maximumBufferSize = maximumBufferSize;
+        this.lazilyCompact = lazilyCompact;
         this.compactionSize = compactionSize;
         this.pollers = new StreamPoller[pollers.length];
         for (int i = 0; i < pollers.length; i++)
         {
             this.pollers[i] = new StreamPoller(pollers[i]);
         }
-        logEntryHandler = new LogEntryHandler(fixMessageConsumer, iLinkMessageConsumer);
+
+        reorderBuffer = new ExpandableArrayBuffer(compactionSize);
+        logEntryHandler = new LogEntryHandler(fixMessageConsumer, fixPMessageConsumer);
         fragmentAssembler = new FragmentAssembler(logEntryHandler);
     }
 
-    public int poll()
+    public int poll(final int fragmentLimit)
     {
         int read = 0;
         final StreamPoller[] pollers = this.pollers;
         final int size = pollers.length;
         for (int i = 0; i < size; i++)
         {
-            read += pollers[i].poll(pollers, fragmentAssembler);
+            read += pollers[i].poll(pollers, fragmentAssembler, fragmentLimit);
+            if (read >= fragmentLimit)
+            {
+                break;
+            }
         }
 
-        read += processReorderBuffer(pollers);
+        // Lazily compact: only process reorder buffer and compact when you hit the compaction size
+        // Can generate a significant speed in batch archive scanning at the expense of greater latency
+        // on handing off messages to the handler
+        if (read > 0 && (read <= fragmentLimit) && (!lazilyCompact || reorderBufferOffset > compactionSize))
+        {
+            read += processReorderBuffer(pollers, fragmentLimit - read);
 
-        compact();
+            compact();
+        }
 
         return read;
     }
 
-    private int processReorderBuffer(final StreamPoller[] pollers)
+    private int processReorderBuffer(final StreamPoller[] pollers, final int fragmentLimit)
     {
+        final ArrayList<BufferedPosition> positions = this.positions;
+
         int read = 0;
-        positions.sort(TIMESTAMP_COMPARATOR);
-        final Iterator<BufferedPosition> it = positions.iterator();
-        while (it.hasNext())
+        positions.sort(REVERSE_TIMESTAMP_COMPARATOR);
+
+        final int lastIndex = positions.size() - 1;
+        int i = lastIndex;
+        for (; i >= 0; i--)
         {
-            final BufferedPosition position = it.next();
+            final BufferedPosition position = positions.get(i);
             final long timestamp = position.timestamp;
-            final long timestampLowWaterMark = findMinLowWaterMark(pollers, position.owner);
+            final StreamPoller owner = position.owner;
+            final long timestampLowWaterMark = findMinLowWaterMark(pollers, owner);
 
             if (timestamp <= timestampLowWaterMark)
             {
-                position.owner.handledTimestamp(timestamp);
-                logEntryHandler.owner = position.owner;
+                owner.handledTimestamp(timestamp);
+                owner.elementsInBuffer--;
+                logEntryHandler.owner = owner;
                 logEntryHandler.onBufferedMessage(position.offset, position.length);
                 read++;
-                it.remove();
 
-                updateOwnerPosition(position);
+                updateOwnerTimestamp(positions, i, owner);
+
+                if (read >= fragmentLimit)
+                {
+                    break;
+                }
             }
             else
             {
                 break;
             }
         }
+
+        i++;
+
+        for (int j = lastIndex; j >= i; j--)
+        {
+            positions.remove(j);
+        }
+
         return read;
     }
 
-    private void compact()
+    private void updateOwnerTimestamp(
+        final ArrayList<BufferedPosition> positions, final int i, final StreamPoller owner)
+    {
+        // Find the next entry with the same owner and set the owner's timestamp to the next
+        // timestamp
+        for (int j = i - 1; j >= 0; j--)
+        {
+            final BufferedPosition remainingPosition = positions.get(j);
+            if (remainingPosition.owner == owner)
+            {
+                // don't go through method here because this might increase the min buffered timestamp.
+                owner.minBufferedTimestamp = remainingPosition.timestamp;
+                return;
+            }
+        }
+
+        owner.nothingBuffered();
+    }
+
+    private boolean compact()
     {
         if (reorderBufferOffset > compactionSize)
         {
@@ -124,16 +177,21 @@ public class StreamTimestampZipper
                 // No compaction possible
                 if (offset == reorderBufferOffset)
                 {
-                    return;
+                    return false;
                 }
 
                 final int length = position.length;
                 position.offset = reorderBufferOffset;
                 reorderBuffer.putBytes(reorderBufferOffset, reorderBuffer, offset, length);
-                reorderBufferOffset += length;
+
+                final int newReorderBufferOffset = reorderBufferOffset + length;
+                validateReorderBufferOffset(length, reorderBufferOffset, newReorderBufferOffset);
+                reorderBufferOffset = newReorderBufferOffset;
             }
             this.reorderBufferOffset = reorderBufferOffset;
         }
+
+        return true;
     }
 
     public int bufferPosition()
@@ -146,24 +204,10 @@ public class StreamTimestampZipper
         return reorderBuffer.capacity();
     }
 
-    private void updateOwnerPosition(final BufferedPosition position)
+    private void dumpBuffer()
     {
-        final StreamPoller owner = position.owner;
-        for (final BufferedPosition remainingPosition : positions)
-        {
-            if (remainingPosition.owner == owner)
-            {
-                // don't go through method here because this might increase the min buffered timestamp.
-                owner.minBufferedTimestamp = remainingPosition.timestamp;
-                return;
-            }
-        }
+        final StreamPoller originalOwner = this.logEntryHandler.owner;
 
-        owner.nothingBuffered();
-    }
-
-    public void onClose()
-    {
         final LogEntryHandler logEntryHandler = this.logEntryHandler;
         final List<BufferedPosition> positions = this.positions;
         final int size = positions.size();
@@ -173,12 +217,26 @@ public class StreamTimestampZipper
         for (int i = 0; i < size; i++)
         {
             final BufferedPosition position = positions.get(i);
+            position.owner.handledTimestamp(position.timestamp);
             logEntryHandler.owner = position.owner;
             logEntryHandler.onBufferedMessage(position.offset, position.length);
         }
 
         positions.clear();
+        for (final StreamPoller poller : pollers)
+        {
+            poller.elementsInBuffer = 0;
+            poller.nothingBuffered();
+        }
         reorderBufferOffset = 0;
+
+        this.logEntryHandler.owner = originalOwner;
+    }
+
+    @Override
+    public void close()
+    {
+        dumpBuffer();
 
         for (final StreamPoller poller : pollers)
         {
@@ -201,6 +259,7 @@ public class StreamTimestampZipper
             this.length = length;
         }
 
+        @Override
         public String toString()
         {
             return "BufferedPosition{" +
@@ -214,14 +273,34 @@ public class StreamTimestampZipper
 
     static class TimestampComparator implements Comparator<BufferedPosition>
     {
+        @Override
         public int compare(final BufferedPosition o1, final BufferedPosition o2)
         {
             return Long.compare(o1.timestamp, o2.timestamp);
         }
     }
 
+    static class UnstableReverseTimestampComparator implements Comparator<BufferedPosition>
+    {
+        @Override
+        public int compare(final BufferedPosition o1, final BufferedPosition o2)
+        {
+            final int timestampCompare = Long.compare(o2.timestamp, o1.timestamp);
+
+            // When we have two messages with an equal timestamp we don't want to have a stable sort, we want it to
+            // reverse the origin positions, so we then compare based upon the offset of the positions.
+            if (timestampCompare == 0)
+            {
+                return Long.compare(o2.offset, o1.offset);
+            }
+
+            return timestampCompare;
+        }
+    }
+
     static class OffsetComparator implements Comparator<BufferedPosition>
     {
+        @Override
         public int compare(final BufferedPosition o1, final BufferedPosition o2)
         {
             return Long.compare(o1.offset, o2.offset);
@@ -236,6 +315,8 @@ public class StreamTimestampZipper
         private final Poller poller;
         private long minBufferedTimestamp = NOTHING_BUFFERED;
         private long maxHandledTimestamp;
+        private boolean isDrained = false;
+        private int elementsInBuffer = 0;
 
         StreamPoller(final Poller poller)
         {
@@ -243,11 +324,12 @@ public class StreamTimestampZipper
             header = new ArtioLogHeader(poller.streamId());
         }
 
-        public int poll(final StreamPoller[] pollers, final FragmentAssembler fragmentAssembler)
+        public int poll(
+            final StreamPoller[] pollers, final FragmentAssembler fragmentAssembler, final int fragmentLimit)
         {
             final long minOtherTimestamp = findMinLowWaterMark(pollers, this);
             logEntryHandler.reset(minOtherTimestamp, this);
-            return poller.poll(fragmentAssembler);
+            return poller.poll(fragmentAssembler, fragmentLimit);
         }
 
         // This is the position at which it is safe for other streams to emit below.
@@ -258,8 +340,7 @@ public class StreamTimestampZipper
 
         void handledTimestamp(final long timestamp)
         {
-            // always >= previous timestamp.
-            maxHandledTimestamp = timestamp;
+            maxHandledTimestamp = Math.max(maxHandledTimestamp, timestamp);
         }
 
         void bufferedTimestamp(final long timestamp)
@@ -279,10 +360,13 @@ public class StreamTimestampZipper
             minBufferedTimestamp = NOTHING_BUFFERED;
         }
 
+        @Override
         public String toString()
         {
             return "StreamPoller{" +
                 "header=" + header +
+                ", isDrained=" + isDrained +
+                ", poller=" + poller +
                 '}';
         }
 
@@ -290,15 +374,38 @@ public class StreamTimestampZipper
         {
             poller.close();
         }
+
+        boolean isDrained()
+        {
+            if (isDrained)
+            {
+                return true;
+            }
+
+            if (!poller.isComplete())
+            {
+                return false;
+            }
+
+            if (elementsInBuffer > 0)
+            {
+                return false;
+            }
+
+            isDrained = true;
+            return true;
+        }
     }
 
-    private static long findMinLowWaterMark(final StreamPoller[] pollers, final StreamPoller owner)
+    private long findMinLowWaterMark(final StreamPoller[] pollers, final StreamPoller owner)
     {
         long timestampLowWaterMark = Long.MAX_VALUE;
         for (int i = 0; i < pollers.length; i++)
         {
             final StreamPoller poller = pollers[i];
-            if (poller != owner)
+            // If the poller has already complete, then there's definitely no more messages from it, so we can
+            // just ignore its timestamp
+            if (poller != owner && !poller.isDrained())
             {
                 timestampLowWaterMark = min(timestampLowWaterMark, poller.timestampLowWaterMark());
             }
@@ -310,21 +417,27 @@ public class StreamTimestampZipper
     {
         private final MessageHeaderDecoder messageHeader = new MessageHeaderDecoder();
         private final FixMessageDecoder fixMessage = new FixMessageDecoder();
-        private final FixPMessageDecoder iLinkMessage = new FixPMessageDecoder();
+        private final FixPMessageDecoder fixpMessage = new FixPMessageDecoder();
         private final ReplayerTimestampDecoder replayerTimestamp = new ReplayerTimestampDecoder();
+        private final ApplicationHeartbeatDecoder applicationHeartbeat = new ApplicationHeartbeatDecoder();
+        private final ConnectDecoder connect = new ConnectDecoder();
 
         private final FixMessageConsumer fixHandler;
-        private final ILinkMessageConsumer iLinkHandler;
+        private final ReproductionFixProtocolConsumer reproductionFixProtocolHandler;
+        private final FixPMessageConsumer fixPHandler;
 
         StreamPoller owner;
         long maxTimestampToHandle;
 
-        LogEntryHandler(final FixMessageConsumer fixHandler, final ILinkMessageConsumer iLinkHandler)
+        LogEntryHandler(final FixMessageConsumer fixHandler, final FixPMessageConsumer fixPHandler)
         {
             this.fixHandler = fixHandler;
-            this.iLinkHandler = iLinkHandler;
+            reproductionFixProtocolHandler = fixHandler instanceof ReproductionFixProtocolConsumer ?
+                (ReproductionFixProtocolConsumer)fixHandler : null;
+            this.fixPHandler = fixPHandler;
         }
 
+        @Override
         public void onFragment(
             final DirectBuffer buffer, final int start, final int length, final Header header)
         {
@@ -336,66 +449,136 @@ public class StreamTimestampZipper
 
             if (templateId == FixMessageDecoder.TEMPLATE_ID)
             {
-                offset += MessageHeaderDecoder.ENCODED_LENGTH;
-
-                fixMessage.wrap(buffer, offset, blockLength, version);
-
-                if (version >= metaDataSinceVersion())
-                {
-                    offset += metaDataHeaderLength() + fixMessage.metaDataLength();
-                    fixMessage.skipMetaData();
-                }
-
-                final long timestamp = fixMessage.timestamp();
-
-                // hand off the first message you see, otherwise buffer it.
-                if (timestamp <= maxTimestampToHandle)
-                {
-                    owner.handledTimestamp(timestamp);
-                    fixHandler.onMessage(fixMessage, buffer, offset, length, owner.header);
-                }
-                else
-                {
-                    putBufferedMessage(buffer, start, length, timestamp);
-                }
+                onFixMessage(buffer, start, length, offset, blockLength, version);
             }
             else if (templateId == ReplayerTimestampDecoder.TEMPLATE_ID)
             {
+                onReplayTimestamp(buffer, offset, blockLength, version);
+            }
+            else if (templateId == ApplicationHeartbeatDecoder.TEMPLATE_ID)
+            {
                 offset += MessageHeaderDecoder.ENCODED_LENGTH;
 
-                replayerTimestamp.wrap(buffer, offset, blockLength, version);
-                final long timestamp = replayerTimestamp.timestamp();
-                owner.handledTimestamp(timestamp);
+                applicationHeartbeat.wrap(buffer, offset, blockLength, version);
+                final long timestampInNs = applicationHeartbeat.timestampInNs();
+                final ReproductionFixProtocolConsumer reproductionHandler = this.reproductionFixProtocolHandler;
+                if (reproductionHandler != null)
+                {
+                    if (timestampInNs <= maxTimestampToHandle)
+                    {
+                        owner.handledTimestamp(timestampInNs);
+                        reproductionHandler.onApplicationHeartbeat(applicationHeartbeat, buffer, offset, length);
+                    }
+                    else
+                    {
+                        putBufferedMessage(buffer, start, length, timestampInNs);
+                    }
+                }
+                else
+                {
+                    owner.handledTimestamp(timestampInNs);
+                }
             }
             else if (templateId == FixPMessageDecoder.TEMPLATE_ID)
             {
                 offset += MessageHeaderDecoder.ENCODED_LENGTH;
 
-                iLinkMessage.wrap(buffer, offset, blockLength, version);
+                fixpMessage.wrap(buffer, offset, blockLength, version);
 
                 offset += FixPMessageDecoder.BLOCK_LENGTH;
 
-                final long timestamp = iLinkMessage.enqueueTime();
+                final long timestamp = fixpMessage.enqueueTime();
 
                 if (timestamp <= maxTimestampToHandle)
                 {
                     owner.handledTimestamp(timestamp);
-                    iLinkHandler.onBusinessMessage(iLinkMessage, buffer, offset, owner.header);
+                    fixPHandler.onMessage(fixpMessage, buffer, offset, owner.header);
                 }
                 else
                 {
                     putBufferedMessage(buffer, start, length, timestamp);
                 }
+            }
+            else if (templateId == ConnectDecoder.TEMPLATE_ID)
+            {
+                final ReproductionFixProtocolConsumer reproductionHandler = this.reproductionFixProtocolHandler;
+                if (reproductionHandler != null)
+                {
+                    offset += MessageHeaderDecoder.ENCODED_LENGTH;
+
+                    connect.wrap(buffer, offset, blockLength, version);
+
+                    final long timestamp = connect.timestamp();
+
+                    if (timestamp <= maxTimestampToHandle)
+                    {
+                        owner.handledTimestamp(timestamp);
+                        reproductionHandler.onConnect(connect, buffer, start, length);
+                    }
+                    else
+                    {
+                        putBufferedMessage(buffer, start, length, timestamp);
+                    }
+                }
+            }
+        }
+
+        private void onReplayTimestamp(
+            final DirectBuffer buffer, final int start, final int blockLength, final int version)
+        {
+            final int offset = start + MessageHeaderDecoder.ENCODED_LENGTH;
+
+            replayerTimestamp.wrap(buffer, offset, blockLength, version);
+            final long timestampInNs = replayerTimestamp.timestamp();
+            owner.handledTimestamp(timestampInNs);
+        }
+
+        private void onFixMessage(
+            final DirectBuffer buffer,
+            final int start, final int length, final int prevOffset, final int blockLength, final int version)
+        {
+            int offset = prevOffset + MessageHeaderDecoder.ENCODED_LENGTH;
+
+            final FixMessageDecoder fixMessage = this.fixMessage;
+            fixMessage.wrap(buffer, offset, blockLength, version);
+
+            if (version >= metaDataSinceVersion())
+            {
+                offset += metaDataHeaderLength() + fixMessage.metaDataLength();
+                fixMessage.skipMetaData();
+            }
+
+            final long timestamp = fixMessage.timestamp();
+
+            // hand off the first message you see, otherwise buffer it.
+            if (timestamp <= maxTimestampToHandle)
+            {
+                owner.handledTimestamp(timestamp);
+                onFixMessage(offset, buffer, fixMessage);
+            }
+            else
+            {
+                putBufferedMessage(buffer, start, length, timestamp);
             }
         }
 
         private void putBufferedMessage(
             final DirectBuffer buffer, final int start, final int length, final long timestamp)
         {
+            if (reorderBufferOffset + length > maximumBufferSize)
+            {
+                dumpBuffer();
+            }
+
+            final int reorderBufferOffset = StreamTimestampZipper.this.reorderBufferOffset;
             owner.bufferedTimestamp(timestamp);
+            owner.elementsInBuffer++;
             reorderBuffer.putBytes(reorderBufferOffset, buffer, start, length);
             positions.add(new BufferedPosition(owner, timestamp, reorderBufferOffset, length));
-            reorderBufferOffset += length;
+
+            final int newReorderBufferOffset = reorderBufferOffset + length;
+            StreamTimestampZipper.this.reorderBufferOffset = newReorderBufferOffset;
+            validateReorderBufferOffset(length, reorderBufferOffset, newReorderBufferOffset);
         }
 
         void reset(final long minOtherTimestamp, final StreamPoller owner)
@@ -415,10 +598,11 @@ public class StreamTimestampZipper
             final int blockLength = messageHeader.blockLength();
             final int version = messageHeader.version();
 
+            offset += MessageHeaderDecoder.ENCODED_LENGTH;
+
             if (templateId == FixMessageDecoder.TEMPLATE_ID)
             {
-                offset += MessageHeaderDecoder.ENCODED_LENGTH;
-
+                final FixMessageDecoder fixMessage = this.fixMessage;
                 fixMessage.wrap(buffer, offset, blockLength, version);
 
                 if (version >= metaDataSinceVersion())
@@ -427,27 +611,64 @@ public class StreamTimestampZipper
                     fixMessage.skipMetaData();
                 }
 
-                fixHandler.onMessage(fixMessage, buffer, offset, length, owner.header);
+                onFixMessage(offset, buffer, fixMessage);
             }
             else if (templateId == FixPMessageDecoder.TEMPLATE_ID)
             {
-                offset += MessageHeaderDecoder.ENCODED_LENGTH;
-
-                iLinkMessage.wrap(buffer, offset, blockLength, version);
+                fixpMessage.wrap(buffer, offset, blockLength, version);
 
                 offset += FixPMessageDecoder.BLOCK_LENGTH;
 
-                iLinkHandler.onBusinessMessage(iLinkMessage, buffer, offset, owner.header);
+                fixPHandler.onMessage(fixpMessage, buffer, offset, owner.header);
             }
+            else if (templateId == ConnectDecoder.TEMPLATE_ID)
+            {
+                final ReproductionFixProtocolConsumer reproductionHandler = this.reproductionFixProtocolHandler;
+                if (reproductionHandler != null)
+                {
+                    final ConnectDecoder connect = this.connect;
+                    connect.wrap(buffer, offset, blockLength, version);
+                    reproductionHandler.onConnect(connect, buffer, start, length);
+                }
+            }
+            else if (templateId == ApplicationHeartbeatDecoder.TEMPLATE_ID)
+            {
+                final ReproductionFixProtocolConsumer reproductionHandler = this.reproductionFixProtocolHandler;
+                if (reproductionHandler != null)
+                {
+                    final ApplicationHeartbeatDecoder applicationHeartbeat = this.applicationHeartbeat;
+                    applicationHeartbeat.wrap(buffer, offset, blockLength, version);
+                    reproductionHandler.onApplicationHeartbeat(applicationHeartbeat, buffer, offset, length);
+                }
+            }
+        }
+
+        private void onFixMessage(final int offset, final DirectBuffer buffer, final FixMessageDecoder fixMessage)
+        {
+            final int messageLength = fixMessage.bodyLength();
+            fixHandler.onMessage(fixMessage, buffer,
+                offset + FixMessageDecoder.BLOCK_LENGTH + bodyHeaderLength(), messageLength, owner.header);
+        }
+    }
+
+    private static void validateReorderBufferOffset(
+        final int length, final int reorderBufferOffset, final int newReorderBufferOffset)
+    {
+        if (newReorderBufferOffset < 0)
+        {
+            throw new IllegalStateException("Detected negative newReorderBufferOffset: " +
+                newReorderBufferOffset + ", reorderBufferOffset=" + reorderBufferOffset + ", length=" + length);
         }
     }
 
     public interface Poller
     {
-        int poll(FragmentAssembler fragmentAssembler);
+        int poll(FragmentAssembler fragmentAssembler, int fragmentLimit);
 
         int streamId();
 
         void close();
+
+        boolean isComplete();
     }
 }

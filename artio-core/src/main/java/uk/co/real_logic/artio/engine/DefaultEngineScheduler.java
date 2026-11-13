@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -35,6 +35,7 @@ public class DefaultEngineScheduler implements EngineScheduler
     private AgentRunner monitoringRunner;
     private RecordingCoordinator recordingCoordinator;
 
+    @Override
     public void launch(
         final EngineConfiguration configuration,
         final ErrorHandler errorHandler,
@@ -70,6 +71,7 @@ public class DefaultEngineScheduler implements EngineScheduler
         }
     }
 
+    @Override
     public void close()
     {
         EngineScheduler.awaitRunnerStart(framerRunner);
@@ -79,6 +81,13 @@ public class DefaultEngineScheduler implements EngineScheduler
         Exceptions.closeAll(framerRunner, archivingRunner, recordingCoordinator, monitoringRunner);
     }
 
+    @Override
+    public int pollFramer()
+    {
+        return 0;
+    }
+
+    @Override
     public void configure(final Aeron.Context aeronContext)
     {
     }

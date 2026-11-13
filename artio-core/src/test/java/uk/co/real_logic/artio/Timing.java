@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,12 +16,14 @@
 
 package uk.co.real_logic.artio;
 
+import uk.co.real_logic.artio.dictionary.generation.Exceptions;
+
 import java.util.Optional;
 import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 
 import static org.agrona.SystemUtil.isDebuggerAttached;
-import static org.junit.Assert.fail;
+import static org.junit.jupiter.api.Assertions.fail;
 
 public final class Timing
 {
@@ -69,7 +71,7 @@ public final class Timing
             () -> message,
             condition,
             timeoutInMs,
-            () -> {});
+            Exceptions::printStackTracesForAllThreads);
     }
 
     public static void assertEventuallyTrue(final String message, final Block runnable)
@@ -105,7 +107,7 @@ public final class Timing
         }
         while (System.currentTimeMillis() < endTime);
 
-        final AssertionError error = new AssertionError(message);
+        final AssertionError error = new AssertionError(message.get());
         error.addSuppressed(lastThrowable);
         throw error;
     }

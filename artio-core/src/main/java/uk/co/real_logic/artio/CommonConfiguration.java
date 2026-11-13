@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,21 +17,24 @@ package uk.co.real_logic.artio;
 
 import io.aeron.Aeron;
 import io.aeron.archive.client.AeronArchive;
+import uk.co.real_logic.artio.engine.EngineConfiguration;
+import uk.co.real_logic.artio.fields.EpochFractionFormat;
+import uk.co.real_logic.artio.session.ResendRequestController;
+import uk.co.real_logic.artio.session.SessionCustomisationStrategy;
+import uk.co.real_logic.artio.session.SessionIdStrategy;
+import uk.co.real_logic.artio.timing.HistogramHandler;
+import uk.co.real_logic.artio.util.MessageTypeEncoding;
+import uk.co.real_logic.artio.validation.MessageValidationStrategy;
 import org.agrona.ErrorHandler;
 import org.agrona.IoUtil;
 import org.agrona.Verify;
+import org.agrona.collections.LongHashSet;
 import org.agrona.concurrent.BackoffIdleStrategy;
 import org.agrona.concurrent.EpochNanoClock;
 import org.agrona.concurrent.IdleStrategy;
 import org.agrona.concurrent.OffsetEpochNanoClock;
 import org.agrona.concurrent.errors.DistinctErrorLog;
 import org.agrona.concurrent.errors.ErrorConsumer;
-import uk.co.real_logic.artio.engine.EngineConfiguration;
-import uk.co.real_logic.artio.fields.EpochFractionFormat;
-import uk.co.real_logic.artio.session.SessionCustomisationStrategy;
-import uk.co.real_logic.artio.session.SessionIdStrategy;
-import uk.co.real_logic.artio.timing.HistogramHandler;
-import uk.co.real_logic.artio.validation.MessageValidationStrategy;
 
 import java.io.File;
 import java.util.Collections;
@@ -39,6 +42,7 @@ import java.util.EnumSet;
 import java.util.Set;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import static java.lang.Integer.getInteger;
@@ -76,6 +80,16 @@ public class CommonConfiguration
      */
     public static final String DEBUG_PRINT_MESSAGES_PROPERTY = "fix.core.debug";
     /**
+     * Property name for the flag to enable or disable printing of Aeron stream identifiers and registration
+     * identifiers.
+     */
+    public static final String DEBUG_PRINT_AERON_STREAM_IDENTIFIERS_PROPERTY = "fix.core.debug.print_aeron_stream_ids";
+    /**
+     * Property name for the flag to specify a subset of message types to debug print, this can be used in
+     * conjunction with the FIX_MESSAGE logtag. Note: this message type filter only applies to valid fix messages.
+     */
+    public static final String DEBUG_PRINT_MESSAGE_TYPES_PROPERTY = "fix.core.debug.msg_types";
+    /**
      * Property name for the flag to specify a thread to print
      */
     public static final String DEBUG_PRINT_THREAD_PROPERTY = "fix.core.debug.thread";
@@ -102,11 +116,6 @@ public class CommonConfiguration
      */
     public static final String DEBUG_FILE_PROPERTY = "fix.core.debug.file";
     /**
-     * Property name for the implementation of {@link AbstractDebugAppender} to use in order
-     * print debug logging. If none set then defaults to {@link PrintingDebugAppender}
-     */
-    public static final String APPENDER_CLASS_PROPERTY = "fix.core.debug.appender";
-    /**
      * Property name for the period at which histogram intervals are polled and logged
      */
     public static final String HISTOGRAM_POLL_PERIOD_IN_MS_PROPERTY = "fix.benchmark.histogram_poll_period";
@@ -119,9 +128,29 @@ public class CommonConfiguration
      * Property name for character to separate debug logging of FIX messages
      */
     public static final String LOGGING_SEPARATOR_PROPERTY = "fix.core.debug.separator";
+
+    /**
+     * Property name for the id of the gateway
+     */
+    public static final String GATEWAY_ID_PROPERTY = "fix.gateway.id";
+
     public static final int NO_FIXP_MAX_RETRANSMISSION_RANGE = 0;
+    public static final ResendRequestController DEFAULT_RESEND_REQUEST_CONTROLLER =
+        (session, resendRequest, correctedEndSeqNo, response) -> response.resend();
+
     protected ThreadFactory threadFactory;
     private int fixPAcceptedSessionMaxRetransmissionRange = NO_FIXP_MAX_RETRANSMISSION_RANGE;
+
+    public static boolean getBoolean(final String propertyName, final boolean defaultValue)
+    {
+        final String propertyValue = getProperty(propertyName);
+        if (propertyValue == null)
+        {
+            return defaultValue;
+        }
+
+        return Boolean.parseBoolean(propertyValue);
+    }
 
     public static void validateTimeout(final long timeoutInMs)
     {
@@ -141,6 +170,7 @@ public class CommonConfiguration
      * These are static final fields in order to give the optimiser more scope
      */
     public static final boolean DEBUG_PRINT_MESSAGES;
+    public static final LongHashSet DEBUG_PRINT_MESSAGE_TYPES;
     public static final Set<LogTag> DEBUG_TAGS;
     public static final String DEBUG_PRINT_THREAD;
     public static final byte DEFAULT_DEBUG_LOGGING_SEPARATOR = '\001';
@@ -153,7 +183,7 @@ public class CommonConfiguration
         Set<LogTag> debugTags = Collections.emptySet();
         if (debugPrintMessagesValue != null)
         {
-            if ("all".equals(debugPrintMessagesValue) || "true".equals(debugPrintMessagesValue))
+            if ("all".equalsIgnoreCase(debugPrintMessagesValue) || "true".equalsIgnoreCase(debugPrintMessagesValue))
             {
                 debugPrintMessages = true;
                 debugTags = EnumSet.allOf(LogTag.class);
@@ -184,6 +214,19 @@ public class CommonConfiguration
         final String loggingSeparator = getProperty(LOGGING_SEPARATOR_PROPERTY);
         DEBUG_LOGGING_SEPARATOR =
             loggingSeparator == null ? DEFAULT_DEBUG_LOGGING_SEPARATOR : (byte)loggingSeparator.charAt(0);
+
+        final String debugPrintMessageTypes = getProperty(DEBUG_PRINT_MESSAGE_TYPES_PROPERTY);
+        if (debugPrintMessageTypes == null)
+        {
+            DEBUG_PRINT_MESSAGE_TYPES = null;
+        }
+        else
+        {
+            DEBUG_PRINT_MESSAGE_TYPES = Stream
+                .of(debugPrintMessageTypes.split(","))
+                .map(MessageTypeEncoding::packMessageType)
+                .collect(Collectors.toCollection(LongHashSet::new));
+        }
     }
 
     private static LogTag lookupLogTag(final String name)
@@ -197,7 +240,6 @@ public class CommonConfiguration
     }
 
     public static final String DEBUG_FILE = System.getProperty(DEBUG_FILE_PROPERTY);
-    public static final String APPENDER_CLASS = System.getProperty(APPENDER_CLASS_PROPERTY);
     public static final boolean TIME_MESSAGES = Boolean.getBoolean(TIME_MESSAGES_PROPERTY);
     public static final boolean FORCE_WRITES = Boolean.getBoolean(FORCE_WRITES_MESSAGES_PROPERTY);
 
@@ -217,7 +259,6 @@ public class CommonConfiguration
     public static final int DEFAULT_REASONABLE_TRANSMISSION_TIME_IN_S = 3;
     public static final long DEFAULT_REASONABLE_TRANSMISSION_TIME_IN_MS =
         SECONDS.toMillis(DEFAULT_REASONABLE_TRANSMISSION_TIME_IN_S);
-    public static final boolean DEFAULT_PRINT_AERON_STREAM_IDENTIFIERS = false;
 
     public static final int DEFAULT_INBOUND_MAX_CLAIM_ATTEMPTS = BACKOFF_SPINS + BACKOFF_YIELDS + 1000;
     public static final int DEFAULT_OUTBOUND_MAX_CLAIM_ATTEMPTS = DEFAULT_INBOUND_MAX_CLAIM_ATTEMPTS;
@@ -225,6 +266,7 @@ public class CommonConfiguration
     public static final int DEFAULT_SESSION_BUFFER_SIZE = 16 * 1024;
     public static final long DEFAULT_SENDING_TIME_WINDOW = MINUTES.toMillis(2);
     public static final int DEFAULT_HEARTBEAT_INTERVAL_IN_S = 10;
+    public static final int NO_FORCED_HEARTBEAT_INTERVAL = -1;
 
     public static final long DEFAULT_REPLY_TIMEOUT_IN_MS = 10_000L;
     public static final long DEFAULT_HISTOGRAM_POLL_PERIOD_IN_MS = MINUTES.toMillis(1);
@@ -233,11 +275,15 @@ public class CommonConfiguration
     public static final int DEFAULT_OUTBOUND_LIBRARY_STREAM = 2;
 
     public static final long DEFAULT_MAX_FIXP_KEEPALIVE_TIMEOUT_IN_MS = MINUTES.toMillis(1);
+    public static final long DEFAULT_MIN_FIXP_KEEPALIVE_TIMEOUT_IN_MS = 1;
+    public static final long DEFAULT_ACCEPTOR_FIXP_KEEPALIVE_TIMEOUT_IN_MS = SECONDS.toMillis(30);
+
+    public static final long DEFAULT_CYCLE_THRESHOLD_NS = SECONDS.toNanos(1);
 
     public static final boolean RUNNING_ON_WINDOWS = System.getProperty("os.name").startsWith("Windows");
 
     private long reasonableTransmissionTimeInMs = DEFAULT_REASONABLE_TRANSMISSION_TIME_IN_MS;
-    private boolean printAeronStreamIdentifiers = DEFAULT_PRINT_AERON_STREAM_IDENTIFIERS;
+    private boolean printAeronStreamIdentifiers = Boolean.getBoolean(DEBUG_PRINT_AERON_STREAM_IDENTIFIERS_PROPERTY);
     private EpochNanoClock epochNanoClock = new OffsetEpochNanoClock();
     private ErrorHandlerFactory errorHandlerFactory = ErrorHandlerFactory.saveDistinctErrors();
     private MonitoringAgentFactory monitoringAgentFactory = MonitoringAgentFactory.printDistinctErrors();
@@ -264,14 +310,23 @@ public class CommonConfiguration
     private String agentNamePrefix = DEFAULT_NAME_PREFIX;
     private int inboundLibraryStream = DEFAULT_INBOUND_LIBRARY_STREAM;
     private int outboundLibraryStream = DEFAULT_OUTBOUND_LIBRARY_STREAM;
-    private boolean gracefulShutdown = true;
     private boolean validateCompIdsOnEveryMessage = true;
     private boolean validateTimeStrictly = true;
     private EpochFractionFormat sessionEpochFractionFormat = EpochFractionFormat.MILLISECONDS;
     private long maxFixPKeepaliveTimeoutInMs = DEFAULT_MAX_FIXP_KEEPALIVE_TIMEOUT_IN_MS;
+    private long minFixPKeepaliveTimeoutInMs = DEFAULT_MIN_FIXP_KEEPALIVE_TIMEOUT_IN_MS;
+    private long acceptorFixPKeepaliveTimeoutInMs = DEFAULT_ACCEPTOR_FIXP_KEEPALIVE_TIMEOUT_IN_MS;
     private long noEstablishFixPTimeoutInMs = EngineConfiguration.DEFAULT_NO_LOGON_DISCONNECT_TIMEOUT_IN_MS;
+    private ResendRequestController resendRequestController = DEFAULT_RESEND_REQUEST_CONTROLLER;
+    private int forcedHeartbeatIntervalInS = NO_FORCED_HEARTBEAT_INTERVAL;
+    private boolean disableHeartbeatRepliesToTestRequests = false;
+    private long gatewayId = Long.getLong(GATEWAY_ID_PROPERTY, 0);
 
     private final AtomicBoolean isConcluded = new AtomicBoolean(false);
+
+    // ------------------------
+    // BEGIN SETTERS
+    // ------------------------
 
     /**
      * Sets the sending time window. The sending time window is the period of acceptance
@@ -279,18 +334,16 @@ public class CommonConfiguration
      * received in messages. Sessions are disconnected if the sending time diverges by
      * more than this window and if validation is enabled.
      *
+     * This is also used for validating acceptor FIXP message timestamps.
+     *
      * @param sendingTimeWindowInMs the current sending time in milliseconds
      * @return this
      */
+    @SuppressWarnings("UnusedReturnValue")
     public CommonConfiguration sendingTimeWindowInMs(final long sendingTimeWindowInMs)
     {
         this.sendingTimeWindowInMs = sendingTimeWindowInMs;
         return this;
-    }
-
-    public long sendingTimeWindowInMs()
-    {
-        return sendingTimeWindowInMs;
     }
 
     /**
@@ -299,15 +352,53 @@ public class CommonConfiguration
      * @param value the default interval for heartbeats if not exchanged upon logon. Specified in seconds.
      * @return this
      */
+    @SuppressWarnings("UnusedReturnValue")
     public CommonConfiguration defaultHeartbeatIntervalInS(final int value)
     {
         defaultHeartbeatIntervalInS = value;
         return this;
     }
 
-    public int defaultHeartbeatIntervalInS()
+    /**
+     * Set an interval for heartbeats, forcing an override of the timeout agreement at the exchange of logon messages.
+     * This configuration option is useful
+     * for testing the behaviour of other client's heartbeat behaviour, or for working around buggy counter-parties.
+     * If you want to mostly disable heartbeats in order to test counter-parties then this can be set to a very long
+     * time period, for example a week (604800 seconds). This configuration option doesn't alter the HeartBtInt (108)
+     * field value of the Logon message.
+     *
+     * See also the related {@link #disableHeartbeatRepliesToTestRequests(boolean)} option.
+     *
+     * Note this option should be set to the same value for connecting {@link EngineConfiguration} and
+     *  {@link uk.co.real_logic.artio.library.LibraryConfiguration} configurations.
+     *
+     * @param forcedHeartbeatIntervalInS the interval for heartbeats, forcing an override of the logon message.
+     *                                  Specified in seconds.
+     * @return this
+     */
+    public CommonConfiguration forcedHeartbeatIntervalInS(final int forcedHeartbeatIntervalInS)
     {
-        return defaultHeartbeatIntervalInS;
+        this.forcedHeartbeatIntervalInS = forcedHeartbeatIntervalInS;
+        return this;
+    }
+
+    /**
+     * Disables heartbeats in response to test requests. This configuration option is useful
+     * for testing the behaviour of other client's heartbeat behaviour or simulating disconnects.
+     *
+     * See also the related {@link #forcedHeartbeatIntervalInS(int)} option.
+     *
+     * Note this option should be set to the same value for connecting {@link EngineConfiguration} and
+     *  {@link uk.co.real_logic.artio.library.LibraryConfiguration} configurations.
+     *
+     * @param disableHeartbeatRepliesToTestRequests true to disable, false (the default) to respond to test requests.
+     * @return this
+     */
+    public CommonConfiguration disableHeartbeatRepliesToTestRequests(
+        final boolean disableHeartbeatRepliesToTestRequests)
+    {
+        this.disableHeartbeatRepliesToTestRequests = disableHeartbeatRepliesToTestRequests;
+        return this;
     }
 
     /**
@@ -358,11 +449,6 @@ public class CommonConfiguration
         return this;
     }
 
-    public long reasonableTransmissionTimeInMs()
-    {
-        return reasonableTransmissionTimeInMs;
-    }
-
     /**
      * Sets the length of the buffer used for monitoring counters.
      *
@@ -370,6 +456,7 @@ public class CommonConfiguration
      * @return this
      * @see CommonConfiguration#MONITORING_BUFFERS_LENGTH_PROPERTY
      */
+    @SuppressWarnings("UnusedReturnValue")
     public CommonConfiguration monitoringBuffersLength(final Integer monitoringBuffersLength)
     {
         this.monitoringBuffersLength = monitoringBuffersLength;
@@ -471,6 +558,7 @@ public class CommonConfiguration
      * @param errorPrinterIdleStrategy the idle strategy for the Error Printer thread.
      * @return this
      */
+    @SuppressWarnings("UnusedReturnValue")
     public CommonConfiguration monitoringThreadIdleStrategy(final IdleStrategy errorPrinterIdleStrategy)
     {
         this.monitoringThreadIdleStrategy = errorPrinterIdleStrategy;
@@ -498,6 +586,7 @@ public class CommonConfiguration
      * @return this
      * @see CommonConfiguration#INBOUND_MAX_CLAIM_ATTEMPTS_PROPERTY
      */
+    @SuppressWarnings("UnusedReturnValue")
     public CommonConfiguration inboundMaxClaimAttempts(final int inboundMaxClaimAttempts)
     {
         this.inboundMaxClaimAttempts = inboundMaxClaimAttempts;
@@ -511,6 +600,7 @@ public class CommonConfiguration
      * @return this
      * @see CommonConfiguration#OUTBOUND_MAX_CLAIM_ATTEMPTS_PROPERTY
      */
+    @SuppressWarnings("UnusedReturnValue")
     public CommonConfiguration outboundMaxClaimAttempts(final int outboundMaxClaimAttempts)
     {
         this.outboundMaxClaimAttempts = outboundMaxClaimAttempts;
@@ -533,30 +623,51 @@ public class CommonConfiguration
         return this;
     }
 
+    @SuppressWarnings("UnusedReturnValue")
     public CommonConfiguration histogramPollPeriodInMs(final long histogramPollPeriodInMs)
     {
         this.histogramPollPeriodInMs = histogramPollPeriodInMs;
         return this;
     }
 
+    @SuppressWarnings("UnusedReturnValue")
     public CommonConfiguration histogramLoggingFile(final String histogramLoggingFile)
     {
         this.histogramLoggingFile = histogramLoggingFile;
         return this;
     }
 
+    @SuppressWarnings("UnusedReturnValue")
     public CommonConfiguration histogramHandler(final HistogramHandler histogramHandler)
     {
         this.histogramHandler = histogramHandler;
         return this;
     }
 
+    /**
+     * Sets the prefix to be used on agent names. This can be used to distinguish two different Artio instances
+     * running in the same process, for example in tests.
+     *
+     * @param agentNamePrefix the prefix to be used on agent names.
+     * @return this
+     */
     public CommonConfiguration agentNamePrefix(final String agentNamePrefix)
     {
         this.agentNamePrefix = agentNamePrefix;
         return this;
     }
 
+    /**
+     * Set to true to print out the mapping between aeron stream identifiers (sessionIds) and the usage of given
+     * Aeron publication and subscription objects within Artio. See {@link StreamInformation} for details.
+     *
+     * This can be helpful when debugging issues related to back-pressure and trying to correlate Artio internal
+     * concepts to Aeron Counters. Defaults to false.
+     *
+     * @param printAeronStreamIdentifiers true to print, false otherwise.
+     * @return this
+     */
+    @SuppressWarnings("UnusedReturnValue")
     public CommonConfiguration printAeronStreamIdentifiers(final boolean printAeronStreamIdentifiers)
     {
         this.printAeronStreamIdentifiers = printAeronStreamIdentifiers;
@@ -575,12 +686,25 @@ public class CommonConfiguration
         return this;
     }
 
+    /**
+     * Set the Aeron stream id to be used for the inbound stream, aka coming from counter-parties to the library.
+     *
+     * @param inboundLibraryStream the aeron stream id
+     * @return this
+     */
     public CommonConfiguration inboundLibraryStream(final int inboundLibraryStream)
     {
         this.inboundLibraryStream = inboundLibraryStream;
         return this;
     }
 
+    /**
+     * Set the Aeron stream id to be used for the outbound stream, aka coming from the library and going out to
+     * counter-parties.
+     *
+     * @param outboundLibraryStream the aeron stream id
+     * @return this
+     */
     public CommonConfiguration outboundLibraryStream(final int outboundLibraryStream)
     {
         this.outboundLibraryStream = outboundLibraryStream;
@@ -592,21 +716,10 @@ public class CommonConfiguration
      * @param threadFactory factory for custom thread creating
      * @return this
      */
+    @SuppressWarnings("UnusedReturnValue")
     public CommonConfiguration threadFactory(final ThreadFactory threadFactory)
     {
         this.threadFactory = threadFactory;
-        return this;
-    }
-
-    /**
-     * Set to false to enable simulation of a non-graceful shutdown. Should only be used for testing.
-     *
-     * @param gracefulShutdown false to enable simulation of a non-graceful shutdown.
-     * @return this
-     */
-    public CommonConfiguration gracefulShutdown(final boolean gracefulShutdown)
-    {
-        this.gracefulShutdown = gracefulShutdown;
         return this;
     }
 
@@ -617,6 +730,7 @@ public class CommonConfiguration
      * @param validateCompIdsOnEveryMessage true to validate comp ids
      * @return this
      */
+    @SuppressWarnings("UnusedReturnValue")
     public CommonConfiguration validateCompIdsOnEveryMessage(final boolean validateCompIdsOnEveryMessage)
     {
         this.validateCompIdsOnEveryMessage = validateCompIdsOnEveryMessage;
@@ -630,6 +744,7 @@ public class CommonConfiguration
      * @param validateTimeStrictly true to validate time matches format
      * @return this
      */
+    @SuppressWarnings("UnusedReturnValue")
     public CommonConfiguration validateTimeStrictly(final boolean validateTimeStrictly)
     {
         this.validateTimeStrictly = validateTimeStrictly;
@@ -637,11 +752,12 @@ public class CommonConfiguration
     }
 
     /**
-     * Sets the time precision that the the session logic uses to encode time stamps.
+     * Sets the time precision that the session logic uses to encode time stamps.
      *
      * @param sessionEpochFractionFormat the format to use.
      * @return this
      */
+    @SuppressWarnings("UnusedReturnValue")
     public CommonConfiguration sessionEpochFractionFormat(final EpochFractionFormat sessionEpochFractionFormat)
     {
         Verify.notNull(sessionEpochFractionFormat, "sessionEpochFractionFormat");
@@ -649,12 +765,58 @@ public class CommonConfiguration
         return this;
     }
 
+    /**
+     * Sets the maximum keep alive timeout in milliseconds that can be agreed by a FIXP connection's logon exchange.
+     *
+     * NB: this only affects the keepalive for the counter-party, use {@link #acceptorFixPKeepaliveTimeoutInMs(long)}
+     * for setting your own keepalive interval as an acceptor.
+     *
+     * @param maxFixpKeepaliveTimeoutInMs the maximum keep alive timeout.
+     * @return this
+     */
+    @SuppressWarnings("UnusedReturnValue")
     public CommonConfiguration maxFixPKeepaliveTimeoutInMs(final long maxFixpKeepaliveTimeoutInMs)
     {
         this.maxFixPKeepaliveTimeoutInMs = maxFixpKeepaliveTimeoutInMs;
         return this;
     }
 
+    /**
+     * Sets the minimum keep alive timeout in milliseconds that can be agreed by a FIXP connection's logon exchange.
+     *
+     * NB: this only affects the keepalive for the counter-party, use {@link #acceptorFixPKeepaliveTimeoutInMs(long)}
+     * for setting your own keepalive interval as an acceptor.
+     *
+     * @param minFixPKeepaliveTimeoutInMs the minimum keep alive timeout.
+     * @return this
+     */
+    @SuppressWarnings("UnusedReturnValue")
+    public CommonConfiguration minFixPKeepaliveTimeoutInMs(final long minFixPKeepaliveTimeoutInMs)
+    {
+        this.minFixPKeepaliveTimeoutInMs = minFixPKeepaliveTimeoutInMs;
+        return this;
+    }
+
+    /**
+     * Sets the minimum keep alive timeout in milliseconds that can be agreed by a FIXP connection's logon exchange.
+     *
+     * @param acceptorFixPKeepaliveTimeoutInMs the minimum keep alive timeout.
+     * @return this
+     */
+    @SuppressWarnings("UnusedReturnValue")
+    public CommonConfiguration acceptorFixPKeepaliveTimeoutInMs(final long acceptorFixPKeepaliveTimeoutInMs)
+    {
+        this.acceptorFixPKeepaliveTimeoutInMs = acceptorFixPKeepaliveTimeoutInMs;
+        return this;
+    }
+
+    /**
+     * Sets the timeout in milliseconds before a FIXP TCP connection is closed if no establish message is sent.
+     * This is analogous to {@link EngineConfiguration#noLogonDisconnectTimeoutInMs(int)} for FIX.
+     *
+     * @param noEstablishFixPTimeoutInMs the time before a FIXP connection is closed if no establish message is sent.
+     * @return this
+     */
     public CommonConfiguration noEstablishFixPTimeoutInMs(final long noEstablishFixPTimeoutInMs)
     {
         this.noEstablishFixPTimeoutInMs = noEstablishFixPTimeoutInMs;
@@ -675,6 +837,65 @@ public class CommonConfiguration
         return this;
     }
 
+    /**
+     * Configures how a resend request is responded to. We default to responding to any valid resend request. See
+     * Javadoc on {@link ResendRequestController} for details of how to implement it.
+     *
+     *
+     * @param resendRequestController the controller to use.
+     * @return this
+     */
+    public CommonConfiguration resendRequestController(final ResendRequestController resendRequestController)
+    {
+        this.resendRequestController = resendRequestController;
+        return this;
+    }
+
+    /**
+     * Configures the id of the gateway.
+     *
+     * @param gatewayId the id of the gateway.
+     * @return this
+     */
+    public CommonConfiguration gatewayId(final long gatewayId)
+    {
+        this.gatewayId = gatewayId;
+        return this;
+    }
+
+    // ------------------------
+    // END SETTERS
+    // ------------------------
+
+    // ------------------------
+    // BEGIN GETTERS
+    // ------------------------
+
+    public long sendingTimeWindowInMs()
+    {
+        return sendingTimeWindowInMs;
+    }
+
+    public int defaultHeartbeatIntervalInS()
+    {
+        return defaultHeartbeatIntervalInS;
+    }
+
+    public int forcedHeartbeatIntervalInS()
+    {
+        return forcedHeartbeatIntervalInS;
+    }
+
+    public boolean disableHeartbeatRepliesToTestRequests()
+    {
+        return disableHeartbeatRepliesToTestRequests;
+    }
+
+    public long reasonableTransmissionTimeInMs()
+    {
+        return reasonableTransmissionTimeInMs;
+    }
+
     public long noEstablishFixPTimeoutInMs()
     {
         return noEstablishFixPTimeoutInMs;
@@ -685,9 +906,14 @@ public class CommonConfiguration
         return maxFixPKeepaliveTimeoutInMs;
     }
 
-    public boolean gracefulShutdown()
+    public long minFixPKeepaliveTimeoutInMs()
     {
-        return gracefulShutdown;
+        return minFixPKeepaliveTimeoutInMs;
+    }
+
+    public long acceptorFixPKeepaliveTimeoutInMs()
+    {
+        return acceptorFixPKeepaliveTimeoutInMs;
     }
 
     public Aeron.Context aeronContext()
@@ -805,6 +1031,15 @@ public class CommonConfiguration
         return fixPAcceptedSessionMaxRetransmissionRange;
     }
 
+    public ResendRequestController resendRequestController()
+    {
+        return resendRequestController;
+    }
+
+    // ------------------------
+    // END GETTERS
+    // ------------------------
+
     protected void conclude(final String fixSuffix)
     {
         if (isConcluded.compareAndSet(false, true))
@@ -877,5 +1112,56 @@ public class CommonConfiguration
     public ThreadFactory threadFactory()
     {
         return threadFactory;
+    }
+
+    public long gatewayId()
+    {
+        return gatewayId;
+    }
+
+    @Override
+    public String toString()
+    {
+        return "CommonConfiguration" +
+            "\n{" +
+            "\n    threadFactory=" + threadFactory +
+            "\n    fixPAcceptedSessionMaxRetransmissionRange=" + fixPAcceptedSessionMaxRetransmissionRange +
+            "\n    reasonableTransmissionTimeInMs=" + reasonableTransmissionTimeInMs +
+            "\n    printAeronStreamIdentifiers=" + printAeronStreamIdentifiers +
+            "\n    epochNanoClock=" + epochNanoClock +
+            "\n    errorHandlerFactory=" + errorHandlerFactory +
+            "\n    monitoringAgentFactory=" + monitoringAgentFactory +
+            "\n    monitoringThreadIdleStrategy=" + monitoringThreadIdleStrategy +
+            "\n    sendingTimeWindowInMs=" + sendingTimeWindowInMs +
+            "\n    sessionIdStrategy=" + sessionIdStrategy +
+            "\n    messageValidationStrategy=" + messageValidationStrategy +
+            "\n    sessionCustomisationStrategy=" + sessionCustomisationStrategy +
+            "\n    monitoringBuffersLength=" + monitoringBuffersLength +
+            "\n    monitoringFile='" + monitoringFile + '\'' +
+            "\n    replyTimeoutInMs=" + replyTimeoutInMs +
+            "\n    aeronContext=" + aeronContext +
+            "\n    sessionBufferSize=" + sessionBufferSize +
+            "\n    inboundMaxClaimAttempts=" + inboundMaxClaimAttempts +
+            "\n    outboundMaxClaimAttempts=" + outboundMaxClaimAttempts +
+            "\n    defaultHeartbeatIntervalInS=" + defaultHeartbeatIntervalInS +
+            "\n    histogramPollPeriodInMs=" + histogramPollPeriodInMs +
+            "\n    histogramLoggingFile='" + histogramLoggingFile + '\'' +
+            "\n    histogramHandler=" + histogramHandler +
+            "\n    agentNamePrefix='" + agentNamePrefix + '\'' +
+            "\n    inboundLibraryStream=" + inboundLibraryStream +
+            "\n    outboundLibraryStream=" + outboundLibraryStream +
+            "\n    validateCompIdsOnEveryMessage=" + validateCompIdsOnEveryMessage +
+            "\n    validateTimeStrictly=" + validateTimeStrictly +
+            "\n    sessionEpochFractionFormat=" + sessionEpochFractionFormat +
+            "\n    maxFixPKeepaliveTimeoutInMs=" + maxFixPKeepaliveTimeoutInMs +
+            "\n    minFixPKeepaliveTimeoutInMs=" + minFixPKeepaliveTimeoutInMs +
+            "\n    acceptorFixPKeepaliveTimeoutInMs=" + acceptorFixPKeepaliveTimeoutInMs +
+            "\n    noEstablishFixPTimeoutInMs=" + noEstablishFixPTimeoutInMs +
+            "\n    resendRequestController=" + resendRequestController +
+            "\n    forcedHeartbeatIntervalInS=" + forcedHeartbeatIntervalInS +
+            "\n    disableHeartbeatRepliesToTestRequests=" + disableHeartbeatRepliesToTestRequests +
+            "\n    gatewayId=" + gatewayId +
+            "\n    isConcluded=" + isConcluded +
+            "\n}";
     }
 }

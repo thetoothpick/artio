@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,30 +15,25 @@
  */
 package uk.co.real_logic.artio.engine.framer;
 
-import io.aeron.logbuffer.ControlledFragmentHandler;
-import io.aeron.logbuffer.Header;
+import io.aeron.logbuffer.ControlledFragmentHandler.Action;
 import org.agrona.DirectBuffer;
-import org.agrona.ErrorHandler;
 import org.agrona.collections.Long2ObjectHashMap;
+import uk.co.real_logic.artio.DebugLogger;
+import uk.co.real_logic.artio.LogTag;
 import uk.co.real_logic.artio.engine.FixEngine;
-import uk.co.real_logic.artio.messages.FixMessageDecoder;
-import uk.co.real_logic.artio.messages.MessageHeaderDecoder;
-import uk.co.real_logic.artio.messages.ThrottleRejectDecoder;
+import uk.co.real_logic.artio.util.CharFormatter;
 
 import java.util.function.LongToIntFunction;
 
 import static io.aeron.logbuffer.ControlledFragmentHandler.Action.CONTINUE;
-import static uk.co.real_logic.artio.messages.ThrottleRejectDecoder.businessRejectRefIDHeaderLength;
+import static uk.co.real_logic.artio.DebugLogger.IS_REPLAY_LOG_TAG_ENABLED;
 
-class FixSenderEndPoints implements AutoCloseable, ControlledFragmentHandler
+class FixSenderEndPoints implements AutoCloseable
 {
-    private static final int HEADER_LENGTH = MessageHeaderDecoder.ENCODED_LENGTH;
+    final CharFormatter missReplayComplete = new CharFormatter(
+        "SEPs.missReplayComplete, connId=%s, corrId=%s, slow=%s");
 
-    private final MessageHeaderDecoder messageHeader = new MessageHeaderDecoder();
-    private final FixMessageDecoder fixMessage = new FixMessageDecoder();
-    private final ThrottleRejectDecoder throttleReject = new ThrottleRejectDecoder();
     private final Long2ObjectHashMap<FixSenderEndPoint> connectionIdToSenderEndpoint = new Long2ObjectHashMap<>();
-    private final ErrorHandler errorHandler;
     private final LongToIntFunction libraryLookup = this::libraryLookup;
 
     private int libraryLookup(final long sessionId)
@@ -55,11 +50,6 @@ class FixSenderEndPoints implements AutoCloseable, ControlledFragmentHandler
     }
 
     private long timeInMs;
-
-    FixSenderEndPoints(final ErrorHandler errorHandler)
-    {
-        this.errorHandler = errorHandler;
-    }
 
     public void add(final FixSenderEndPoint senderEndPoint)
     {
@@ -82,12 +72,23 @@ class FixSenderEndPoints implements AutoCloseable, ControlledFragmentHandler
         final int offset,
         final int length,
         final int sequenceNumber,
-        final long position)
+        final int sequenceIndex,
+        final long messageType,
+        final int metaDataLength)
     {
         final FixSenderEndPoint endPoint = connectionIdToSenderEndpoint.get(connectionId);
         if (endPoint != null)
         {
-            endPoint.onOutboundMessage(libraryId, buffer, offset, length, sequenceNumber, position, timeInMs);
+            endPoint.onOutboundMessage(
+                libraryId,
+                buffer,
+                offset,
+                length,
+                sequenceNumber,
+                sequenceIndex,
+                messageType,
+                timeInMs,
+                metaDataLength);
             return true;
         }
 
@@ -100,17 +101,17 @@ class FixSenderEndPoints implements AutoCloseable, ControlledFragmentHandler
         final long refMsgType,
         final int refSeqNum,
         final int sequenceNumber,
+        final int sequenceIndex,
         final DirectBuffer businessRejectRefIDBuffer,
         final int businessRejectRefIDOffset,
-        final int businessRejectRefIDLength,
-        final long position)
+        final int businessRejectRefIDLength)
     {
         final FixSenderEndPoint endPoint = connectionIdToSenderEndpoint.get(connectionId);
         if (endPoint != null)
         {
             endPoint.onThrottleReject(
-                libraryId, refMsgType, refSeqNum, sequenceNumber,
-                businessRejectRefIDBuffer, businessRejectRefIDOffset, businessRejectRefIDLength, position,
+                libraryId, refMsgType, refSeqNum, sequenceNumber, sequenceIndex,
+                businessRejectRefIDBuffer, businessRejectRefIDOffset, businessRejectRefIDLength,
                 timeInMs);
         }
 
@@ -118,125 +119,37 @@ class FixSenderEndPoints implements AutoCloseable, ControlledFragmentHandler
     }
 
     Action onReplayMessage(
-        final long connectionId, final DirectBuffer buffer, final int offset, final int length, final long position)
+        final long connectionId, final DirectBuffer buffer, final int offset, final int length,
+        final int sequenceNumber)
     {
         final FixSenderEndPoint endPoint = connectionIdToSenderEndpoint.get(connectionId);
         if (endPoint != null)
         {
-            return endPoint.onReplayMessage(buffer, offset, length, timeInMs, position);
+            return endPoint.onReplayMessage(buffer, offset, length, timeInMs, sequenceNumber);
         }
-        else
-        {
-            logReplayError(connectionId, buffer, offset, length);
-
-            return CONTINUE;
-        }
-    }
-
-    Action onSlowReplayMessage(
-        final long connectionId,
-        final DirectBuffer buffer,
-        final int offset,
-        final int length,
-        final long position,
-        final int metaDataLength)
-    {
-        final FixSenderEndPoint endPoint = connectionIdToSenderEndpoint.get(connectionId);
-        if (endPoint != null)
-        {
-            return endPoint.onSlowReplayMessage(buffer, offset, length, timeInMs, position, metaDataLength);
-        }
-        else
-        {
-            // We don't log the replay error at this point, as it will likely be a message that has already been
-            // attempted. This cannot be a slow endpoint anymore - it's a disconnected endpoint.
-
-            return CONTINUE;
-        }
-    }
-
-    private void logReplayError(final long connectionId, final DirectBuffer buffer, final int offset, final int length)
-    {
-        errorHandler.onError(new IllegalArgumentException(String.format(
-            "Failed to replay message on conn=%1$d [%2$s], this probably indicates the connection has disconnected " +
-            "from Artio whilst this message was in the process of being replayed",
-            connectionId,
-            buffer.getStringWithoutLengthUtf8(offset, length))));
-    }
-
-    public Action onFragment(final DirectBuffer buffer, final int offset, final int length, final Header header)
-    {
-        return onSlowConsumerMessageFragment(buffer, offset, length, header.position());
-    }
-
-    @SuppressWarnings("FinalParameters")
-    private Action onSlowConsumerMessageFragment(
-        final DirectBuffer buffer,
-        int offset,
-        final int length,
-        final long position)
-    {
-        final MessageHeaderDecoder messageHeader = this.messageHeader;
-        messageHeader.wrap(buffer, offset);
-
-        final int templateId = messageHeader.templateId();
-        if (templateId == FixMessageDecoder.TEMPLATE_ID)
-        {
-            offset += HEADER_LENGTH;
-            final int version = messageHeader.version();
-            fixMessage.wrap(buffer, offset, messageHeader.blockLength(), version);
-
-            final long connectionId = fixMessage.connection();
-            final FixSenderEndPoint senderEndPoint = connectionIdToSenderEndpoint.get(connectionId);
-            if (senderEndPoint != null)
-            {
-                final int metaDataLength = fixMessage.skipMetaData();
-
-                final int bodyLength = fixMessage.bodyLength();
-                final int libraryId = fixMessage.libraryId();
-                final int sequenceNumber = fixMessage.sequenceNumber();
-                return senderEndPoint.onSlowOutboundMessage(
-                    buffer, offset, length - HEADER_LENGTH, position, bodyLength, libraryId, timeInMs,
-                    metaDataLength, sequenceNumber);
-            }
-        }
-        else if (templateId == ThrottleRejectDecoder.TEMPLATE_ID)
-        {
-            offset += HEADER_LENGTH;
-            final int version = messageHeader.version();
-            throttleReject.wrap(buffer, offset, messageHeader.blockLength(), version);
-
-            final long connectionId = throttleReject.connection();
-            final FixSenderEndPoint senderEndPoint = connectionIdToSenderEndpoint.get(connectionId);
-            if (senderEndPoint != null)
-            {
-                final int businessRejectRefIDOffset = throttleReject.limit() + businessRejectRefIDHeaderLength();
-                return senderEndPoint.onSlowThrottleReject(
-                    throttleReject.libraryId(),
-                    throttleReject.refMsgType(),
-                    throttleReject.refSeqNum(),
-                    throttleReject.sequenceNumber(),
-                    buffer,
-                    businessRejectRefIDOffset,
-                    throttleReject.businessRejectRefIDLength(),
-                    position,
-                    timeInMs);
-            }
-        }
-
         return CONTINUE;
+
     }
 
-    Action onReplayComplete(final long connectionId)
+    Action onReplayComplete(final long connectionId, final long correlationId, final boolean slow)
     {
         final FixSenderEndPoint senderEndPoint = connectionIdToSenderEndpoint.get(connectionId);
         if (senderEndPoint != null)
         {
-            return senderEndPoint.onReplayComplete();
+            return senderEndPoint.onReplayComplete(correlationId);
+        }
+        else
+        {
+            if (IS_REPLAY_LOG_TAG_ENABLED)
+            {
+                DebugLogger.log(LogTag.REPLAY, missReplayComplete.clear().with(connectionId).with(correlationId)
+                    .with(slow));
+            }
         }
         return CONTINUE;
     }
 
+    @Override
     public void close()
     {
         connectionIdToSenderEndpoint
@@ -255,12 +168,12 @@ class FixSenderEndPoints implements AutoCloseable, ControlledFragmentHandler
         this.timeInMs = timeInMs;
     }
 
-    int checkTimeouts(final long timeInMs)
+    int poll(final long timeInMs)
     {
         int count = 0;
         for (final FixSenderEndPoint senderEndPoint : connectionIdToSenderEndpoint.values())
         {
-            if (senderEndPoint.checkTimeouts(timeInMs))
+            if (senderEndPoint.poll(timeInMs))
             {
                 count++;
             }
@@ -272,5 +185,24 @@ class FixSenderEndPoints implements AutoCloseable, ControlledFragmentHandler
     LongToIntFunction libraryLookup()
     {
         return libraryLookup;
+    }
+
+    public void onValidResendRequest(final long connection, final long correlationId)
+    {
+        final FixSenderEndPoint fixSenderEndPoint = connectionIdToSenderEndpoint.get(connection);
+        if (fixSenderEndPoint != null)
+        {
+            fixSenderEndPoint.onValidResendRequest(correlationId);
+        }
+    }
+
+    public void onStartReplay(
+        final long connection, final long correlationId, final boolean slow)
+    {
+        final FixSenderEndPoint fixSenderEndPoint = connectionIdToSenderEndpoint.get(connection);
+        if (fixSenderEndPoint != null)
+        {
+            fixSenderEndPoint.onStartReplay(correlationId);
+        }
     }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd., Monotonic Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd., Monotonic Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ package uk.co.real_logic.artio.engine.logger;
 
 import io.aeron.Subscription;
 import io.aeron.driver.Configuration;
+import io.aeron.driver.DutyCycleTracker;
 import io.aeron.logbuffer.ControlledFragmentHandler;
 import io.aeron.logbuffer.ControlledFragmentHandler.Action;
 import io.aeron.logbuffer.Header;
@@ -27,9 +28,9 @@ import org.agrona.collections.IntHashSet;
 import org.agrona.concurrent.EpochNanoClock;
 import org.agrona.concurrent.IdleStrategy;
 import org.agrona.concurrent.status.AtomicCounter;
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.mockito.stubbing.Answer;
 import org.mockito.stubbing.OngoingStubbing;
@@ -42,16 +43,21 @@ import uk.co.real_logic.artio.decoder.SequenceResetDecoder;
 import uk.co.real_logic.artio.engine.EngineConfiguration;
 import uk.co.real_logic.artio.engine.ReplayHandler;
 import uk.co.real_logic.artio.engine.ReplayerCommandQueue;
+import uk.co.real_logic.artio.engine.SenderSequenceNumber;
 import uk.co.real_logic.artio.engine.SenderSequenceNumbers;
 import uk.co.real_logic.artio.fields.EpochFractionFormat;
 import uk.co.real_logic.artio.fields.RejectReason;
 import uk.co.real_logic.artio.fields.UtcTimestampDecoder;
 import uk.co.real_logic.artio.messages.FixPProtocolType;
 import uk.co.real_logic.artio.messages.MessageHeaderDecoder;
+import uk.co.real_logic.artio.messages.MessageHeaderEncoder;
 import uk.co.real_logic.artio.messages.ReplayCompleteDecoder;
+import uk.co.real_logic.artio.messages.ThrottleRejectEncoder;
+import uk.co.real_logic.artio.messages.ValidResendRequestEncoder;
 import uk.co.real_logic.artio.util.AsciiBuffer;
 import uk.co.real_logic.artio.util.MutableAsciiBuffer;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -60,13 +66,14 @@ import static io.aeron.logbuffer.ControlledFragmentHandler.Action.*;
 import static java.nio.charset.StandardCharsets.US_ASCII;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsString;
-import static org.junit.Assert.*;
+import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 import static uk.co.real_logic.artio.CommonConfiguration.DEFAULT_NAME_PREFIX;
 import static uk.co.real_logic.artio.decoder.ExampleMessageDecoder.MESSAGE_TYPE;
 import static uk.co.real_logic.artio.engine.EngineConfiguration.*;
 import static uk.co.real_logic.artio.engine.PossDupEnabler.ORIG_SENDING_TIME_PREFIX_AS_STR;
 import static uk.co.real_logic.artio.engine.logger.Replayer.MESSAGE_FRAME_BLOCK_LENGTH;
+import static uk.co.real_logic.artio.engine.logger.Replayer.START_REPLAY_LENGTH;
 import static uk.co.real_logic.artio.messages.FixMessageDecoder.metaDataHeaderLength;
 import static uk.co.real_logic.artio.util.CustomMatchers.sequenceEqualsAscii;
 
@@ -78,9 +85,10 @@ public class ReplayerTest extends AbstractLogTest
 
     public static final byte[] MESSAGE_REQUIRING_LONGER_BODY_LENGTH =
         ("8=FIX.4.4\0019=99\00135=1\00134=1\00149=LEH_LZJ02\00152=" + ORIGINAL_SENDING_TIME + "\00156=CCG\001" +
-            "112=a12345678910123456789101234567891012345\00110=005\001").getBytes(US_ASCII);
+        "112=a12345678910123456789101234567891012345\00110=005\001").getBytes(US_ASCII);
 
     private static final int MAX_CLAIM_ATTEMPTS = 100;
+    private static final long CORRELATION_ID = 2;
 
     private final ReplayQuery replayQuery = mock(ReplayQuery.class);
     private final Subscription subscription = mock(Subscription.class);
@@ -97,8 +105,9 @@ public class ReplayerTest extends AbstractLogTest
     private final AtomicCounter currentReplayCounter = mock(AtomicCounter.class);
 
     private Replayer replayer;
+    private boolean sendsStartReplay = true;
 
-    @Before
+    @BeforeEach
     public void setUp()
     {
         when(fragmentHeader.flags()).thenReturn((byte)DataHeaderFlyweight.BEGIN_AND_END_FLAGS);
@@ -106,10 +115,13 @@ public class ReplayerTest extends AbstractLogTest
         when(publication.tryClaim(anyInt(), any())).thenReturn(1L);
         when(publication.maxPayloadLength()).thenReturn(Configuration.mtuLength() - DataHeaderFlyweight.HEADER_LENGTH);
 
-        when(replayQuery.query(anyLong(), anyInt(), anyInt(), anyInt(), anyInt(), any(), messageTracker.capture()))
-            .thenReturn(replayOperation);
+        when(replayQuery.query(anyLong(), anyInt(), anyInt(), anyInt(), anyInt(), any())).thenReturn(new ArrayList<>());
+        when(replayQuery.newReplayOperation(any(), any(), messageTracker.capture())).thenReturn(replayOperation);
         when(replayOperation.pollReplay()).thenReturn(true);
-        when(senderSequenceNumbers.bytesInBufferCounter(anyLong())).thenReturn(bytesInBufferCounter);
+        final SenderSequenceNumber senderSequenceNumber = mock(SenderSequenceNumber.class);
+        when(senderSequenceNumber.fixP()).thenReturn(false);
+        when(senderSequenceNumber.bytesInBuffer()).thenReturn(bytesInBufferCounter);
+        when(senderSequenceNumbers.senderSequenceNumber(anyLong())).thenReturn(senderSequenceNumber);
 
         setReplayedMessages(1);
 
@@ -120,7 +132,6 @@ public class ReplayerTest extends AbstractLogTest
             idleStrategy,
             errorHandler,
             MAX_CLAIM_ATTEMPTS,
-            subscription,
             DEFAULT_NAME_PREFIX,
             EngineConfiguration.DEFAULT_GAPFILL_ON_REPLAY_MESSAGE_TYPES,
             new IntHashSet(),
@@ -135,7 +146,8 @@ public class ReplayerTest extends AbstractLogTest
             DEFAULT_MAX_CONCURRENT_SESSION_REPLAYS,
             clock,
             FixPProtocolType.ILINK_3,
-            mock(EngineConfiguration.class));
+            mock(EngineConfiguration.class),
+            mock(DutyCycleTracker.class));
     }
 
     private void setReplayedMessages(final int replayedMessages)
@@ -170,7 +182,7 @@ public class ReplayerTest extends AbstractLogTest
 
         onFragment(srcLength);
 
-        assertHasResentWithPossDupFlag(srcLength, times(1));
+        assertHasResentWithPossDupFlag(srcLength, times(2));
 
         replayer.doWork();
         replayer.doWork();
@@ -203,7 +215,7 @@ public class ReplayerTest extends AbstractLogTest
         setupMessage(srcLength);
         onFragment(srcLength, CONTINUE, secondHandler);
 
-        assertHasResentWithPossDupFlag(srcLength, times(2));
+        assertHasResentWithPossDupFlag(srcLength, times(4));
     }
 
     @Test
@@ -219,7 +231,7 @@ public class ReplayerTest extends AbstractLogTest
 
         replayer.doWork();
 
-        assertSentGapFill(SEQUENCE_NUMBER, END_SEQ_NO + 1, offset, times(1));
+        assertSentGapFill(SEQUENCE_NUMBER, END_SEQ_NO + 1, offset, times(2));
 
         replayer.doWork();
 
@@ -244,7 +256,7 @@ public class ReplayerTest extends AbstractLogTest
 
         replayer.doWork();
 
-        assertSentGapFill(SEQUENCE_NUMBER, endSeqNo + 1, offset, times(1));
+        assertSentGapFill(SEQUENCE_NUMBER, endSeqNo + 1, offset, times(2));
 
         replayer.doWork();
 
@@ -274,12 +286,13 @@ public class ReplayerTest extends AbstractLogTest
         replayer.doWork(); // receives the callback with the two test requests
 
         replayer.doWork(); // attempts the replay and get's back pressured
+        verifyStartReplyClaim();
         claimedAndNothingMore();
 
         // resend the gap fill, don't get back pressured
         final int offset = setupCapturingClaim();
         replayer.doWork();
-        assertSentGapFill(SEQUENCE_NUMBER, endSeqNo + 1, offset, times(1));
+        assertSentGapFill(SEQUENCE_NUMBER, endSeqNo + 1, offset, times(2));
 
         replayer.doWork();
 
@@ -300,7 +313,7 @@ public class ReplayerTest extends AbstractLogTest
 
             final int srcLength = onExampleMessage(endSeqNo);
 
-            assertResentGapFillThenMessage(endSeqNo, offset, srcLength);
+            assertResentGapFillThenMessage(endSeqNo, offset, srcLength, times(2));
 
             return true;
         });
@@ -324,7 +337,7 @@ public class ReplayerTest extends AbstractLogTest
 
             onExampleMessage(endSeqNo);
 
-            assertHasResentWithPossDupFlag(srcLength, times(2));
+            assertHasResentWithPossDupFlag(srcLength, times(3));
 
             return true;
         });
@@ -376,7 +389,7 @@ public class ReplayerTest extends AbstractLogTest
 
             // First message resent
             final int srcLength1 = onExampleMessage(BEGIN_SEQ_NO);
-            assertHasResentWithPossDupFlag(srcLength1, times(1));
+            assertHasResentWithPossDupFlag(srcLength1, times(2));
 
             return false;
         });
@@ -416,7 +429,7 @@ public class ReplayerTest extends AbstractLogTest
         {
             setupCapturingClaim();
             final int srcLength = onExampleMessage(BEGIN_SEQ_NO);
-            assertHasResentWithPossDupFlag(srcLength, times(1));
+            assertHasResentWithPossDupFlag(srcLength, times(2));
 
             backpressureTryClaim();
             onTestRequest(endSeqNo);
@@ -459,7 +472,7 @@ public class ReplayerTest extends AbstractLogTest
 
         replayer.doWork();
 
-        assertSentGapFill(SEQUENCE_NUMBER, endSeqNo + 1, offset, times(1));
+        assertSentGapFill(SEQUENCE_NUMBER, endSeqNo + 1, offset, times(2));
         verifyIllegalStateException();
     }
 
@@ -483,7 +496,7 @@ public class ReplayerTest extends AbstractLogTest
 
         replayer.doWork();
 
-        assertSentGapFill(SEQUENCE_NUMBER, endSeqNo + 1, offset, times(1));
+        assertSentGapFill(SEQUENCE_NUMBER, endSeqNo + 1, offset, times(2));
         verifyIllegalStateException();
     }
 
@@ -498,13 +511,63 @@ public class ReplayerTest extends AbstractLogTest
 
             final int srcLength = onExampleMessage(endSeqNo);
 
-            assertResentGapFillThenMessage(BEGIN_SEQ_NO, offset, srcLength);
+            assertResentGapFillThenMessage(2, offset, srcLength, times(3));
 
             return true;
         });
 
         replayer.doWork();
 
+        verifyIllegalStateException();
+    }
+
+    @Test
+    public void shouldGapFillHoleAfterReplayedMessageFromTheNextSequenceNumber()
+    {
+        final int endSeqNo = BEGIN_SEQ_NO + 3;
+        setupCapturingClaim();
+        final List<String> replayed = recordReplayedFixMessages();
+        setReplayedMessages(2);
+
+        onReplay(endSeqNo, inv ->
+        {
+            onExampleMessage(BEGIN_SEQ_NO);
+            onExampleMessage(endSeqNo);
+
+            return true;
+        });
+
+        replayer.doWork();
+
+        assertEquals(List.of(
+            exampleMessageSummary(BEGIN_SEQ_NO),
+            gapFillSummary(BEGIN_SEQ_NO + 1, endSeqNo),
+            exampleMessageSummary(endSeqNo)), replayed);
+        verifyIllegalStateException();
+    }
+
+    @Test
+    public void shouldGapFillHoleBeforeThrottleRejectFromTheNextSequenceNumber()
+    {
+        final int endSeqNo = BEGIN_SEQ_NO + 3;
+        setupCapturingClaim();
+        final List<String> replayed = recordReplayedFixMessages();
+        setReplayedMessages(2);
+
+        onReplay(endSeqNo, inv ->
+        {
+            onExampleMessage(BEGIN_SEQ_NO);
+            onThrottleReject(endSeqNo);
+
+            return true;
+        });
+
+        replayer.doWork();
+
+        assertEquals(List.of(
+            exampleMessageSummary(BEGIN_SEQ_NO),
+            gapFillSummary(BEGIN_SEQ_NO + 1, endSeqNo),
+            "35=j 34=" + endSeqNo), replayed);
         verifyIllegalStateException();
     }
 
@@ -552,6 +615,7 @@ public class ReplayerTest extends AbstractLogTest
         verifyNoMoreInteractions(claim);
         resetMocks();
 
+        sendsStartReplay = false;
         shouldReplayMessageWithExpandingBodyLength();
     }
 
@@ -581,7 +645,29 @@ public class ReplayerTest extends AbstractLogTest
         });
     }
 
-    @After
+    @Test
+    public void shouldGapFillMessageIfOverriddenBeginSeqNo()
+    {
+        final int endSeqNo = endSeqNoForTwoMessages();
+
+        setReplayedMessages(1);
+
+        onReplay(endSeqNo, 3, inv ->
+        {
+            final int offset = setupCapturingClaim();
+
+            bufferContainsExampleMessage(true, SESSION_ID, BEGIN_SEQ_NO, SEQUENCE_INDEX);
+            final int srcLength = onExampleMessage(endSeqNo);
+
+            assertResentGapFillThenMessage(endSeqNo, offset, srcLength, times(3));
+
+            return true;
+        });
+
+        replayer.doWork();
+    }
+
+    @AfterEach
     public void shouldHaveNoMoreErrors()
     {
         verifyNoMoreInteractions(errorHandler);
@@ -595,7 +681,8 @@ public class ReplayerTest extends AbstractLogTest
         reset(publication);
     }
 
-    private void assertResentGapFillThenMessage(final int endSeqNo, final int offset, final int srcLength)
+    private void assertResentGapFillThenMessage(
+        final int endSeqNo, final int offset, final int srcLength, final VerificationMode commitTimes)
     {
         doAnswer(commitInv ->
         {
@@ -603,7 +690,7 @@ public class ReplayerTest extends AbstractLogTest
             return null;
         }).when(claim).commit();
 
-        assertHasResentWithPossDupFlag(srcLength, times(2));
+        assertHasResentWithPossDupFlag(srcLength, commitTimes);
     }
 
     private int onExampleMessage(final int endSeqNo)
@@ -625,6 +712,60 @@ public class ReplayerTest extends AbstractLogTest
         onFragment(fragmentLength(), CONTINUE, getMessageTracker());
     }
 
+    private void onThrottleReject(final int sequenceNumber)
+    {
+        final ThrottleRejectEncoder throttleReject = new ThrottleRejectEncoder()
+            .wrapAndApplyHeader(buffer, START, header)
+            .libraryId(LIBRARY_ID)
+            .connection(CONNECTION_ID)
+            .refMsgType(MESSAGE_TYPE)
+            .refSeqNum(sequenceNumber)
+            .sequenceNumber(sequenceNumber)
+            .session(SESSION_ID)
+            .sequenceIndex(SEQUENCE_INDEX)
+            .putBusinessRejectRefID(new byte[0], 0, 0);
+        onFragment(
+            MessageHeaderEncoder.ENCODED_LENGTH + throttleReject.encodedLength(), CONTINUE, getMessageTracker());
+    }
+
+    /**
+     * Records the MsgType, MsgSeqNum and NewSeqNo of each FIX message committed to the publication.
+     */
+    private List<String> recordReplayedFixMessages()
+    {
+        final List<String> replayed = new ArrayList<>();
+        final Pattern fixMessage = Pattern.compile("8=FIX.*?\00110=\\d{3}\001");
+        doAnswer(inv ->
+        {
+            final Matcher matcher = fixMessage.matcher(resultAsciiBuffer.getAscii(0, resultAsciiBuffer.capacity()));
+            if (matcher.find())
+            {
+                final String message = matcher.group();
+                final String newSeqNo = field(message, "36");
+                replayed.add("35=" + field(message, "35") + " 34=" + field(message, "34") +
+                    (newSeqNo == null ? "" : " 36=" + newSeqNo));
+            }
+            return null;
+        }).when(claim).commit();
+        return replayed;
+    }
+
+    private static String field(final String message, final String tag)
+    {
+        final Matcher matcher = Pattern.compile("\001" + tag + "=([^\001]*)\001").matcher(message);
+        return matcher.find() ? matcher.group(1) : null;
+    }
+
+    private static String exampleMessageSummary(final int msgSeqNum)
+    {
+        return "35=" + ExampleMessageDecoder.MESSAGE_TYPE_AS_STRING + " 34=" + msgSeqNum;
+    }
+
+    private static String gapFillSummary(final int msgSeqNum, final int newSeqNo)
+    {
+        return "35=4 34=" + msgSeqNum + " 36=" + newSeqNo;
+    }
+
     private int endSeqNoForTwoMessages()
     {
         // inclusive numbering
@@ -638,10 +779,15 @@ public class ReplayerTest extends AbstractLogTest
 
     private void onReplay(final int endSeqNo, final Answer<Boolean> answer)
     {
+        onReplay(endSeqNo, (int)ValidResendRequestEncoder.overriddenBeginSequenceNumberNullValue(), answer);
+    }
+
+    private void onReplay(final int endSeqNo, final int overriddenBeginSeqNo, final Answer<Boolean> answer)
+    {
         whenReplayQueried().then(answer);
 
         final long result = bufferHasResendRequest(endSeqNo);
-        onRequestResendMessage(result, endSeqNo);
+        onRequestResendMessage(result, endSeqNo, overriddenBeginSeqNo);
     }
 
     private void onReplayOtherSession(final int endSeqNo)
@@ -649,7 +795,8 @@ public class ReplayerTest extends AbstractLogTest
         whenReplayQueried().thenReturn(true);
 
         final long result = bufferHasResendRequest(endSeqNo, RESEND_TARGET_2);
-        onRequestResendMessageWithSession(result, COMMIT, SESSION_ID_2, CONNECTION_ID_2, BEGIN_SEQ_NO, endSeqNo);
+        onRequestResendMessageWithSession(result, SESSION_ID_2, CONNECTION_ID_2, BEGIN_SEQ_NO, endSeqNo,
+            (int)ValidResendRequestEncoder.overriddenBeginSequenceNumberNullValue());
     }
 
     private void onFragment(final int length, final Action expectedAction, final ControlledFragmentHandler handler)
@@ -679,11 +826,11 @@ public class ReplayerTest extends AbstractLogTest
         final int msgSeqNum,
         final int newSeqNo,
         final int offset,
-        final VerificationMode times)
+        final VerificationMode commitTimes)
     {
         verifyClaim();
         assertResultBufferHasGapFillMessage(resultBuffer.capacity() - offset, msgSeqNum, newSeqNo);
-        verifyCommit(times);
+        verifyCommit(commitTimes);
     }
 
     private void verifyClaim()
@@ -695,7 +842,7 @@ public class ReplayerTest extends AbstractLogTest
     {
         final String message = resultAsciiBuffer.getAscii(afterOffset, resultAsciiBuffer.capacity() - afterOffset);
         final Matcher matcher = Pattern.compile("10=\\d+\001").matcher(message);
-        assertTrue(message, matcher.find());
+        assertTrue(matcher.find(), message);
     }
 
     private void hasNotOverwrittenSeperatorChar()
@@ -723,10 +870,10 @@ public class ReplayerTest extends AbstractLogTest
                 RejectReason.decode(sequenceReset.rejectReason()));
         }
 
-        assertTrue(message, sequenceReset.gapFillFlag());
-        assertEquals(message, msgSeqNum, header.msgSeqNum());
+        assertTrue(sequenceReset.gapFillFlag(), message);
+        assertEquals(msgSeqNum, header.msgSeqNum(), message);
         assertEquals(newSeqNo, sequenceReset.newSeqNo());
-        assertTrue(message, header.possDupFlag());
+        assertTrue(header.possDupFlag(), message);
     }
 
     private void setupMessage(final int length)
@@ -743,8 +890,8 @@ public class ReplayerTest extends AbstractLogTest
             eq(SEQUENCE_INDEX),
             eq(endSeqNo),
             eq(SEQUENCE_INDEX),
-            any(),
             any());
+        verify(replayQuery).newReplayOperation(any(), any(), any());
     }
 
     private void assertResultBufferHasSetPossDupFlagAndSendingTimeUpdates()
@@ -761,25 +908,47 @@ public class ReplayerTest extends AbstractLogTest
 
     private void onRequestResendMessage(final long result, final int endSeqNo)
     {
-        onRequestResendMessageWithSession(result, Action.COMMIT, SESSION_ID, CONNECTION_ID, BEGIN_SEQ_NO, endSeqNo);
+        onRequestResendMessage(
+            result, endSeqNo, (int)ValidResendRequestEncoder.overriddenBeginSequenceNumberNullValue());
+    }
+
+    private void onRequestResendMessage(final long result, final int endSeqNo, final int overriddenBeginSeqNo)
+    {
+        onRequestResendMessageWithSession(
+            result, SESSION_ID, CONNECTION_ID, BEGIN_SEQ_NO, endSeqNo, overriddenBeginSeqNo);
     }
 
     private void onRequestResendMessageWithSession(
         final long result,
-        final Action expectedAction,
         final long sessionId,
         final long connectionId,
         final int beginSeqNo,
-        final int endSeqNo)
+        final int endSeqNo,
+        final int overriddenBeginSeqNo)
     {
         final int offset = Encoder.offset(result);
         final int length = Encoder.length(result);
 
         final MutableAsciiBuffer buffer = new MutableAsciiBuffer();
         buffer.wrap(this.buffer, offset, length);
-        final Action action = replayer.onResendRequest(
-            sessionId, connectionId, beginSeqNo, endSeqNo, SEQUENCE_INDEX, buffer);
-        assertEquals(expectedAction, action);
+
+        setupClaim(START_REPLAY_LENGTH);
+        replayer.onResendRequest(sessionId, connectionId, CORRELATION_ID,
+            beginSeqNo, endSeqNo, SEQUENCE_INDEX, overriddenBeginSeqNo, buffer);
+
+        if (sendsStartReplay)
+        {
+            replayer.doWork();
+            verifyStartReplyClaim();
+        }
+    }
+
+    private void verifyStartReplyClaim()
+    {
+        verify(publication, atLeastOnce()).tryClaim(eq(START_REPLAY_LENGTH), eq(claim));
+        verify(claim, atLeastOnce()).buffer();
+        verify(claim, atLeastOnce()).offset();
+        verify(claim, atLeastOnce()).commit();
     }
 
     private void bufferContainsMessage(final byte[] message)

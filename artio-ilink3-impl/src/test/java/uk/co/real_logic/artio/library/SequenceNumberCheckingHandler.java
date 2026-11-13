@@ -16,11 +16,15 @@
 package uk.co.real_logic.artio.library;
 
 import iLinkBinary.ExecutionReportStatus532Decoder;
+import io.aeron.logbuffer.ControlledFragmentHandler.Action;
 import org.agrona.DirectBuffer;
 import org.agrona.collections.LongArrayList;
 import uk.co.real_logic.artio.fixp.FixPConnection;
+import uk.co.real_logic.artio.fixp.FixPMessageHeader;
 import uk.co.real_logic.artio.ilink.ILink3ConnectionHandler;
 import uk.co.real_logic.artio.messages.DisconnectReason;
+
+import static io.aeron.logbuffer.ControlledFragmentHandler.Action.CONTINUE;
 
 public class SequenceNumberCheckingHandler implements ILink3ConnectionHandler
 {
@@ -29,14 +33,15 @@ public class SequenceNumberCheckingHandler implements ILink3ConnectionHandler
     private final LongArrayList uuids = new LongArrayList();
     private boolean retransmitTimedOut = false;
 
-    public void onBusinessMessage(
+    public Action onBusinessMessage(
         final FixPConnection connection,
         final int templateId,
         final DirectBuffer buffer,
         final int offset,
         final int blockLength,
         final int version,
-        final boolean possRetrans)
+        final boolean possRetrans,
+        final FixPMessageHeader messageHeader)
     {
         if (templateId == ExecutionReportStatus532Decoder.TEMPLATE_ID)
         {
@@ -47,6 +52,8 @@ public class SequenceNumberCheckingHandler implements ILink3ConnectionHandler
             sequenceNumbers.add(seqNum);
             uuids.add(uuid);
         }
+
+        return CONTINUE;
     }
 
     public LongArrayList sequenceNumbers()
@@ -59,20 +66,22 @@ public class SequenceNumberCheckingHandler implements ILink3ConnectionHandler
         return uuids;
     }
 
-    public void onNotApplied(
+    public Action onNotApplied(
         final FixPConnection connection,
         final long fromSequenceNumber,
         final long msgCount,
         final NotAppliedResponse response)
     {
+        return CONTINUE;
     }
 
-    public void onRetransmitReject(
+    public Action onRetransmitReject(
         final FixPConnection connection,
         final String reason,
         final long requestTimestamp,
         final int errorCodes)
     {
+        return CONTINUE;
     }
 
     public boolean retransmitTimedOut()
@@ -80,9 +89,11 @@ public class SequenceNumberCheckingHandler implements ILink3ConnectionHandler
         return retransmitTimedOut;
     }
 
-    public void onRetransmitTimeout(final FixPConnection connection)
+    public Action onRetransmitTimeout(final FixPConnection connection)
     {
         retransmitTimedOut = true;
+
+        return CONTINUE;
     }
 
     public void resetRetransmitTimedOut()
@@ -90,15 +101,18 @@ public class SequenceNumberCheckingHandler implements ILink3ConnectionHandler
         retransmitTimedOut = false;
     }
 
-    public void onSequence(final FixPConnection connection, final long nextSeqNo)
+    public Action onSequence(final FixPConnection connection, final long nextSeqNo)
     {
+        return CONTINUE;
     }
 
-    public void onError(final FixPConnection connection, final Exception ex)
+    public Action onError(final FixPConnection connection, final Exception ex)
     {
+        return CONTINUE;
     }
 
-    public void onDisconnect(final FixPConnection connection, final DisconnectReason reason)
+    public Action onDisconnect(final FixPConnection connection, final DisconnectReason reason)
     {
+        return CONTINUE;
     }
 }

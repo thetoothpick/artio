@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,9 +26,10 @@ public class MessageDumper
         final JsonPrinter dumper, final DirectBuffer buffer, final int offset, final int length)
     {
         final ByteBuffer byteBuffer = buffer.byteBuffer();
+        final int bufferOffset = buffer.wrapAdjustment() + offset;
         final int originalPosition = byteBuffer.position();
         final int originalLimit = byteBuffer.limit();
-        byteBuffer.limit(length + offset).position(offset);
+        byteBuffer.limit(length + bufferOffset).position(bufferOffset);
         final ByteBuffer slice = byteBuffer.slice();
         byteBuffer.limit(originalLimit).position(originalPosition);
 

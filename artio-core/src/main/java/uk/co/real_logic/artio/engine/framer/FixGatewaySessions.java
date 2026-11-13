@@ -22,14 +22,13 @@ import org.agrona.concurrent.EpochNanoClock;
 import org.agrona.concurrent.status.AtomicCounter;
 import uk.co.real_logic.artio.DebugLogger;
 import uk.co.real_logic.artio.FixCounters;
+import uk.co.real_logic.artio.Pressure;
 import uk.co.real_logic.artio.builder.Encoder;
 import uk.co.real_logic.artio.builder.SessionHeaderEncoder;
 import uk.co.real_logic.artio.decoder.AbstractLogonDecoder;
 import uk.co.real_logic.artio.decoder.SessionHeaderDecoder;
 import uk.co.real_logic.artio.dictionary.FixDictionary;
-import uk.co.real_logic.artio.engine.ByteBufferUtil;
 import uk.co.real_logic.artio.engine.EngineConfiguration;
-import uk.co.real_logic.artio.engine.FixEngine;
 import uk.co.real_logic.artio.engine.HeaderSetup;
 import uk.co.real_logic.artio.engine.logger.SequenceNumberIndexReader;
 import uk.co.real_logic.artio.fields.EpochFractionFormat;
@@ -37,6 +36,7 @@ import uk.co.real_logic.artio.fields.UtcTimestampEncoder;
 import uk.co.real_logic.artio.library.OnMessageInfo;
 import uk.co.real_logic.artio.messages.CancelOnDisconnectOption;
 import uk.co.real_logic.artio.messages.DisconnectReason;
+import uk.co.real_logic.artio.messages.MessageStatus;
 import uk.co.real_logic.artio.messages.SessionState;
 import uk.co.real_logic.artio.protocol.GatewayPublication;
 import uk.co.real_logic.artio.session.*;
@@ -54,6 +54,8 @@ import java.util.function.Function;
 
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static uk.co.real_logic.artio.LogTag.FIX_CONNECTION;
+import static uk.co.real_logic.artio.LogTag.FIX_MESSAGE;
+import static uk.co.real_logic.artio.engine.FixEngine.ENGINE_LIBRARY_ID;
 import static uk.co.real_logic.artio.engine.SessionInfo.UNK_SESSION;
 import static uk.co.real_logic.artio.engine.framer.FixContexts.DUPLICATE_SESSION;
 import static uk.co.real_logic.artio.engine.framer.FixContexts.UNKNOWN_SESSION;
@@ -64,6 +66,7 @@ public class FixGatewaySessions extends GatewaySessions
     private final Map<FixDictionary, UserRequestExtractor> dictionaryToUserRequestExtractor = new HashMap<>();
     private final Function<FixDictionary, UserRequestExtractor> newUserRequestExtractor =
         dictionary -> new UserRequestExtractor(dictionary, errorHandler);
+    private final InternalSession.Formatters formatters = new InternalSession.Formatters();
 
     private final EpochFractionClock epochFractionClock;
     private final SessionIdStrategy sessionIdStrategy;
@@ -82,6 +85,12 @@ public class FixGatewaySessions extends GatewaySessions
     private final EpochNanoClock clock;
     private final EpochFractionFormat epochFractionPrecision;
     private final UtcTimestampEncoder sendingTimeEncoder;
+    private final ResendRequestController resendRequestController;
+    private final int forcedHeartbeatIntervalInS;
+    private final boolean disableHeartbeatRepliesToTestRequests;
+    private final boolean isReproductionEnabled;
+    private final CancelOnDisconnectOption cancelOnDisconnectOption;
+    private final int cancelOnDisconnectTimeoutWindowInMs;
 
     // Initialised after logon processed.
     private SessionContext sessionContext;
@@ -118,6 +127,7 @@ public class FixGatewaySessions extends GatewaySessions
         this.sendingTimeWindowInMs = configuration.sendingTimeWindowInMs();
         this.reasonableTransmissionTimeInMs = configuration.reasonableTransmissionTimeInMs();
         this.logAllMessages = configuration.logAllMessages();
+        this.isReproductionEnabled = configuration.isReproductionEnabled();
         this.validateCompIdsOnEveryMessage = configuration.validateCompIdsOnEveryMessage();
         this.validateTimeStrictly = configuration.validateTimeStrictly();
         this.clock = configuration.epochNanoClock();
@@ -126,10 +136,14 @@ public class FixGatewaySessions extends GatewaySessions
         this.epochFractionPrecision = epochFractionPrecision;
         this.epochFractionClock = EpochFractionClocks.create(epochClock, configuration.epochNanoClock(),
             epochFractionPrecision);
+        this.resendRequestController = configuration.resendRequestController();
+        this.forcedHeartbeatIntervalInS = configuration.forcedHeartbeatIntervalInS();
+        this.disableHeartbeatRepliesToTestRequests = configuration.disableHeartbeatRepliesToTestRequests();
+        this.cancelOnDisconnectOption = configuration.cancelOnDisconnectOption();
+        this.cancelOnDisconnectTimeoutWindowInMs = configuration.cancelOnDisconnectTimeoutWindowInMs();
 
         sendingTimeEncoder = new UtcTimestampEncoder(epochFractionPrecision);
     }
-
 
     void acquire(
         final FixGatewaySession gatewaySession,
@@ -139,12 +153,12 @@ public class FixGatewaySessions extends GatewaySessions
         final int lastSentSequenceNumber,
         final int lastReceivedSequenceNumber,
         final String username,
-        final String password,
-        final BlockablePosition engineBlockablePosition)
+        final String password)
     {
+        final long sessionId = gatewaySession.sessionId();
         final long connectionId = gatewaySession.connectionId();
-        final AtomicCounter receivedMsgSeqNo = fixCounters.receivedMsgSeqNo(connectionId);
-        final AtomicCounter sentMsgSeqNo = fixCounters.sentMsgSeqNo(connectionId);
+        final AtomicCounter receivedMsgSeqNo = fixCounters.receivedMsgSeqNo(connectionId, sessionId);
+        final AtomicCounter sentMsgSeqNo = fixCounters.sentMsgSeqNo(connectionId, sessionId);
         final MutableAsciiBuffer asciiBuffer = new MutableAsciiBuffer(new byte[sessionBufferSize]);
         final OnMessageInfo messageInfo = new OnMessageInfo();
 
@@ -155,7 +169,7 @@ public class FixGatewaySessions extends GatewaySessions
             customisationStrategy,
             clock,
             connectionId,
-            FixEngine.ENGINE_LIBRARY_ID,
+            ENGINE_LIBRARY_ID,
             errorHandler,
             epochFractionPrecision);
 
@@ -164,6 +178,7 @@ public class FixGatewaySessions extends GatewaySessions
             connectionId,
             clock,
             state,
+            false,
             proxy,
             inboundPublication,
             outboundPublication,
@@ -171,7 +186,7 @@ public class FixGatewaySessions extends GatewaySessions
             sendingTimeWindowInMs,
             receivedMsgSeqNo,
             sentMsgSeqNo,
-            FixEngine.ENGINE_LIBRARY_ID,
+            ENGINE_LIBRARY_ID,
             lastSentSequenceNumber + 1,
             // This gets set by the receiver end point once the logon message has been received.
             0,
@@ -181,12 +196,19 @@ public class FixGatewaySessions extends GatewaySessions
             customisationStrategy,
             messageInfo,
             epochFractionClock,
-            gatewaySession.connectionType());
+            gatewaySession.connectionType(),
+            resendRequestController,
+            forcedHeartbeatIntervalInS,
+            disableHeartbeatRepliesToTestRequests,
+            true,
+            formatters);
 
         session.awaitingResend(awaitingResend);
         session.closedResendInterval(gatewaySession.closedResendInterval());
         session.resendRequestChunkSize(gatewaySession.resendRequestChunkSize());
         session.sendRedundantResendRequests(gatewaySession.sendRedundantResendRequests());
+        session.cancelOnDisconnectOption(gatewaySession.cancelOnDisconnectOption());
+        session.cancelOnDisconnectTimeoutWindowInNs(gatewaySession.cancelOnDisconnectTimeoutWindowInNs());
 
         final SessionParser sessionParser = new SessionParser(
             session,
@@ -201,7 +223,7 @@ public class FixGatewaySessions extends GatewaySessions
         {
             sessions.add(gatewaySession);
         }
-        gatewaySession.manage(sessionParser, session, engineBlockablePosition, proxy);
+        gatewaySession.manage(sessionParser, session, proxy);
 
         if (DebugLogger.isEnabled(FIX_CONNECTION))
         {
@@ -222,12 +244,15 @@ public class FixGatewaySessions extends GatewaySessions
         final FixGatewaySession gatewaySession,
         final TcpChannel channel,
         final FixDictionary fixDictionary,
-        final Framer framer)
+        final Framer framer,
+        final String remoteAddress,
+        final FixReceiverEndPoint fixReceiverEndPoint)
     {
         gatewaySession.startAuthentication(epochClock.time());
 
         return new FixPendingAcceptorLogon(
-            sessionIdStrategy, gatewaySession, logon, connectionId, fixContexts, channel, fixDictionary, framer);
+            sessionIdStrategy, gatewaySession, logon, connectionId, fixContexts, channel, fixDictionary, framer,
+            remoteAddress, fixReceiverEndPoint, cancelOnDisconnectOption, cancelOnDisconnectTimeoutWindowInMs);
     }
 
     void onUserRequest(
@@ -252,6 +277,7 @@ public class FixGatewaySessions extends GatewaySessions
             reason);
     }
 
+    @Override
     protected void setLastSequenceResetTime(final GatewaySession session)
     {
         ((FixGatewaySession)session).lastSequenceResetTime(sessionContext.lastSequenceResetTime());
@@ -265,11 +291,15 @@ public class FixGatewaySessions extends GatewaySessions
         private final FixGatewaySession session;
         private final AbstractLogonDecoder logon;
         private final FixContexts fixContexts;
-        private FixDictionary fixDictionary;
+        private final String remoteAddress;
         private final boolean resetSeqNum;
+        private final CancelOnDisconnectOption cancelOnDisconnectOption;
+        private final int cancelOnDisconnectTimeoutWindowInMs;
 
+        private FixDictionary fixDictionary;
         private Encoder encoder;
         private Class<? extends FixDictionary> fixDictionaryClass;
+        private long rejectEncodeResult;
 
         FixPendingAcceptorLogon(
             final SessionIdStrategy sessionIdStrategy,
@@ -279,15 +309,22 @@ public class FixGatewaySessions extends GatewaySessions
             final FixContexts fixContexts,
             final TcpChannel channel,
             final FixDictionary fixDictionary,
-            final Framer framer)
+            final Framer framer,
+            final String remoteAddress,
+            final FixReceiverEndPoint fixReceiverEndPoint,
+            final CancelOnDisconnectOption cancelOnDisconnectOption,
+            final int cancelOnDisconnectTimeoutWindowInMs)
         {
-            super(gatewaySession, connectionId, channel, framer);
+            super(gatewaySession, connectionId, channel, framer, fixReceiverEndPoint);
 
             this.sessionIdStrategy = sessionIdStrategy;
             this.session = gatewaySession;
             this.logon = logon;
             this.fixContexts = fixContexts;
             this.fixDictionary = fixDictionary;
+            this.remoteAddress = remoteAddress;
+            this.cancelOnDisconnectOption = cancelOnDisconnectOption;
+            this.cancelOnDisconnectTimeoutWindowInMs = cancelOnDisconnectTimeoutWindowInMs;
 
             final PersistenceLevel persistenceLevel = getPersistenceLevel(logon, connectionId);
             final boolean resetSeqNumFlag = logon.hasResetSeqNumFlag() && logon.resetSeqNumFlag();
@@ -295,11 +332,11 @@ public class FixGatewaySessions extends GatewaySessions
             final boolean resetSequenceNumbersUponLogon = resetSequenceNumbersUponLogon(persistenceLevel);
             resetSeqNum = resetSequenceNumbersUponLogon || resetSeqNumFlag;
 
-            if (!resetSequenceNumbersUponLogon && !logAllMessages)
+            if (!resetSequenceNumbersUponLogon && (!logAllMessages && !isReproductionEnabled))
             {
                 onError(new IllegalStateException(
                     "Persistence Strategy specified INDEXED but " +
-                    "EngineConfiguration has disabled required logging of messsages"));
+                    "EngineConfiguration has disabled required logging of messages"));
 
                 reject(DisconnectReason.INVALID_CONFIGURATION_NOT_LOGGING_MESSAGES);
                 return;
@@ -339,14 +376,16 @@ public class FixGatewaySessions extends GatewaySessions
             }
         }
 
+        @Override
         public void accept(final Class<? extends FixDictionary> fixDictionaryClass)
         {
             validateState();
 
             this.fixDictionaryClass = fixDictionaryClass;
-            state = AuthenticationState.AUTHENTICATED;
+            setState(AuthenticationState.AUTHENTICATED);
         }
 
+        @Override
         protected void onAuthenticated()
         {
             if (fixDictionaryClass != null && fixDictionary.getClass() != fixDictionaryClass)
@@ -357,9 +396,10 @@ public class FixGatewaySessions extends GatewaySessions
 
             final String username = SessionParser.username(logon);
             final String password = SessionParser.password(logon);
-            final CancelOnDisconnectOption cancelOnDisconnectOption = SessionParser.cancelOnDisconnectType(logon);
-            final long cancelOnDisconnectTimeoutWindowInNs =
-                MILLISECONDS.toNanos(SessionParser.cancelOnDisconnectTimeoutWindow(logon));
+            final CancelOnDisconnectOption cancelOnDisconnectOptionLocal = SessionParser.cancelOnDisconnectType(
+                logon, cancelOnDisconnectOption);
+            final long cancelOnDisconnectTimeoutWindowInNs = MILLISECONDS.toNanos(
+                SessionParser.cancelOnDisconnectTimeoutWindow(logon, cancelOnDisconnectTimeoutWindowInMs));
 
             final SessionHeaderDecoder header = logon.header();
             final CompositeKey compositeKey;
@@ -381,10 +421,10 @@ public class FixGatewaySessions extends GatewaySessions
                 return;
             }
 
-            final boolean isOfflineReconnect = framer.onLogonMessageReceived(session, sessionContext.sessionId());
+            final boolean isOfflineReconnect = framer.onFixLogonMessageReceived(session, sessionContext.sessionId());
 
-            final long logonTime = clock.nanoTime();
-            sessionContext.onLogon(resetSeqNum, logonTime, fixDictionary);
+            final long logonTimeInNs = clock.nanoTime();
+            sessionContext.onLogon(resetSeqNum, logonTimeInNs, fixDictionary);
             session.initialResetSeqNum(resetSeqNum);
             session.fixDictionary(fixDictionary);
             session.updateSessionDictionary();
@@ -396,26 +436,27 @@ public class FixGatewaySessions extends GatewaySessions
                 password,
                 logon.heartBtInt(),
                 header.msgSeqNum(),
-                cancelOnDisconnectOption,
+                cancelOnDisconnectOptionLocal,
                 cancelOnDisconnectTimeoutWindowInNs);
-            session.lastLogonTime(logonTime);
+            session.lastLogonTime(logonTimeInNs);
 
             // See Framer.handoverNewConnectionToLibrary for sole library mode equivalent
             if (resetSeqNum)
             {
                 session.acceptorSequenceNumbers(UNK_SESSION, UNK_SESSION);
                 session.lastLogonWasSequenceReset();
-                state = AuthenticationState.ACCEPTED;
+                setState(AuthenticationState.ACCEPTED);
             }
             else
             {
                 requiredPosition = outboundPublication.position();
-                state = AuthenticationState.INDEXER_CATCHUP;
+                setState(AuthenticationState.INDEXER_CATCHUP);
             }
 
             framer.onGatewaySessionSetup(session, isOfflineReconnect);
         }
 
+        @Override
         public void reject(final Encoder encoder, final long lingerTimeoutInMs)
         {
             Objects.requireNonNull(encoder, "encoder should be provided");
@@ -429,14 +470,17 @@ public class FixGatewaySessions extends GatewaySessions
             this.encoder = encoder;
             this.reason = DisconnectReason.FAILED_AUTHENTICATION;
             this.lingerTimeoutInMs = lingerTimeoutInMs;
-            this.state = AuthenticationState.SENDING_REJECT_MESSAGE;
+            setState(AuthenticationState.SAVING_REJECTED_LOGON_WITH_REPLY);
         }
 
+        @Override
         protected void encodeRejectMessage()
         {
-            rejectEncodeBuffer = ByteBuffer.allocateDirect(ENCODE_BUFFER_SIZE);
-
-            final MutableAsciiBuffer asciiBuffer = new MutableAsciiBuffer(rejectEncodeBuffer);
+            if (rejectEncodeBuffer == null)
+            {
+                rejectEncodeBuffer = ByteBuffer.allocate(ENCODE_BUFFER_SIZE);
+                rejectAsciiBuffer = new MutableAsciiBuffer(rejectEncodeBuffer);
+            }
 
             final SessionHeaderEncoder header = encoder.header();
             header.msgSeqNum(1);
@@ -445,19 +489,49 @@ public class FixGatewaySessions extends GatewaySessions
             HeaderSetup.setup(logon.header(), header);
             customisationStrategy.configureHeader(header, UNKNOWN_SESSION.sessionId());
 
-            final long result = encoder.encode(asciiBuffer, 0);
-            final int offset = Encoder.offset(result);
-            final int length = Encoder.length(result);
-
-            ByteBufferUtil.position(rejectEncodeBuffer, offset);
-            ByteBufferUtil.limit(rejectEncodeBuffer, offset + length);
+            rejectEncodeResult = encoder.encode(rejectAsciiBuffer, 0);
         }
 
+        @Override
+        protected SendRejectResult sendReject()
+        {
+            final int offset = Encoder.offset(rejectEncodeResult);
+            final int length = Encoder.length(rejectEncodeResult);
+
+            final long messageType = encoder.messageType();
+            final long position = outboundPublication.saveMessage(
+                rejectAsciiBuffer,
+                offset,
+                length,
+                ENGINE_LIBRARY_ID,
+                messageType,
+                Session.UNKNOWN,
+                0,
+                connectionId,
+                MessageStatus.OK,
+                1);
+
+            final boolean backPressured = Pressure.isBackPressured(position);
+            if (!backPressured)
+            {
+                DebugLogger.logFixMessage(
+                    FIX_MESSAGE, messageType, "Auth Reject Reply: ", rejectAsciiBuffer, offset, length);
+            }
+            return backPressured ? SendRejectResult.BACK_PRESSURED : SendRejectResult.INFLIGHT;
+        }
+
+        @Override
         public void reject()
         {
             validateState();
 
             reject(DisconnectReason.FAILED_AUTHENTICATION);
+        }
+
+        @Override
+        public String remoteAddress()
+        {
+            return remoteAddress;
         }
     }
 }

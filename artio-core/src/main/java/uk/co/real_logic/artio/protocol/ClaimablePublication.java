@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -78,6 +78,11 @@ public class ClaimablePublication implements AutoCloseable
                 idleStrategy.idle();
             }
 
+            if (position == CLOSED || position == MAX_POSITION_EXCEEDED)
+            {
+                throw new NotConnectedException(position);
+            }
+
             fails.increment();
             i++;
         }
@@ -85,14 +90,7 @@ public class ClaimablePublication implements AutoCloseable
 
         idleStrategy.reset();
 
-        if (position == CLOSED || position == MAX_POSITION_EXCEEDED)
-        {
-            throw new NotConnectedException(position);
-        }
-        else
-        {
-            return position;
-        }
+        return position;
     }
 
     public long offer(final DirectBuffer buffer, final int offset, final int length)
@@ -118,6 +116,7 @@ public class ClaimablePublication implements AutoCloseable
         return initialPosition;
     }
 
+    @Override
     public void close()
     {
         dataPublication.close();

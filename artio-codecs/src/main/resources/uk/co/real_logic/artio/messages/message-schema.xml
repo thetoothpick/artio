@@ -2,7 +2,7 @@
 <sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe"
                    package="uk.co.real_logic.artio.messages"
                    id="666"
-                   version="17"
+                   version="27"
                    semanticVersion="0.2"
                    description="Internal messaging format used by the FIX Gateway"
                    byteOrder="littleEndian">
@@ -124,6 +124,12 @@
                         description="Disconnected due to an explicit administrative API operation from a user" sinceVersion="15">21</validValue>
             <validValue name="MISSING_LOGON_COMP_ID"
                         description="Disconnected due to a sender or target comp id field missing from the Logon message" sinceVersion="15">22</validValue>
+            <validValue name="CALLBACK_EXCEPTION"
+                        description="Disconnected due to an exception being thrown by a callback from application code. Exception will be passed to the application's ErrorHandler unless it is in response to an initiate() call in which case it will be given to the reply." sinceVersion="19">23</validValue>
+            <validValue name="REPLAY_BACK_PRESSURE_DISCONNECT"
+                        description="We disconnected because an inbound message timeout whilst a replay was going on">24</validValue>
+            <validValue name="FIX_HEARTBEAT_TIMEOUT"
+                        description="Regular Fix heartbeat timeout">25</validValue>
         </enum>
         <enum name="SessionState" encodingType="uint8">
             <validValue name="CONNECTING"
@@ -143,9 +149,12 @@
             <validValue name="DISCONNECTING"
                         description="Session is trying to disconnect, will retry disconnecting until not backpressured">8</validValue>
             <validValue name="DISCONNECTED"
-                        description="Session has been disconnected and can't send messages.">9</validValue>
+                        description="Session has been disconnected.">9</validValue>
             <validValue name="DISABLED"
                         description="DISCONNECTED and unable to reconnect.">10</validValue>
+            <validValue name="AWAITING_ASYNC_PROXY_LOGOUT"
+                        description="Logout has been sent on an async SessionProxy, the session is waiting for it to be written via a SessionWriter."
+                        sinceVersion="21">11</validValue>
         </enum>
         <enum name="SequenceNumberType" encodingType="uint8">
             <validValue name="TRANSIENT">0</validValue>
@@ -316,6 +325,7 @@
                  description="">
         <field name="libraryId" id="1" type="LibraryId"/>
         <field name="correlationId" id="2" type="CorrelationId"/>
+        <field name="protocolType" id="4" type="FixPProtocolType" sinceVersion="20"/>
         <data name="header" id="3" type="AsciiString"/>
     </sbe:message>
 
@@ -378,6 +388,14 @@
         <field name="throttleLimitOfMessages" id="5" type="int32" />
     </sbe:message>
 
+    <sbe:message name="SeqIndexSync" id="74"
+         description="Notify the engine of an update to the sequence index that only gets written on the outbound stream"
+         sinceVersion="18">
+        <field name="libraryId" id="1" type="LibraryId"/>
+        <field name="sessionId" id="2" type="FixSessionId"/>
+        <field name="sequenceIndex" id="3" type="SequenceIndex" />
+    </sbe:message>
+
     <!-- Messages From Engine To Library -->
     <sbe:message name="Disconnect" id="7" description="A connection has disconnected">
         <field name="libraryId" id="1" type="LibraryId"/>
@@ -387,6 +405,7 @@
 
     <sbe:message name="Connect" id="33" description="We have accepted an inbound TCP Connection">
         <field name="connection" id="1" type="ConnectionId"/>
+        <field name="timestamp" id="3" type="Timestamp"  sinceVersion="25"/>
         <data name="address" id="2" type="Utf8String"/>
     </sbe:message>
 
@@ -471,12 +490,18 @@
         <group name="sessions" id="2" dimensionType="groupSizeEncoding">
             <field name="sessionId" id="10" type="FixSessionId"/>
         </group>
+        <group name="disconnectedSessions" id="4" dimensionType="groupSizeEncoding">
+            <field name="sessionId" id="10" type="FixSessionId"/>
+        </group>
     </sbe:message>
 
     <sbe:message name="LibraryTimeout" id="40"
                  description="notifies library instances that they have been timed out, added for monitoring purposes">
         <field name="libraryId" id="1" type="LibraryId"/>
         <field name="connectCorrelationId" id="2" type="CorrelationId"/>
+        <group name="sessions" id="3" dimensionType="groupSizeEncoding" sinceVersion="26">
+            <field name="sessionId" id="4" type="FixSessionId"/>
+        </group>
     </sbe:message>
 
     <sbe:message name="FollowerSessionReply" id="48"
@@ -552,6 +577,7 @@
         <!-- BinaryEntrypoint: sessionVerId -->
         <field name="lastConnectPayload" id="8" type="uint64"/>
         <field name="messageLength" id="9" type="uint16"/>
+        <field name="offline" id="10" type="Bool"/>
         <!-- then the first message sent -->
     </sbe:message>
 
@@ -591,6 +617,7 @@
         <field name="sequenceIndex" id="8" type="SequenceIndex" />
         <field name="metaDataUpdateOffset" id="13" type="int32" />
         <!-- only visible outbound -->
+        <!-- This is set to 0 for resent messages, except for the last message in a replay where it's the seqnum -->
         <field name="sequenceNumber" id="9" type="int32" />
         <field name="messageType" id="11" type="MessageType" presence="optional" sinceVersion="3"/>
         <data name="metaData" id="12" type="Utf8String"  sinceVersion="6"/>
@@ -601,6 +628,7 @@
                  description="A heartbeat message sent within the application protocol">
         <field name="libraryId" id="1" type="LibraryId"/>
         <field name="connectCorrelationId" id="2" type="CorrelationId"/>
+        <field name="timestampInNs" id="3" type="Timestamp" sinceVersion="22"/>
     </sbe:message>
 
     <sbe:message name="ResetSequenceNumber" id="42"
@@ -624,7 +652,9 @@
     <sbe:message name="ReplayComplete" id="45"
                  description="Replayer tells SenderEndPoint that the current replay is complete">
         <field name="connection" id="1" type="ConnectionId"/>
-        <field name="libraryId" id="2" type="LibraryId" sinceVersion="9"/>
+        <field name="libraryId" id="2" type="LibraryId" sinceVersion="9"
+           description="Set when going from Framer to Library, but not from Replayer to Framer"/>
+        <field name="correlationId" id="3" type="CorrelationId" sinceVersion="23" />
     </sbe:message>
 
     <sbe:message name="FixPMessage" id="58" description="FIXP Message Header"
@@ -649,12 +679,20 @@
         <field name="beginSequenceNumber" id="3" type="uint32"/>
         <field name="endSequenceNumber" id="4" type="uint32"/>
         <field name="SequenceIndex" id="5" type="int32"/>
+        <field name="correlationId" id="7" type="CorrelationId" sinceVersion="23"/>
+        <field name="overriddenBeginSequenceNumber" id="8" type="uint32" sinceVersion="27"/>
         <data name="body" id="6" type="AsciiString"/>
     </sbe:message>
 
     <!-- Replay Stream Only messages -->
     <sbe:message name="ReplayerTimestamp" id="61" description="" sinceVersion="13">
         <field name="timestamp" id="0" type="Timestamp"/>
+    </sbe:message>
+
+    <sbe:message name="StartReplay" id="75" description="" sinceVersion="23">
+        <field name="session" id="1" type="FixSessionId"/>
+        <field name="connection" id="2" type="ConnectionId"/>
+        <field name="correlationId" id="3" type="CorrelationId"/>
     </sbe:message>
 
     <!-- Admin Stream Only messages -->

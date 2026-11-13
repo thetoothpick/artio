@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,35 +15,24 @@
  */
 package uk.co.real_logic.artio.fields;
 
-import org.junit.Test;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
-import org.junit.runners.Parameterized.Parameters;
+import java.util.stream.Stream;
 
-import static org.junit.Assert.assertEquals;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 
-@RunWith(Parameterized.class)
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
 public class DecimalFloatToStringTest
 {
-    @Parameters(name = "{index}: {1},{2} => {0}")
-    public static Iterable<Object[]> data1()
+    public static Stream<Arguments> data1()
     {
         return DecimalFloatEncodingTest.decimalFloatCodecData();
     }
 
-    private final String input;
-    private final long value;
-    private final int scale;
-
-    public DecimalFloatToStringTest(final String input, final long value, final int scale)
-    {
-        this.input = input;
-        this.value = value;
-        this.scale = scale;
-    }
-
-    @Test
-    public void canEncodeDecimalFloat()
+    @ParameterizedTest
+    @MethodSource(value = "data1")
+    public void canEncodeDecimalFloat(final String input, final long value, final int scale)
     {
         final DecimalFloat price = new DecimalFloat(value, scale);
 

@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 package uk.co.real_logic.artio.dictionary.generation;
 
 import org.agrona.generation.OutputManager;
+import uk.co.real_logic.artio.dictionary.Generated;
 import uk.co.real_logic.artio.dictionary.ir.Dictionary;
 import uk.co.real_logic.artio.dictionary.ir.Message;
 import uk.co.real_logic.artio.util.AsciiBuffer;
@@ -24,6 +25,7 @@ import java.io.IOException;
 import java.io.Writer;
 
 import static uk.co.real_logic.artio.dictionary.generation.DecoderGenerator.decoderClassName;
+import static uk.co.real_logic.artio.dictionary.generation.GenerationUtil.GENERATED_ANNOTATION;
 import static uk.co.real_logic.artio.dictionary.generation.GenerationUtil.fileHeader;
 import static uk.co.real_logic.artio.dictionary.generation.GenerationUtil.importFor;
 import static uk.co.real_logic.sbe.generation.java.JavaUtil.formatPropertyName;
@@ -51,9 +53,12 @@ class AcceptorGenerator
 
     public void generate()
     {
-        generateAcceptor();
-        generateDefaultAcceptor();
-        generateDecoder();
+        if (!dictionary.shared())
+        {
+            generateAcceptor();
+            generateDefaultAcceptor();
+            generateDecoder();
+        }
     }
 
     private void generateAcceptor()
@@ -99,7 +104,7 @@ class AcceptorGenerator
     {
         acceptorOutput.append(String.format(
             "    @Override\n" +
-            "    public void on%1$s(final %2$s decoder) {};\n\n",
+            "    public void on%1$s(final %2$s decoder) {}\n\n",
             message.name(),
             decoderClassName(message)
         ));
@@ -120,8 +125,10 @@ class AcceptorGenerator
     private void generateAcceptorClass(final Writer acceptorOutput) throws IOException
     {
         acceptorOutput.append(fileHeader(packageName));
+        acceptorOutput.append(importFor(Generated.class));
         acceptorOutput.append(
             "\n" +
+            GENERATED_ANNOTATION +
             "public interface " + DICTIONARY_ACCEPTOR + "\n" +
             "{\n"
         );
@@ -130,8 +137,10 @@ class AcceptorGenerator
     private void generateDefaultAcceptorClass(final Writer acceptorOutput) throws IOException
     {
         acceptorOutput.append(fileHeader(packageName));
+        acceptorOutput.append(importFor(Generated.class));
         acceptorOutput.append(
             "\n" +
+            GENERATED_ANNOTATION +
             "public class " + DEFAULT_DICTIONARY_ACCEPTOR + " implements " + DICTIONARY_ACCEPTOR + "\n" +
             "{\n"
         );
@@ -192,10 +201,10 @@ class AcceptorGenerator
     {
         decoderOutput.append(String.format(
             "        %1$sif (messageType == %2$s.MESSAGE_TYPE)\n" +
-            "        {" +
+            "        {\n" +
+            "            %3$s.reset();\n" +
             "            %3$s.decode(buffer, offset, length);\n" +
             "            acceptor.on%4$s(%3$s);\n" +
-            "            %3$s.reset();\n" +
             "        }\n\n",
             index == 0 ? "" : "else ",
             decoderClassName(message),
@@ -217,8 +226,10 @@ class AcceptorGenerator
     {
         decoderOutput.append(fileHeader(packageName));
         decoderOutput.append(importFor(AsciiBuffer.class));
+        decoderOutput.append(importFor(Generated.class));
         decoderOutput.append(
             "\n" +
+            GENERATED_ANNOTATION +
             "public final class " + DICTIONARY_DECODER + "\n" +
             "{\n\n" +
             "    private final " + DICTIONARY_ACCEPTOR + " acceptor;\n\n");

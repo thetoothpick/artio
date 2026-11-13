@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -37,12 +37,15 @@ import static org.agrona.concurrent.AgentRunner.startOnThread;
 public class LowResourceEngineScheduler implements EngineScheduler
 {
     private AgentRunner runner;
+    private ErrorHandler errorHandler;
+    private Agent framer;
     private RecordingCoordinator recordingCoordinator;
 
     public LowResourceEngineScheduler()
     {
     }
 
+    @Override
     public void launch(
         final EngineConfiguration configuration,
         final ErrorHandler errorHandler,
@@ -52,6 +55,8 @@ public class LowResourceEngineScheduler implements EngineScheduler
         final Agent conductorAgent,
         final RecordingCoordinator recordingCoordinator)
     {
+        this.errorHandler = errorHandler;
+        this.framer = framer;
         this.recordingCoordinator = recordingCoordinator;
 
         if (runner != null)
@@ -73,6 +78,7 @@ public class LowResourceEngineScheduler implements EngineScheduler
         startOnThread(runner, configuration.threadFactory());
     }
 
+    @Override
     public void close()
     {
         EngineScheduler.awaitRunnerStart(runner);
@@ -80,6 +86,33 @@ public class LowResourceEngineScheduler implements EngineScheduler
         CloseHelper.close(runner);
     }
 
+    @Override
+    public int pollFramer()
+    {
+        if (framer != null)
+        {
+            try
+            {
+                return framer.doWork();
+            }
+            catch (final Throwable e)
+            {
+                if (errorHandler != null)
+                {
+                    errorHandler.onError(e);
+                }
+                else
+                {
+                    // Should never happen, but best to be defensive
+                    e.printStackTrace();
+                }
+            }
+        }
+
+        return 0;
+    }
+
+    @Override
     public void configure(final Aeron.Context aeronContext)
     {
         aeronContext.useConductorAgentInvoker(true);
@@ -88,7 +121,7 @@ public class LowResourceEngineScheduler implements EngineScheduler
     /**
      * Adapt a recording coordinator to the Agent interface to enable it to be shutdown in order.
      */
-    private class RecordingCoordinatorAgent implements Agent
+    private final class RecordingCoordinatorAgent implements Agent
     {
         @Override
         public int doWork()

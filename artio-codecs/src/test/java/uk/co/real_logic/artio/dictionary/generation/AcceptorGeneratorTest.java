@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,17 +16,18 @@
 package uk.co.real_logic.artio.dictionary.generation;
 
 import org.agrona.generation.StringWriterOutputManager;
-import org.junit.BeforeClass;
-import org.junit.Test;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
 import uk.co.real_logic.artio.util.AsciiBuffer;
 import uk.co.real_logic.artio.util.MutableAsciiBuffer;
 
 import java.lang.reflect.Proxy;
 import java.util.Map;
+import java.util.Objects;
 
 import static java.lang.reflect.Modifier.*;
 import static org.agrona.generation.CompilerUtil.compileInMemory;
-import static org.junit.Assert.*;
+import static org.junit.jupiter.api.Assertions.*;
 import static uk.co.real_logic.artio.dictionary.ExampleDictionary.*;
 import static uk.co.real_logic.artio.dictionary.generation.AcceptorGenerator.*;
 import static uk.co.real_logic.artio.dictionary.generation.Generator.RUNTIME_REJECT_UNKNOWN_ENUM_VALUE_PROPERTY;
@@ -35,16 +36,16 @@ public class AcceptorGeneratorTest
 {
     private static final StringWriterOutputManager OUTPUT_MANAGER = new StringWriterOutputManager();
     private static final ConstantGenerator CONSTANT_GENERATOR =
-        new ConstantGenerator(MESSAGE_EXAMPLE, TEST_PACKAGE, OUTPUT_MANAGER);
+        new ConstantGenerator(MESSAGE_EXAMPLE, TEST_PACKAGE, null, OUTPUT_MANAGER);
     private static final EnumGenerator ENUM_GENERATOR = new EnumGenerator(
         MESSAGE_EXAMPLE, TEST_PACKAGE, OUTPUT_MANAGER);
     private static final EncoderGenerator ENCODER_GENERATOR = new EncoderGenerator(
         MESSAGE_EXAMPLE, TEST_PACKAGE, TEST_PARENT_PACKAGE, OUTPUT_MANAGER, ValidationOn.class,
-        RejectUnknownFieldOn.class, RejectUnknownEnumValueOn.class, RUNTIME_REJECT_UNKNOWN_ENUM_VALUE_PROPERTY);
+        RejectUnknownFieldOn.class, RejectUnknownEnumValueOn.class, RUNTIME_REJECT_UNKNOWN_ENUM_VALUE_PROPERTY, true);
     private static final DecoderGenerator DECODER_GENERATOR = new DecoderGenerator(
         MESSAGE_EXAMPLE, 1, TEST_PACKAGE, TEST_PARENT_PACKAGE, TEST_PACKAGE, OUTPUT_MANAGER, ValidationOn.class,
-        RejectUnknownFieldOff.class, RejectUnknownEnumValueOn.class, false,
-        Generator.RUNTIME_REJECT_UNKNOWN_ENUM_VALUE_PROPERTY);
+        RejectUnknownFieldOff.class, RejectUnknownEnumValueOn.class, false, false, false,
+        Generator.RUNTIME_REJECT_UNKNOWN_ENUM_VALUE_PROPERTY, true, null);
     private static final AcceptorGenerator ACCEPTOR_GENERATOR = new AcceptorGenerator(
         MESSAGE_EXAMPLE, TEST_PACKAGE, OUTPUT_MANAGER);
     private static Class<?> acceptor;
@@ -52,7 +53,7 @@ public class AcceptorGeneratorTest
 
     private final MutableAsciiBuffer buffer = new MutableAsciiBuffer(new byte[8 * 1024]);
 
-    @BeforeClass
+    @BeforeAll
     public static void generate() throws Exception
     {
         CONSTANT_GENERATOR.generate();
@@ -61,7 +62,10 @@ public class AcceptorGeneratorTest
         DECODER_GENERATOR.generate();
         ACCEPTOR_GENERATOR.generate();
         final Map<String, CharSequence> sources = OUTPUT_MANAGER.getSources();
+
         acceptor = compileInMemory(TEST_PACKAGE + "." + DICTIONARY_ACCEPTOR, sources);
+        Objects.requireNonNull(acceptor, "acceptor must not be null");
+
         decoder = acceptor.getClassLoader().loadClass(TEST_PACKAGE + "." + DICTIONARY_DECODER);
         if (acceptor == null || decoder == null)
         {
@@ -72,21 +76,21 @@ public class AcceptorGeneratorTest
     @Test
     public void shouldGenerateAcceptor()
     {
-        assertNotNull("Failed to generate acceptor", acceptor);
+        assertNotNull(acceptor, "Failed to generate acceptor");
 
         final int modifiers = acceptor.getModifiers();
-        assertTrue("Not public", isPublic(modifiers));
-        assertTrue("Not interface", isInterface(modifiers));
+        assertTrue(isPublic(modifiers), "Not public");
+        assertTrue(isInterface(modifiers), "Not interface");
     }
 
     @Test
     public void shouldGenerateDecoder()
     {
-        assertNotNull("Failed to generate decoder", decoder);
+        assertNotNull(decoder, "Failed to generate decoder");
 
         final int modifiers = decoder.getModifiers();
-        assertTrue("Not public", isPublic(modifiers));
-        assertFalse("Not instantiable", isAbstract(modifiers));
+        assertTrue(isPublic(modifiers), "Not public");
+        assertFalse(isAbstract(modifiers), "Not instantiable");
     }
 
     @Test
@@ -102,7 +106,7 @@ public class AcceptorGeneratorTest
                 assertEquals("onHeartbeat", method.getName());
 
                 final Object argument = args[0];
-                assertNotNull("Missing first argument", argument);
+                assertNotNull(argument, "Missing first argument");
                 assertEquals("HeartbeatDecoder", argument.getClass().getSimpleName());
 
                 return null;
@@ -113,7 +117,7 @@ public class AcceptorGeneratorTest
 
         onMessage(decoderInst);
 
-        assertTrue("Proxy not invoked", called[0]);
+        assertTrue(called[0], "Proxy not invoked");
     }
 
     private void onMessage(final Object inst) throws Exception

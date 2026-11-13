@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,12 +15,17 @@
  */
 package uk.co.real_logic.artio.system_tests;
 
+import org.agrona.DirectBuffer;
 import org.agrona.ErrorHandler;
 import org.agrona.concurrent.EpochNanoClock;
-import org.junit.Before;
-import org.junit.Test;
+import org.agrona.concurrent.UnsafeBuffer;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+
 import uk.co.real_logic.artio.*;
 import uk.co.real_logic.artio.builder.*;
+import uk.co.real_logic.artio.decoder.ResendRequestDecoder;
+import uk.co.real_logic.artio.decoder.SequenceResetDecoder;
 import uk.co.real_logic.artio.dictionary.FixDictionary;
 import uk.co.real_logic.artio.engine.EngineConfiguration;
 import uk.co.real_logic.artio.engine.FixEngine;
@@ -33,8 +38,10 @@ import uk.co.real_logic.artio.library.SessionAcquiredInfo;
 import uk.co.real_logic.artio.library.SessionHandler;
 import uk.co.real_logic.artio.messages.CancelOnDisconnectOption;
 import uk.co.real_logic.artio.messages.DisconnectReason;
+import uk.co.real_logic.artio.messages.SessionState;
 import uk.co.real_logic.artio.protocol.GatewayPublication;
 import uk.co.real_logic.artio.session.*;
+import uk.co.real_logic.artio.validation.SessionPersistenceStrategy;
 
 import java.util.List;
 
@@ -42,20 +49,24 @@ import static java.util.Arrays.asList;
 import static java.util.Objects.requireNonNull;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.greaterThan;
-import static org.junit.Assert.*;
+import static org.junit.jupiter.api.Assertions.*;
+import static uk.co.real_logic.artio.Constants.LOGOUT_MESSAGE_AS_STR;
 import static uk.co.real_logic.artio.Reply.State.COMPLETED;
 import static uk.co.real_logic.artio.TestFixtures.launchMediaDriver;
 import static uk.co.real_logic.artio.Timing.DEFAULT_TIMEOUT_IN_MS;
 import static uk.co.real_logic.artio.Timing.withTimeout;
+import static uk.co.real_logic.artio.library.SessionConfiguration.AUTOMATIC_INITIAL_SEQUENCE_NUMBER;
 import static uk.co.real_logic.artio.messages.InitialAcceptedSessionOwner.SOLE_LIBRARY;
 import static uk.co.real_logic.artio.system_tests.SystemTestUtil.*;
 
 public class ExternallyControlledSystemTest extends AbstractGatewayToGatewaySystemTest
 {
+    private boolean awaitsNewOrderSingle = false;
     private final FakeSessionProxy fakeSessionProxy = new FakeSessionProxy();
     private SessionWriter acceptingSessionWriter = null;
     private final FakeHandler acceptingHandler = new FakeHandler(acceptingOtfAcceptor)
     {
+        @Override
         public SessionHandler onSessionAcquired(final Session session, final SessionAcquiredInfo acquiredInfo)
         {
             acceptingSessionWriter = acceptingLibrary.sessionWriter(
@@ -69,17 +80,25 @@ public class ExternallyControlledSystemTest extends AbstractGatewayToGatewaySyst
 
     private int sessionProxyRequests = 0;
 
-    @Before
-    public void launch()
+    public void launch(final boolean withPersistenceStrategy)
     {
         mediaDriver = launchMediaDriver();
 
         final EngineConfiguration acceptingConfig = acceptingConfig(port, ACCEPTOR_ID, INITIATOR_ID, nanoClock);
         acceptingConfig.deleteLogFileDirOnStart(true);
         acceptingConfig.initialAcceptedSessionOwner(SOLE_LIBRARY);
+        acceptingConfig.sessionPersistenceStrategy(withPersistenceStrategy ?
+            SessionPersistenceStrategy.alwaysPersistent() : SessionPersistenceStrategy.alwaysTransient());
 
         acceptingEngine = FixEngine.launch(acceptingConfig);
-        initiatingEngine = launchInitiatingEngine(libraryAeronPort, nanoClock);
+
+        final EngineConfiguration initiatingConfig = initiatingConfig(libraryAeronPort, nanoClock);
+        initiatingConfig.deleteLogFileDirOnStart(true);
+        initiatingConfig.initialAcceptedSessionOwner(SOLE_LIBRARY);
+        initiatingConfig.sessionPersistenceStrategy(withPersistenceStrategy ?
+            SessionPersistenceStrategy.alwaysPersistent() : SessionPersistenceStrategy.alwaysTransient());
+
+        initiatingEngine = FixEngine.launch(initiatingConfig);
 
         final LibraryConfiguration acceptingLibraryConfig = acceptingLibraryConfig(acceptingHandler, nanoClock)
             .sessionProxyFactory(this::sessionProxyFactory);
@@ -89,8 +108,84 @@ public class ExternallyControlledSystemTest extends AbstractGatewayToGatewaySyst
         testSystem = new TestSystem(acceptingLibrary, initiatingLibrary);
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
+    public void shouldValidResendRequestGoThroughSessionProxy()
+    {
+        launch(true);
+
+        connectSessions();
+        acceptingSession = acceptingHandler.lastSession();
+        messagesCanBeExchanged();
+
+        testSystem.awaitSend("Initiator disconnect", () -> initiatingSession.requestDisconnect());
+        testSystem.await("Acceptor disconnected", () -> acceptingSession.state() == SessionState.DISCONNECTED);
+
+        OrderFactory.sendOrder(initiatingSession);
+        OrderFactory.sendOrder(initiatingSession);
+        ReportFactory.sendOneReport(testSystem, acceptingSession, Side.BUY);
+        ReportFactory.sendOneReport(testSystem, acceptingSession, Side.BUY);
+
+        final Reply<Session> initateReply = connectPersistentSessions(
+            AUTOMATIC_INITIAL_SEQUENCE_NUMBER, AUTOMATIC_INITIAL_SEQUENCE_NUMBER, false);
+        initiatingSession = completeConnectSessions(initateReply);
+
+        testSystem.await("Acceptor sends Resend Request via External System",
+            () -> 1 == fakeSessionProxy.sentResendRequests);
+
+        testSystem.await("Acceptor receives resend request", () ->
+        {
+            final FixMessage last = acceptingOtfAcceptor.messages().get(acceptingOtfAcceptor.messages().size() - 1);
+            return 6 == last.messageSequenceNumber() && ResendRequestDecoder.MESSAGE_TYPE == last.messageType();
+        });
+        testSystem.await("Acceptor sends Valid Resend Request via External System",
+            () -> 1 == fakeSessionProxy.sentValidResendRequest);
+
+        final int msgSeqNo = fakeSessionProxy.resend.header().msgSeqNum();
+        testSystem.awaitSend("Acceptor sends Resend Request From External System",
+            () -> acceptingSessionWriter.send(fakeSessionProxy.resend, msgSeqNo));
+        testSystem.await("Initiator receives resend request", () ->
+        {
+            final FixMessage last = initiatingOtfAcceptor.messages().get(initiatingOtfAcceptor.messages().size() - 1);
+            return 6 == last.messageSequenceNumber() && ResendRequestDecoder.MESSAGE_TYPE == last.messageType();
+        });
+        testSystem.await("Acceptor receives gapfill", () ->
+        {
+            final FixMessage last = acceptingOtfAcceptor.messages().get(acceptingOtfAcceptor.messages().size() - 1);
+            return 5 == last.messageSequenceNumber() && SequenceResetDecoder.MESSAGE_TYPE == last.messageType();
+        });
+
+        testSystem.awaitSend("Acceptor sends ValidResendRequest from External System", () ->
+        {
+            return acceptingSessionWriter.sendValidResendRequest(
+                fakeSessionProxy.lastValidResendRequest.connectionId,
+                fakeSessionProxy.lastValidResendRequest.beginSequenceNumber,
+                fakeSessionProxy.lastValidResendRequest.endSequenceNumber,
+                fakeSessionProxy.lastValidResendRequest.sequenceIndex,
+                fakeSessionProxy.lastValidResendRequest.correlationId,
+                fakeSessionProxy.lastValidResendRequest.overriddenBeginSequenceNumber,
+                fakeSessionProxy.lastValidResendRequest.body,
+                0,
+                fakeSessionProxy.lastValidResendRequest.body.capacity());
+        });
+        testSystem.await("Initiator receives gapfill", () ->
+        {
+            final FixMessage last = initiatingOtfAcceptor.messages().get(initiatingOtfAcceptor.messages().size() - 1);
+            return 5 == last.messageSequenceNumber() && SequenceResetDecoder.MESSAGE_TYPE == last.messageType();
+        });
+
+        messagesCanBeExchanged();
+    }
+
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void shouldRoundTripMessagesViaExternalSystem()
+    {
+        launch(false);
+        roundTripMessagesViaExternalSystem();
+    }
+
+    private void roundTripMessagesViaExternalSystem()
     {
         connectSessions();
 
@@ -98,18 +193,42 @@ public class ExternallyControlledSystemTest extends AbstractGatewayToGatewaySyst
 
         assertNotNull(acceptingSessionWriter);
 
+        if (awaitsNewOrderSingle)
+        {
+            testSystem.await("Acceptor sends Valid Resend Request via External System",
+                () -> 1 == fakeSessionProxy.sentValidResendRequest);
+            testSystem.awaitSend("Acceptor sends ValidResendRequest from External System", () ->
+            {
+                return acceptingSessionWriter.sendValidResendRequest(
+                    fakeSessionProxy.lastValidResendRequest.connectionId,
+                    fakeSessionProxy.lastValidResendRequest.beginSequenceNumber,
+                    fakeSessionProxy.lastValidResendRequest.endSequenceNumber,
+                    fakeSessionProxy.lastValidResendRequest.sequenceIndex,
+                    fakeSessionProxy.lastValidResendRequest.correlationId,
+                    fakeSessionProxy.lastValidResendRequest.overriddenBeginSequenceNumber,
+                    fakeSessionProxy.lastValidResendRequest.body,
+                    0,
+                    fakeSessionProxy.lastValidResendRequest.body.capacity());
+            });
+
+            testSystem.awaitMessageOf(initiatingOtfAcceptor, "D");
+        }
+
         messagesCanBeExchanged();
 
         assertEquals(1, sessionProxyRequests);
         assertEquals(1, fakeSessionProxy.sentHeartbeats);
         assertEquals(1, fakeSessionProxy.sentLogons);
         assertEquals(0, fakeSessionProxy.sentResendRequests);
+        assertEquals(awaitsNewOrderSingle ? 1 : 0, fakeSessionProxy.sentValidResendRequest);
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void shouldReconnectConnections()
     {
-        shouldRoundTripMessagesViaExternalSystem();
+        launch(false);
+        roundTripMessagesViaExternalSystem();
 
         disconnectSessions();
         acceptingSession = null;
@@ -126,24 +245,37 @@ public class ExternallyControlledSystemTest extends AbstractGatewayToGatewaySyst
         assertEquals(0, fakeSessionProxy.sentResendRequests);
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void shouldBeAbleToContinueProcessingAFollowersSession()
     {
-        final long writerSessionId = writeMessageWithSessionWriter();
+        launch(false);
+        final SessionWriter sessionWriter = writeMessageWithFollowerSessionWriter();
+        final long writerSessionId = sessionWriter.id();
 
         fakeSessionProxy.sequenceNumberAdjustment = 1;
 
-        shouldRoundTripMessagesViaExternalSystem();
+        awaitsNewOrderSingle = true;
+        roundTripMessagesViaExternalSystem();
 
         assertEquals(acceptingSession.id(), writerSessionId);
 
         final FixMessage resentNewOrderSingle = awaitMessageFromSessionWriter(3, 1);
         assertEquals("Y", resentNewOrderSingle.possDup());
+
+        // Check we can continue to use the session writer after session reconnected.
+        assertEquals(acceptingSession.connectionId(), sessionWriter.connectionId());
+        initiatingOtfAcceptor.messages().clear();
+        final int secondNOSSeqNum = acceptingSession.lastSentMsgSeqNum() + 1;
+        writeMessageWith(sessionWriter, secondNOSSeqNum);
+        awaitMessageFromSessionWriter(secondNOSSeqNum, secondNOSSeqNum);
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void shouldBeAbleToAdjustSequenceNumbersFromTheControlSystem()
     {
+        launch(false);
         connectSessions();
         awaitForwardingOfAcceptingSession();
 
@@ -161,6 +293,46 @@ public class ExternallyControlledSystemTest extends AbstractGatewayToGatewaySyst
         assertEquals(0, fakeSessionProxy.sentResendRequests);
     }
 
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
+    public void shouldReceiveLogoutBeforeDisconnectInClusteredCaseInitiatorSentLogout()
+    {
+        launch(false);
+        connectSessions();
+
+        final SessionWriter followerSessionWriter = followerSession();
+
+        // fake delaying a logout to simulate it round-tripping a cluster
+        fakeSessionProxy.send(false);
+        testSystem.awaitSend(initiatingSession::startLogout);
+        testSystem.awaitMessageOf(acceptingOtfAcceptor, LOGOUT_MESSAGE_AS_STR);
+        assertEquals(1, fakeSessionProxy.sentLogouts);
+
+        testSystem.awaitSend(() -> fakeSessionProxy.sendLogoutMessage(followerSessionWriter));
+
+        assertSessionDisconnected(initiatingSession);
+        final FixMessage lastInitRecvMsg = initiatingOtfAcceptor.lastReceivedMessage();
+        assertEquals(LOGOUT_MESSAGE_AS_STR, lastInitRecvMsg.msgType());
+    }
+
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
+    public void shouldReceiveLogoutBeforeDisconnectInClusteredCaseAcceptorSentLogout()
+    {
+        launch(false);
+        connectSessions();
+        awaitForwardingOfAcceptingSession();
+        final SessionWriter followerSession = followerSession();
+
+        testSystem.awaitSend(() -> fakeSessionProxy.setupAndSendLogoutMessage(2, followerSession));
+
+        testSystem.awaitMessageOf(initiatingOtfAcceptor, LOGOUT_MESSAGE_AS_STR);
+        assertSessionDisconnected(initiatingSession);
+
+        final FixMessage fixMessage = testSystem.awaitMessageOf(acceptingOtfAcceptor, LOGOUT_MESSAGE_AS_STR);
+        assertTrue(fixMessage.isValid());
+    }
+
     private FixMessage awaitMessageFromSessionWriter(final int lastReceivedMsgSeqNum, final int newOrderSingleSeqNum)
     {
         final FixMessage receivedNewOrderSingle = withTimeout("Unable to find NOS", () ->
@@ -173,7 +345,16 @@ public class ExternallyControlledSystemTest extends AbstractGatewayToGatewaySyst
         return receivedNewOrderSingle;
     }
 
-    private long writeMessageWithSessionWriter()
+    private SessionWriter writeMessageWithFollowerSessionWriter()
+    {
+        final SessionWriter sessionWriter = followerSession();
+
+        writeMessageWith(sessionWriter, 1);
+
+        return sessionWriter;
+    }
+
+    private SessionWriter followerSession()
     {
         final HeaderEncoder headerEncoder = new HeaderEncoder()
             .senderCompID(INITIATOR_ID)
@@ -184,10 +365,7 @@ public class ExternallyControlledSystemTest extends AbstractGatewayToGatewaySyst
         assertEquals(COMPLETED, reply.state());
 
         final SessionWriter sessionWriter = reply.resultIfPresent();
-
-        writeMessageWith(sessionWriter, 1);
-
-        return sessionWriter.id();
+        return sessionWriter;
     }
 
     private void writeMessageWith(final SessionWriter sessionWriter, final int msgSeqNum)
@@ -236,7 +414,7 @@ public class ExternallyControlledSystemTest extends AbstractGatewayToGatewaySyst
         final CompositeKey compositeKey = acceptingSession.compositeKey();
         assertEquals(INITIATOR_ID, compositeKey.remoteCompId());
         assertEquals(ACCEPTOR_ID, compositeKey.localCompId());
-        assertNotNull("unable to acquire accepting session", acceptingSession);
+        assertNotNull(acceptingSession, "unable to acquire accepting session");
     }
 
     private SessionProxy sessionProxyFactory(
@@ -251,6 +429,7 @@ public class ExternallyControlledSystemTest extends AbstractGatewayToGatewaySyst
         final EpochFractionFormat epochFractionPrecision)
     {
         sessionProxyRequests++;
+        fakeSessionProxy.setup(gatewayPublication, libraryId);
         return fakeSessionProxy;
     }
 
@@ -260,21 +439,43 @@ public class ExternallyControlledSystemTest extends AbstractGatewayToGatewaySyst
         private final UtcTimestampEncoder timestampEncoder = new UtcTimestampEncoder();
         private final HeartbeatEncoder heartbeat = new HeartbeatEncoder();
         private final LogonEncoder logon = new LogonEncoder();
+        private final ResendRequestEncoder resend = new ResendRequestEncoder();
         private final LogoutEncoder logout = new LogoutEncoder();
-        private final List<HeaderEncoder> headers = asList(logon.header(), heartbeat.header(), logout.header());
+        private final List<HeaderEncoder> headers = asList(
+            logon.header(), heartbeat.header(), resend.header(), logout.header());
+        private GatewayPublication gatewayPublication;
+        private int libraryId;
+
+        private ValidResendRequestRecord lastValidResendRequest = null;
+
+        FakeSessionProxy()
+        {
+
+        }
 
         private int sentLogons = 0;
+        private int sentLogouts = 0;
         private int sentHeartbeats = 0;
         private int sentResendRequests = 0;
+        private int sentValidResendRequest = 0;
 
         private int sequenceNumberAdjustment = 0;
 
         private boolean seqNumResetRequested = false;
 
+        private boolean send = true;
+
+        public void send(final boolean send)
+        {
+            this.send = send;
+        }
+
+        @Override
         public void fixDictionary(final FixDictionary dictionary)
         {
         }
 
+        @Override
         public void setupSession(final long sessionId, final CompositeKey sessionKey)
         {
             requireNonNull(sessionKey, "sessionKey");
@@ -285,10 +486,12 @@ public class ExternallyControlledSystemTest extends AbstractGatewayToGatewaySyst
             }
         }
 
+        @Override
         public void connectionId(final long connectionId)
         {
         }
 
+        @Override
         public long sendResendRequest(
             final int msgSeqNo,
             final int beginSeqNo,
@@ -297,16 +500,25 @@ public class ExternallyControlledSystemTest extends AbstractGatewayToGatewaySyst
             final int lastMsgSeqNumProcessed)
         {
             sentResendRequests++;
+
+            final int adjustedMsgSeqNo = msgSeqNo + sequenceNumberAdjustment;
+            final HeaderEncoder header = resend.header();
+            setupHeader(header, adjustedMsgSeqNo);
+            resend
+                .beginSeqNo(beginSeqNo)
+                .endSeqNo(endSeqNo);
+
             DebugLogger.log(LogTag.FIX_TEST, "FakeSessionProxy.sendResendRequest");
             return 0;
         }
 
+        @Override
         public long sendRequestDisconnect(final long connectionId, final DisconnectReason reason)
         {
-            DebugLogger.log(LogTag.FIX_TEST, "FakeSessionProxy.sendRequestDisconnect");
-            return 0;
+            return gatewayPublication.saveRequestDisconnect(libraryId, connectionId, reason);
         }
 
+        @Override
         public long sendLogon(
             final int msgSeqNo,
             final int heartbeatIntervalInS,
@@ -342,15 +554,43 @@ public class ExternallyControlledSystemTest extends AbstractGatewayToGatewaySyst
             return acceptingSessionWriter.send(logon, adjustedMsgSeqNo);
         }
 
-        public long sendLogout(final int msgSeqNo, final int sequenceIndex, final int lastMsgSeqNumProcessed)
+        @Override
+        public long sendLogout(
+            final int msgSeqNo, final int sequenceIndex, final int lastMsgSeqNumProcessed, final byte[] text)
         {
+            sentLogouts++;
+
             final int adjustedMsgSeqNo = msgSeqNo + sequenceNumberAdjustment;
             final HeaderEncoder header = logout.header();
             setupHeader(header, adjustedMsgSeqNo);
+            if (text != null)
+            {
+                logout.text(text);
+            }
 
-            return acceptingSessionWriter.send(logout, adjustedMsgSeqNo);
+            if (send)
+            {
+                return sendLogoutMessage(acceptingSessionWriter);
+            }
+            else
+            {
+                return 1;
+            }
         }
 
+        long setupAndSendLogoutMessage(final int msgSeqNo, final SessionWriter sessionWriter)
+        {
+            final HeaderEncoder header = logout.header();
+            setupHeader(header, msgSeqNo);
+            return sendLogoutMessage(sessionWriter);
+        }
+
+        long sendLogoutMessage(final SessionWriter sessionWriter)
+        {
+            return sessionWriter.send(logout, logout.header().msgSeqNum());
+        }
+
+        @Override
         public long sendLogout(
             final int msgSeqNo,
             final int sequenceIndex,
@@ -361,6 +601,7 @@ public class ExternallyControlledSystemTest extends AbstractGatewayToGatewaySyst
             return 0;
         }
 
+        @Override
         public long sendLowSequenceNumberLogout(
             final int msgSeqNo,
             final int expectedSeqNo,
@@ -372,6 +613,7 @@ public class ExternallyControlledSystemTest extends AbstractGatewayToGatewaySyst
             return 0;
         }
 
+        @Override
         public long sendIncorrectBeginStringLogout(
             final int msgSeqNo,
             final int sequenceIndex,
@@ -381,6 +623,7 @@ public class ExternallyControlledSystemTest extends AbstractGatewayToGatewaySyst
             return 0;
         }
 
+        @Override
         public long sendNegativeHeartbeatLogout(
             final int msgSeqNo, final int sequenceIndex, final int lastMsgSeqNumProcessed)
         {
@@ -388,6 +631,7 @@ public class ExternallyControlledSystemTest extends AbstractGatewayToGatewaySyst
             return 0;
         }
 
+        @Override
         public long sendReceivedMessageWithoutSequenceNumber(
             final int msgSeqNo, final int sequenceIndex, final int lastMsgSeqNumProcessed)
         {
@@ -395,6 +639,7 @@ public class ExternallyControlledSystemTest extends AbstractGatewayToGatewaySyst
             return 0;
         }
 
+        @Override
         public long sendRejectWhilstNotLoggedOn(
             final int msgSeqNo, final RejectReason reason, final int sequenceIndex, final int lastMsgSeqNumProcessed)
         {
@@ -402,11 +647,13 @@ public class ExternallyControlledSystemTest extends AbstractGatewayToGatewaySyst
             return 0;
         }
 
+        @Override
         public long sendHeartbeat(final int msgSeqNo, final int sequenceIndex, final int lastMsgSeqNumProcessed)
         {
             return sendHeartbeat(msgSeqNo, null, 0, sequenceIndex, lastMsgSeqNumProcessed);
         }
 
+        @Override
         public long sendHeartbeat(
             final int msgSeqNo,
             final char[] testReqId,
@@ -432,6 +679,7 @@ public class ExternallyControlledSystemTest extends AbstractGatewayToGatewaySyst
             return acceptingSessionWriter.send(heartbeat, adjustedMsgSeqNo);
         }
 
+        @Override
         public long sendReject(
             final int msgSeqNo,
             final int refSeqNum,
@@ -446,6 +694,7 @@ public class ExternallyControlledSystemTest extends AbstractGatewayToGatewaySyst
             return 0;
         }
 
+        @Override
         public long sendTestRequest(
             final int msgSeqNo, final CharSequence testReqID, final int sequenceIndex, final int lastMsgSeqNumProcessed)
         {
@@ -453,6 +702,7 @@ public class ExternallyControlledSystemTest extends AbstractGatewayToGatewaySyst
             return 0;
         }
 
+        @Override
         public long sendSequenceReset(
             final int msgSeqNo, final int newSeqNo, final int sequenceIndex, final int lastMsgSeqNumProcessed)
         {
@@ -460,19 +710,44 @@ public class ExternallyControlledSystemTest extends AbstractGatewayToGatewaySyst
             return 0;
         }
 
+        @Override
         public void libraryConnected(final boolean libraryConnected)
         {
             DebugLogger.log(LogTag.FIX_TEST, "FakeSessionProxy.libraryConnected");
         }
 
+        @Override
         public boolean seqNumResetRequested()
         {
             return seqNumResetRequested;
         }
 
+        @Override
         public long sendCancelOnDisconnectTrigger(final long id, final long timeInNs)
         {
             DebugLogger.log(LogTag.FIX_TEST, "FakeSessionProxy.sendCancelOnDisconnectTrigger");
+            return 0;
+        }
+
+        @Override
+        public long sendValidResendRequest(
+            final long sessionId,
+            final long connectionId,
+            final long beginSequenceNumber,
+            final long endSequenceNumber,
+            final int sequenceIndex,
+            final long correlationId,
+            final long overriddenBeginSequenceNumber,
+            final DirectBuffer bodyBuffer,
+            final int bodyOffset,
+            final int bodyLength)
+        {
+            sentValidResendRequest++;
+            lastValidResendRequest = new ValidResendRequestRecord(sessionId, connectionId, beginSequenceNumber,
+                endSequenceNumber, sequenceIndex, correlationId, overriddenBeginSequenceNumber,
+                bodyBuffer, bodyOffset, bodyLength);
+
+            DebugLogger.log(LogTag.FIX_TEST, "FakeSessionProxy.sendValidResendRequest");
             return 0;
         }
 
@@ -486,6 +761,53 @@ public class ExternallyControlledSystemTest extends AbstractGatewayToGatewaySyst
         private boolean notNullOrEmpty(final String string)
         {
             return string != null && string.length() > 0;
+        }
+
+        void setup(final GatewayPublication gatewayPublication, final int libraryId)
+        {
+            this.gatewayPublication = gatewayPublication;
+            this.libraryId = libraryId;
+        }
+
+        @Override
+        public boolean isAsync()
+        {
+            return true;
+        }
+
+        private static final class ValidResendRequestRecord
+        {
+            final long sessionId;
+            final long connectionId;
+            final long beginSequenceNumber;
+            final long endSequenceNumber;
+            final int sequenceIndex;
+            final long correlationId;
+            final long overriddenBeginSequenceNumber;
+            final UnsafeBuffer body;
+
+            ValidResendRequestRecord(
+                final long sessionId,
+                final long connectionId,
+                final long beginSequenceNumber,
+                final long endSequenceNumber,
+                final int sequenceIndex,
+                final long correlationId,
+                final long overriddenBeginSequenceNumber,
+                final DirectBuffer bodyBuffer,
+                final int bodyOffset,
+                final int bodyLength)
+            {
+                this.sessionId = sessionId;
+                this.connectionId = connectionId;
+                this.beginSequenceNumber = beginSequenceNumber;
+                this.endSequenceNumber = endSequenceNumber;
+                this.sequenceIndex = sequenceIndex;
+                this.correlationId = correlationId;
+                this.overriddenBeginSequenceNumber = overriddenBeginSequenceNumber;
+                body = new UnsafeBuffer(new byte[bodyLength]);
+                body.putBytes(0, bodyBuffer, bodyOffset, bodyLength);
+            }
         }
     }
 }

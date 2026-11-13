@@ -20,12 +20,15 @@ import org.agrona.LangUtil;
 import org.agrona.MutableDirectBuffer;
 import uk.co.real_logic.sbe.ir.Ir;
 import uk.co.real_logic.sbe.ir.IrDecoder;
+import uk.co.real_logic.sbe.ir.Token;
 
 import java.io.InputStream;
+import java.net.URL;
 import java.nio.ByteBuffer;
+import java.util.List;
 
 import static java.nio.ByteOrder.LITTLE_ENDIAN;
-import static uk.co.real_logic.artio.fixp.AbstractFixPParser.ILINK_MESSAGE_HEADER_LENGTH;
+import static uk.co.real_logic.artio.fixp.AbstractFixPParser.FIXP_MESSAGE_HEADER_LENGTH;
 
 public abstract class AbstractFixPOffsets
 {
@@ -41,15 +44,20 @@ public abstract class AbstractFixPOffsets
     // Optimised path for sequence numbers based upon common patterns.
     public static long clientSeqNum(final DirectBuffer buffer, final int sbeHeaderOffset)
     {
-        final int templateId = buffer.getShort(sbeHeaderOffset + TEMPLATE_ID_OFFSET, LITTLE_ENDIAN) & 0xFFFF;
+        final int templateId = templateId(buffer, sbeHeaderOffset, TEMPLATE_ID_OFFSET);
         if (templateId < MINIMUM_BUSINESS_MSG_TEMPLATE_ID)
         {
             return MISSING_OFFSET;
         }
 
-        final int messageOffset = sbeHeaderOffset + ILINK_MESSAGE_HEADER_LENGTH;
+        final int messageOffset = sbeHeaderOffset + FIXP_MESSAGE_HEADER_LENGTH;
         final int fieldOffset = clientSeqNumOffset(templateId);
         return seqNum(buffer, messageOffset + fieldOffset);
+    }
+
+    public static int templateId(final DirectBuffer buffer, final int sbeHeaderOffset, final int templateIdOffset)
+    {
+        return buffer.getShort(sbeHeaderOffset + templateIdOffset, LITTLE_ENDIAN) & 0xFFFF;
     }
 
     public static void clientSeqNum(
@@ -97,8 +105,10 @@ public abstract class AbstractFixPOffsets
             final InputStream stream = encoder.getResourceAsStream(fileName);
             if (stream == null)
             {
+                final URL resource = encoder.getResource(".");
+                final String encoderDir = resource == null ? "unknown" : resource.toURI().getPath();
                 throw new IllegalStateException("Unable to find SBE IR: " + fileName +
-                    " associated with resource: " + encoder);
+                    " associated with resource: " + encoder + " @ " + encoderDir);
             }
             final int length = stream.available();
             final byte[] bytes = new byte[length];
@@ -117,5 +127,11 @@ public abstract class AbstractFixPOffsets
             LangUtil.rethrowUnchecked(e);
             return null;
         }
+    }
+
+    public static int templateId(final List<Token> messageTokens)
+    {
+        final Token beginMessage = messageTokens.get(0);
+        return beginMessage.id();
     }
 }

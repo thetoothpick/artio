@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,13 +15,15 @@
  */
 package uk.co.real_logic.artio.session;
 
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 import uk.co.real_logic.artio.messages.CancelOnDisconnectOption;
+import uk.co.real_logic.artio.messages.ConnectionType;
 import uk.co.real_logic.artio.protocol.GatewayPublication;
 import uk.co.real_logic.artio.util.MutableAsciiBuffer;
 
-import static org.junit.Assert.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.Mockito.*;
+import static uk.co.real_logic.artio.CommonConfiguration.DEFAULT_RESEND_REQUEST_CONTROLLER;
 import static uk.co.real_logic.artio.CommonConfiguration.DEFAULT_SESSION_BUFFER_SIZE;
 import static uk.co.real_logic.artio.dictionary.generation.CodecUtil.MISSING_INT;
 import static uk.co.real_logic.artio.engine.EngineConfiguration.DEFAULT_REASONABLE_TRANSMISSION_TIME_IN_MS;
@@ -32,14 +34,15 @@ import static uk.co.real_logic.artio.session.Session.ACTIVE_VALUE;
 
 public class AcceptorSessionTest extends AbstractSessionTest
 {
-    private final AcceptorSession session = newAcceptorSession();
-
-    private AcceptorSession newAcceptorSession()
+    @Override
+    protected InternalSession newSession()
     {
-        final AcceptorSession acceptorSession = new AcceptorSession(
+        final InternalSession acceptorSession = new InternalSession(
             HEARTBEAT_INTERVAL_IN_S,
             CONNECTION_ID,
             nanoClock,
+            CONNECTED,
+            false,
             sessionProxy,
             mock(GatewayPublication.class),
             mockPublication,
@@ -50,15 +53,20 @@ public class AcceptorSessionTest extends AbstractSessionTest
             LIBRARY_ID,
             1,
             SEQUENCE_INDEX,
-            CONNECTED,
             DEFAULT_REASONABLE_TRANSMISSION_TIME_IN_MS,
             new MutableAsciiBuffer(new byte[DEFAULT_SESSION_BUFFER_SIZE]),
             DEFAULT_ENABLE_LAST_MSG_SEQ_NUM_PROCESSED,
             SessionCustomisationStrategy.none(),
             messageInfo,
-            fakeEpochFractionClock);
+            fakeEpochFractionClock,
+            ConnectionType.ACCEPTOR,
+            DEFAULT_RESEND_REQUEST_CONTROLLER,
+            forcedHeartbeatIntervalInS,
+            disableHeartbeatRepliesToTestRequests,
+            true,
+            new InternalSession.Formatters());
         acceptorSession.fixDictionary(makeDictionary());
-        acceptorSession.sessionProcessHandler(mockLogonListener);
+        acceptorSession.sessionProcessHandler(fixSessionOwner);
         return acceptorSession;
     }
 
@@ -75,7 +83,7 @@ public class AcceptorSessionTest extends AbstractSessionTest
     @Test
     public void shouldInitiallyBeConnected()
     {
-        assertEquals(CONNECTED, session.state());
+        assertEquals(CONNECTED, session().state());
     }
 
     @Test
@@ -84,8 +92,20 @@ public class AcceptorSessionTest extends AbstractSessionTest
         onLogon(1);
 
         verifyLogon();
+        verify(sessionProxy).seqNumResetRequested();
         verifyNoFurtherMessages();
         assertState(ACTIVE);
+    }
+
+    @Test
+    public void shouldRequestLogoutWithCustomText()
+    {
+        shouldBeActivatedBySuccessfulLogin();
+        final byte[] text = "custom text".getBytes();
+
+        session.logoutAndDisconnect(text);
+
+        verifyLogout(2, times(1), text);
     }
 
     @Test
@@ -127,14 +147,20 @@ public class AcceptorSessionTest extends AbstractSessionTest
         shouldStartAcceptLogonBasedSequenceNumberResetWhenSequenceNumberIsOne(SEQUENCE_INDEX);
     }
 
+    @Test
+    public void shouldTakeForcedHeartbeatConfigurationIntoAccountWhenReplyingToLogon()
+    {
+        forcedHeartbeatIntervalInS = 5;
+
+        onLogon(1);
+
+        verifySendLogon(SEQUENCE_INDEX, false);
+    }
+
+    @Override
     protected void readyForLogon()
     {
         // Deliberately blank
-    }
-
-    protected Session session()
-    {
-        return session;
     }
 
     private void verifyLogon()

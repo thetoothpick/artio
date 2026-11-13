@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,9 @@ package uk.co.real_logic.artio.system_tests;
 
 import org.agrona.CloseHelper;
 import org.agrona.LangUtil;
+import org.agrona.concurrent.IdleStrategy;
+import org.agrona.concurrent.YieldingIdleStrategy;
+
 import uk.co.real_logic.artio.DebugLogger;
 import uk.co.real_logic.artio.ExecType;
 import uk.co.real_logic.artio.OrdStatus;
@@ -28,17 +31,19 @@ import uk.co.real_logic.artio.fields.UtcTimestampEncoder;
 import uk.co.real_logic.artio.util.MutableAsciiBuffer;
 
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
 
-import static org.junit.Assert.*;
+import static org.junit.jupiter.api.Assertions.*;
 import static uk.co.real_logic.artio.LogTag.FIX_TEST;
 import static uk.co.real_logic.artio.system_tests.SystemTestUtil.*;
 
 public final class FixConnection implements AutoCloseable
 {
+    static final IdleStrategy ADMIN_IDLE_STRATEGY = new YieldingIdleStrategy();
     public static final int BUFFER_SIZE = 8 * 1024;
     private static final int OFFSET = 0;
 
@@ -52,6 +57,8 @@ public final class FixConnection implements AutoCloseable
 
     public static final String PROXY_V2_IPV6_SOURCE_IP = "fdaa:bbcc:ddee:0:5e8:349b:d23d:f168";
     public static final int PROXY_V2_IPV6_SOURCE_PORT = 44858;
+    public static final int CHECKSUM_LENGTH = 3;
+    public static final int TAG10_VALUE_OFFSET = 4;
 
     private final ByteBuffer writeBuffer = ByteBuffer.allocateDirect(BUFFER_SIZE);
     private final MutableAsciiBuffer writeAsciiBuffer = new MutableAsciiBuffer(writeBuffer);
@@ -70,16 +77,17 @@ public final class FixConnection implements AutoCloseable
 
     private final ByteBuffer readBuffer = ByteBuffer.allocateDirect(BUFFER_SIZE);
     private final MutableAsciiBuffer asciiReadBuffer = new MutableAsciiBuffer(readBuffer);
-    private int endOfMessage;
+    private int endOfFixMessage;
     private int bytesRemaining = 0;
     private String ascii;
+    private String extraAscii = "";
 
     public static FixConnection initiate(final int port) throws IOException
     {
         return new FixConnection(
-            SocketChannel.open(new InetSocketAddress("localhost", port)),
-            INITIATOR_ID,
-            ACCEPTOR_ID);
+          SocketChannel.open(new InetSocketAddress("localhost", port)),
+          INITIATOR_ID,
+          ACCEPTOR_ID);
     }
 
     public static FixConnection accept(final int port, final Runnable connectOperation) throws IOException
@@ -99,10 +107,7 @@ public final class FixConnection implements AutoCloseable
             }
             ADMIN_IDLE_STRATEGY.reset();
 
-            return new FixConnection(
-                socket,
-                ACCEPTOR_ID,
-                INITIATOR_ID);
+            return new FixConnection(socket, ACCEPTOR_ID, INITIATOR_ID);
         }
     }
 
@@ -114,7 +119,7 @@ public final class FixConnection implements AutoCloseable
     }
 
     // Can read data
-    boolean isConnected()
+    public boolean isConnected()
     {
         try
         {
@@ -238,36 +243,50 @@ public final class FixConnection implements AutoCloseable
         send(0, length);
     }
 
+    public void sendBytesLarge(final byte[] bytes)
+    {
+        int offset = 0;
+        int remaining = bytes.length;
+        while (remaining > 0)
+        {
+            final int length = Math.min(remaining, BUFFER_SIZE);
+            writeAsciiBuffer.putBytes(0, bytes, offset, length);
+            send(0, length);
+            offset += length;
+            remaining -= length;
+        }
+    }
+
     public void logon(final boolean resetSeqNumFlag)
     {
         logon(resetSeqNumFlag, 30);
     }
 
-    public void logon(final boolean resetSeqNumFlag, final int heartBtInt)
+    public void logon(final boolean resetSeqNumFlag, final int heartBtIntInS)
     {
-        logon(resetSeqNumFlag, heartBtInt, false);
+        logon(resetSeqNumFlag, heartBtIntInS, false);
     }
 
-    public void logon(final boolean resetSeqNumFlag, final int heartBtInt, final boolean possDupFlag)
+    public void logon(final boolean resetSeqNumFlag, final int heartBtIntInS, final boolean possDupFlag)
     {
         setupHeader(logon.header(), msgSeqNum++, possDupFlag);
 
         logon
-            .resetSeqNumFlag(resetSeqNumFlag)
-            .encryptMethod(0)
-            .heartBtInt(heartBtInt)
+          .resetSeqNumFlag(resetSeqNumFlag)
+          .encryptMethod(0)
+          .heartBtInt(heartBtIntInS)
             .maxMessageSize(9999);
 
         send(logon);
     }
 
-    FixConnection msgSeqNum(final int msgSeqNum)
+    public FixConnection msgSeqNum(final int msgSeqNum)
     {
         this.msgSeqNum = msgSeqNum;
         return this;
     }
 
-    int acquireMsgSeqNum()
+    public int acquireMsgSeqNum()
     {
         return this.msgSeqNum++;
     }
@@ -279,15 +298,15 @@ public final class FixConnection implements AutoCloseable
         send(logout);
     }
 
-    void setupHeader(final SessionHeaderEncoder header, final int msgSeqNum, final boolean possDupFlag)
+    public void setupHeader(final SessionHeaderEncoder header, final int msgSeqNum, final boolean possDupFlag)
     {
         final long timestamp = System.currentTimeMillis();
         final int timestampLength = sendingTimeEncoder.encode(timestamp);
 
         header
-            .senderCompID(senderCompID)
-            .targetCompID(targetCompID)
-            .msgSeqNum(msgSeqNum)
+          .senderCompID(senderCompID)
+          .targetCompID(targetCompID)
+          .msgSeqNum(msgSeqNum)
             .sendingTime(sendingTimeEncoder.buffer(), timestampLength);
 
         if (possDupFlag)
@@ -295,7 +314,7 @@ public final class FixConnection implements AutoCloseable
             final int origSendingTimeLength = origSendingTimeEncoder.encode(timestamp - 1000);
 
             header
-                .possDupFlag(true)
+              .possDupFlag(true)
                 .origSendingTime(origSendingTimeEncoder.buffer(), origSendingTimeLength);
         }
     }
@@ -305,38 +324,98 @@ public final class FixConnection implements AutoCloseable
         return readMessage(new ExecutionReportDecoder());
     }
 
+    public ExecutionReportDecoder readExecutionReport(final int msgSeqNum)
+    {
+        final ExecutionReportDecoder executionReport = readExecutionReport();
+        assertSeqNum(msgSeqNum, executionReport);
+        return executionReport;
+    }
+
+    public ExecutionReportDecoder readResentExecutionReport(final int msgSeqNum)
+    {
+        final ExecutionReportDecoder executionReport = readExecutionReport(msgSeqNum);
+        assertTrue(executionReport.header().possDupFlag());
+        return executionReport;
+    }
+
     public <T extends Decoder> T readMessage(final T decoder)
     {
         try
         {
-            final int bytesToParse = bytesRemaining == 0 ? socket.read(readBuffer) : bytesRemaining;
+            final boolean shouldReadFromSocket = extraAscii.isEmpty() && bytesRemaining == 0;
+            final int bytesToParse = shouldReadFromSocket ? socket.read(readBuffer) : bytesRemaining;
             ascii = asciiReadBuffer.getAscii(OFFSET, bytesToParse);
 
             DebugLogger.log(FIX_TEST,
                 "< [" + ascii + "] for attempted: " + decoder.getClass());
 
-            endOfMessage = ascii.indexOf("8=FIX.4.4", 9);
-            if (endOfMessage == -1)
+            endOfFixMessage = getEndOfTag10(ascii);
+            int bytesReadInLoop;
+            while (endOfFixMessage == -1)
             {
-                endOfMessage = bytesToParse;
+                readBuffer.clear();
+                extraAscii = ascii;
+                bytesReadInLoop = socket.read(readBuffer);
+                ascii = extraAscii + asciiReadBuffer.getAscii(OFFSET, bytesReadInLoop);
+                extraAscii = "";
+                endOfFixMessage = getEndOfTag10(ascii);
             }
-
-            decoder.decode(asciiReadBuffer, OFFSET, endOfMessage);
+            if (ascii.length() > BUFFER_SIZE)
+            {
+                extraAscii = ascii.substring(BUFFER_SIZE);
+                ascii = ascii.substring(0, BUFFER_SIZE);
+            }
+            asciiReadBuffer.putBytes(0, ascii.getBytes());
+            decoder.decode(asciiReadBuffer, OFFSET, endOfFixMessage);
 
             if (!decoder.validate())
             {
-                fail("Failed: " + RejectReason.decode(decoder.rejectReason()) + " for " + decoder.invalidTagId());
+                fail("Failed: " + RejectReason.decode(decoder.rejectReason()) + " for " + decoder.invalidTagId() +
+                    " msg = [" + ascii + "]");
             }
 
-            readBuffer.clear();
-            if (endOfMessage != -1)
+            // check MsgType in case we read an unexpected message, but with a compatible structure
+            try
             {
-                bytesRemaining = bytesToParse - endOfMessage;
-                asciiReadBuffer.putBytes(0, asciiReadBuffer, endOfMessage, bytesRemaining);
+                final Field messageTypeAsStringField = decoder.getClass().getDeclaredField("MESSAGE_TYPE_AS_STRING");
+                final String expectedMsgType = (String)messageTypeAsStringField.get(null);
+                final SessionHeaderDecoder header = decoder.header();
+                final String actualMsgType = new String(header.msgType(), 0, header.msgTypeLength());
+                assertEquals(expectedMsgType, actualMsgType, "MsgType");
+            }
+            catch (final NoSuchFieldException | IllegalAccessException e)
+            {
+                LangUtil.rethrowUnchecked(e);
+            }
+
+            if (!extraAscii.isEmpty())
+            {
+                bytesRemaining = ascii.length() - endOfFixMessage + extraAscii.length();
+                asciiReadBuffer.putBytes(0, ascii.getBytes(), endOfFixMessage, ascii.length() - endOfFixMessage);
+                if (bytesRemaining < BUFFER_SIZE)
+                {
+                    asciiReadBuffer.putBytes(
+                        ascii.length() - endOfFixMessage,
+                        extraAscii.getBytes(),
+                        0,
+                        extraAscii.length());
+                    extraAscii = "";
+                }
+                else
+                {
+                    asciiReadBuffer.putBytes(
+                        ascii.length() - endOfFixMessage,
+                        extraAscii.getBytes(),
+                        0,
+                        bytesRemaining - BUFFER_SIZE);
+                    extraAscii = extraAscii.substring(bytesRemaining - BUFFER_SIZE);
+                }
             }
             else
             {
-                bytesRemaining = 0;
+                bytesRemaining = ascii.length() - endOfFixMessage;
+                readBuffer.clear();
+                asciiReadBuffer.putBytes(0, ascii.getBytes(), endOfFixMessage, bytesRemaining);
             }
         }
         catch (final IOException ex)
@@ -345,6 +424,14 @@ public final class FixConnection implements AutoCloseable
         }
 
         return decoder;
+    }
+
+    private static int getEndOfTag10(final String ascii)
+    {
+        final int tag10Index = ascii.indexOf("\00110=");
+        return tag10Index == -1 || tag10Index + TAG10_VALUE_OFFSET + CHECKSUM_LENGTH > ascii.length() ?
+            -1 :
+            ascii.indexOf("\001", tag10Index + TAG10_VALUE_OFFSET) + 1;
     }
 
     int pollData() throws IOException
@@ -393,11 +480,31 @@ public final class FixConnection implements AutoCloseable
         return readMessage(new LogonDecoder());
     }
 
+    public SequenceResetDecoder readSequenceReset()
+    {
+        return readMessage(new SequenceResetDecoder());
+    }
+
+    public SequenceResetDecoder readSequenceResetGapFill(final int newSeqNo)
+    {
+        final SequenceResetDecoder sequenceReset = readSequenceReset();
+        final String msg = sequenceReset.toString();
+        assertTrue(sequenceReset.header().possDupFlag(), msg);
+        assertTrue(sequenceReset.hasGapFillFlag(), msg);
+        assertEquals(newSeqNo, sequenceReset.newSeqNo(), msg);
+        return sequenceReset;
+    }
+
     public LogonDecoder readLogon(final int msgSeqNum)
     {
         final LogonDecoder logonReply = readLogon();
-        assertEquals(logonReply.toString(), msgSeqNum, logonReply.header().msgSeqNum());
+        assertSeqNum(msgSeqNum, logonReply);
         return logonReply;
+    }
+
+    private void assertSeqNum(final int msgSeqNum, final Decoder decoder)
+    {
+        assertEquals(msgSeqNum, decoder.header().msgSeqNum(), decoder.toString());
     }
 
     public RejectDecoder readReject()
@@ -413,8 +520,8 @@ public final class FixConnection implements AutoCloseable
     public ResendRequestDecoder readResendRequest(final int beginSeqNo, final int endSeqNo)
     {
         final ResendRequestDecoder resendRequest = readMessage(new ResendRequestDecoder());
-        assertEquals(resendRequest.toString(), beginSeqNo, resendRequest.beginSeqNo());
-        assertEquals(resendRequest.toString(), endSeqNo, resendRequest.endSeqNo());
+        assertEquals(beginSeqNo, resendRequest.beginSeqNo(), resendRequest.toString());
+        assertEquals(endSeqNo, resendRequest.endSeqNo(), resendRequest.toString());
         return resendRequest;
     }
 
@@ -440,14 +547,14 @@ public final class FixConnection implements AutoCloseable
     {
         final HeartbeatDecoder heartbeat = readHeartbeat();
         final String message = lastMessageAsString();
-        assertTrue(message, heartbeat.hasTestReqID());
-        assertEquals(message, testReqID, heartbeat.testReqIDAsString());
+        assertTrue(heartbeat.hasTestReqID(), message);
+        assertEquals(testReqID, heartbeat.testReqIDAsString(), message);
         return heartbeat;
     }
 
     public String lastMessageAsString()
     {
-        return asciiReadBuffer.getAscii(OFFSET, endOfMessage);
+        return ascii;
     }
 
     public String lastTotalBytesRead()
@@ -460,6 +567,12 @@ public final class FixConnection implements AutoCloseable
         return readMessage(new HeartbeatDecoder());
     }
 
+    public TestRequestDecoder readTestRequest()
+    {
+        return readMessage(new TestRequestDecoder());
+    }
+
+    @Override
     public void close()
     {
         CloseHelper.close(socket);
@@ -470,7 +583,7 @@ public final class FixConnection implements AutoCloseable
         logout();
 
         final LogoutDecoder logout = readLogout();
-        assertFalse(logout.textAsString(), logout.hasText());
+        assertFalse(logout.hasText(), logout.textAsString());
 
         return logout;
     }
@@ -500,10 +613,10 @@ public final class FixConnection implements AutoCloseable
         setupHeader(header, msgSeqNum, possDupFlag);
 
         executionReportEncoder
-            .orderID("order")
-            .execID("exec")
-            .execType(ExecType.FILL)
-            .ordStatus(OrdStatus.FILLED)
+          .orderID("order")
+          .execID("exec")
+          .execType(ExecType.FILL)
+          .ordStatus(OrdStatus.FILLED)
             .side(Side.BUY);
 
         executionReportEncoder.instrument().symbol("IBM");

@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -42,26 +42,31 @@ class EngineLibraryInfo implements LibraryInfo
         this.gatewaySessions = gatewaySessions;
     }
 
+    @Override
     public int libraryId()
     {
         return ENGINE_LIBRARY_ID;
     }
 
+    @Override
     public String libraryName()
     {
         return "Gateway Library";
     }
 
+    @Override
     public List<ConnectedSessionInfo> sessions()
     {
         return sessions;
     }
 
+    @Override
     public List<FixPConnectedSessionInfo> fixPConnections()
     {
         return Collections.emptyList();
     }
 
+    @Override
     public String toString()
     {
         return "EngineLibraryInfo{" +
@@ -69,6 +74,7 @@ class EngineLibraryInfo implements LibraryInfo
             '}';
     }
 
+    @Override
     public boolean equals(final Object o)
     {
         if (this == o)
@@ -85,6 +91,7 @@ class EngineLibraryInfo implements LibraryInfo
         return Objects.equals(gatewaySessions, that.gatewaySessions);
     }
 
+    @Override
     public int hashCode()
     {
         return gatewaySessions != null ? gatewaySessions.hashCode() : 0;

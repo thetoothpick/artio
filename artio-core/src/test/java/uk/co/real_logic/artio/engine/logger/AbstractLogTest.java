@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd., Monotonic Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd., Monotonic Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -37,6 +37,7 @@ import static org.mockito.Mockito.*;
 import static uk.co.real_logic.artio.CommonConfiguration.DEFAULT_OUTBOUND_LIBRARY_STREAM;
 import static uk.co.real_logic.artio.TestFixtures.MESSAGE_BUFFER_SIZE_IN_BYTES;
 import static uk.co.real_logic.artio.engine.logger.Replayer.SIZE_OF_LENGTH_FIELD;
+import static uk.co.real_logic.artio.engine.logger.Replayer.START_REPLAY_LENGTH;
 import static uk.co.real_logic.artio.messages.FixMessageDecoder.metaDataHeaderLength;
 
 public class AbstractLogTest
@@ -126,7 +127,7 @@ public class AbstractLogTest
             SESSION_ID, sequenceNumber, SEQUENCE_INDEX, testRequestEncoder, header, TestRequestDecoder.MESSAGE_TYPE);
     }
 
-    private void bufferContainsMessage(
+    protected void bufferContainsMessage(
         final long sessionId,
         final int sequenceNumber,
         final int sequenceIndex,
@@ -222,6 +223,7 @@ public class AbstractLogTest
     protected void backpressureTryClaim()
     {
         when(publication.tryClaim(anyInt(), any())).thenReturn(Publication.BACK_PRESSURED);
+        when(publication.tryClaim(eq(START_REPLAY_LENGTH), any())).thenReturn(1L);
     }
 
     protected void setupClaim(final int srcLength)

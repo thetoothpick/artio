@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,7 +17,8 @@ package uk.co.real_logic.artio.session;
 
 import org.agrona.concurrent.AtomicBuffer;
 import org.agrona.concurrent.UnsafeBuffer;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
+import uk.co.real_logic.artio.decoder.SessionHeaderDecoder;
 
 import java.util.Arrays;
 import java.util.List;
@@ -27,7 +28,11 @@ import static java.util.stream.Collectors.toSet;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.greaterThan;
 import static org.hamcrest.Matchers.hasSize;
-import static org.junit.Assert.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+import static uk.co.real_logic.artio.dictionary.SessionConstants.SENDER_COMP_ID;
+import static uk.co.real_logic.artio.dictionary.SessionConstants.TARGET_COMP_ID;
 import static uk.co.real_logic.artio.session.SessionIdStrategy.INSUFFICIENT_SPACE;
 
 @SuppressWarnings("Indentation")
@@ -86,5 +91,32 @@ public class SenderAndTargetSessionIdStrategyTest
         final int length = strategy.save(key, buffer, 1);
 
         assertEquals(INSUFFICIENT_SPACE, length);
+    }
+
+    @Test
+    public void testValidation()
+    {
+        final CompositeKey localKey = strategy.onInitiateLogon("FOO", null, null, "BAR", null, null);
+        final SessionHeaderDecoder receivedHeader = mock(SessionHeaderDecoder.class);
+
+        final Object[][] testVector = new Object[][]{
+            { "BAR", "FOO", 0 },
+            { "X", "FOO", SENDER_COMP_ID },
+            { "BAR", "X", TARGET_COMP_ID },
+        };
+
+        for (final Object[] row : testVector)
+        {
+            final String senderCompId = (String)row[0];
+            final String targetCompId = (String)row[1];
+            final Integer expected = (Integer)row[2];
+
+            when(receivedHeader.senderCompID()).thenReturn(senderCompId.toCharArray());
+            when(receivedHeader.senderCompIDLength()).thenReturn(senderCompId.length());
+            when(receivedHeader.targetCompID()).thenReturn(targetCompId.toCharArray());
+            when(receivedHeader.targetCompIDLength()).thenReturn(targetCompId.length());
+
+            assertEquals(expected.intValue(), strategy.validateCompIds(localKey, receivedHeader));
+        }
     }
 }

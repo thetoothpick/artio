@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited., Monotonic Ltd.
+ * Copyright 2015-2025 Real Logic Limited., Monotonic Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@ final class NoAuthenticationStrategy implements AuthenticationStrategy
     {
     }
 
+    @Override
     public boolean authenticate(final AbstractLogonDecoder logon)
     {
         return true;

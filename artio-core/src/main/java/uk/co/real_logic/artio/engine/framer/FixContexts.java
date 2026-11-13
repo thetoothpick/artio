@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -42,6 +42,7 @@ import java.util.Map.Entry;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.zip.CRC32;
 
+import static uk.co.real_logic.artio.AtomicBuffers.checkAligned;
 import static uk.co.real_logic.artio.engine.EngineConfiguration.DEFAULT_INITIAL_SEQUENCE_INDEX;
 import static uk.co.real_logic.artio.engine.SectorFramer.*;
 import static uk.co.real_logic.artio.session.SessionIdStrategy.INSUFFICIENT_SPACE;
@@ -66,7 +67,7 @@ public class FixContexts implements SessionContexts
         null,
         OUT_OF_SPACE,
         DEFAULT_INITIAL_SEQUENCE_INDEX,
-        null);
+        null, false);
     static final SessionContext UNKNOWN_SESSION = new SessionContext(
         null,
         Session.UNKNOWN,
@@ -76,8 +77,7 @@ public class FixContexts implements SessionContexts
         null,
         OUT_OF_SPACE,
         DEFAULT_INITIAL_SEQUENCE_INDEX,
-        null);
-    static final long LOWEST_VALID_SESSION_ID = 1L;
+        null, false);
     static final int VERSION_WITHOUT_FIX_DICTIONARY = 2;
 
     private static final int HEADER_SIZE = MessageHeaderDecoder.ENCODED_LENGTH;
@@ -101,27 +101,32 @@ public class FixContexts implements SessionContexts
     private final ByteBuffer byteBuffer;
 
     private final AtomicBuffer buffer;
+    private final boolean reproductionEnabled;
     private final SessionIdStrategy idStrategy;
     private final ErrorHandler errorHandler;
     private final MappedFile mappedFile;
     private final int initialSequenceIndex;
+    private final SessionIdGenerator sessionIdGenerator;
 
     private int filePosition;
-    private long counter = LOWEST_VALID_SESSION_ID;
 
     public FixContexts(
         final MappedFile mappedFile,
         final SessionIdStrategy idStrategy,
         final int initialSequenceIndex,
-        final ErrorHandler errorHandler)
+        final ErrorHandler errorHandler,
+        final boolean reproductionEnabled,
+        final SessionIdGenerator sessionIdGenerator)
     {
         this.mappedFile = mappedFile;
-        this.buffer = mappedFile.buffer();
+        this.buffer = checkAligned(mappedFile.buffer());
+        this.reproductionEnabled = reproductionEnabled;
         this.byteBuffer = this.buffer.byteBuffer();
         sectorFramer = new SectorFramer(buffer.capacity());
         this.idStrategy = idStrategy;
         this.initialSequenceIndex = initialSequenceIndex;
         this.errorHandler = errorHandler;
+        this.sessionIdGenerator = sessionIdGenerator;
         loadBuffer();
         allSessions.addAll(compositeToContext.values());
     }
@@ -152,8 +157,14 @@ public class FixContexts implements SessionContexts
         while (filePosition < lastRecordStart)
         {
             sectorEnd = validateSectorChecksum(filePosition, sectorEnd);
+
             long sessionId = wrap(sessionIdDecoder, filePosition);
-            if (sessionId == 0)
+            // If filePosition is close enough to the end of the sector then sessionId won't be zero'd
+            // even if there's a gap before the next sector because the checksum will be written into
+            // some of the bytes of the session Id.
+            final int startOfNextChecksum = sectorEnd - CHECKSUM_SIZE;
+            final int endOfSessionId = filePosition + SessionIdDecoder.sessionIdEncodingLength();
+            if (sessionId == 0 || (startOfNextChecksum < endOfSessionId && filePosition != sectorEnd))
             {
                 final int nextSectorPeekPosition = sectorEnd;
                 if (nextSectorPeekPosition > lastRecordStart)
@@ -186,6 +197,7 @@ public class FixContexts implements SessionContexts
                 final long lastSequenceResetTime = sessionIdDecoder.lastSequenceResetTime();
                 final int compositeKeyLength = sessionIdDecoder.compositeKeyLength();
                 final String lastFixDictionary = sessionIdDecoder.lastFixDictionary();
+
                 filePosition = sessionIdDecoder.limit();
                 final CompositeKey compositeKey = idStrategy.load(
                     buffer, filePosition, compositeKeyLength);
@@ -194,15 +206,24 @@ public class FixContexts implements SessionContexts
                     return requiresCompaction;
                 }
 
-                final FixDictionary thisDictionary = (dictionary == null) ?
-                    FixDictionary.of(FixDictionary.find(lastFixDictionary)) : dictionary;
-                final SessionContext sessionContext = new SessionContext(compositeKey,
-                    sessionId, sequenceIndex, lastLogonTime, lastSequenceResetTime, this,
-                    sessionIdDecoder.initialOffset(),
-                    initialSequenceIndex, thisDictionary);
-                compositeToContext.put(compositeKey, sessionContext);
+                try
+                {
+                    final FixDictionary thisDictionary = (dictionary == null) ?
+                        FixDictionary.of(FixDictionary.find(lastFixDictionary)) : dictionary;
+                    final SessionContext sessionContext = new SessionContext(compositeKey,
+                        sessionId, sequenceIndex, lastLogonTime, lastSequenceResetTime, this,
+                        sessionIdDecoder.offset(),
+                        initialSequenceIndex, thisDictionary, reproductionEnabled);
+                    compositeToContext.put(compositeKey, sessionContext);
+                }
+                catch (final Exception e)
+                {
+                    // Don't block the startup / load of the engine if there's an invalid fix dictionary error
+                    // just report it to the user
+                    errorHandler.onError(e);
+                }
 
-                counter = Math.max(counter, sessionId + 1);
+                sessionIdGenerator.onExistingSessionId(sessionId);
 
                 filePosition += compositeKeyLength;
             }
@@ -288,7 +309,7 @@ public class FixContexts implements SessionContexts
 
     private SessionContext onNewLogon(final CompositeKey compositeKey, final FixDictionary fixDictionary)
     {
-        final long sessionId = counter++;
+        final long sessionId = sessionIdGenerator.nextId();
         final SessionContext sessionContext = assignSessionId(
             compositeKey,
             sessionId,
@@ -312,7 +333,8 @@ public class FixContexts implements SessionContexts
             this,
             0,
             initialSequenceIndex,
-            fixDictionary);
+            fixDictionary,
+            reproductionEnabled);
 
         allocateNewSlot(context);
 
@@ -336,7 +358,6 @@ public class FixContexts implements SessionContexts
                 sessionId,
                 compositeKey)));
             context.filePosition(OUT_OF_SPACE);
-
         }
         else
         {
@@ -357,7 +378,7 @@ public class FixContexts implements SessionContexts
                         .wrap(buffer, filePosition)
                         .sessionId(sessionId)
                         .sequenceIndex(sequenceIndex)
-                        .logonTime(context.lastLogonTime())
+                        .logonTime(context.lastLogonTimeInNs())
                         .lastSequenceResetTime(context.lastSequenceResetTime())
                         .compositeKeyLength(compositeKeyLength)
                         .lastFixDictionary(fixDictionaryName);
@@ -380,13 +401,24 @@ public class FixContexts implements SessionContexts
         return fixDictionary.getClass().getName();
     }
 
-    public void sequenceReset(final long sessionId, final long resetTime)
+    @Override
+    public void sequenceReset(final long sessionId, final long resetTimeInNs)
     {
         final Entry<CompositeKey, SessionContext> entry = lookupById(sessionId);
         if (entry != null)
         {
             final SessionContext context = entry.getValue();
-            context.onSequenceReset(resetTime);
+            context.onSequenceReset(resetTimeInNs);
+        }
+    }
+
+    public void onSequenceIndex(final long sessionId, final long resetTimeInNs, final int sequenceIndex)
+    {
+        final Entry<CompositeKey, SessionContext> entry = lookupById(sessionId);
+        if (entry != null)
+        {
+            final SessionContext context = entry.getValue();
+            context.onSequenceIndex(resetTimeInNs, sequenceIndex);
         }
     }
 
@@ -429,7 +461,7 @@ public class FixContexts implements SessionContexts
                 "There are currently authenticated sessions: " + currentlyAuthenticatedSessionIds);
         }
 
-        counter = LOWEST_VALID_SESSION_ID;
+        sessionIdGenerator.reset();
         compositeToContext.clear();
         allSessions.clear();
 
@@ -471,7 +503,7 @@ public class FixContexts implements SessionContexts
         {
             sessionIdEncoder
                 .sequenceIndex(context.sequenceIndex())
-                .logonTime(context.lastLogonTime())
+                .logonTime(context.lastLogonTimeInNs())
                 .lastSequenceResetTime(context.lastSequenceResetTime());
 
             updateSectorChecksum(filePosition);
@@ -497,11 +529,13 @@ public class FixContexts implements SessionContexts
         return sessionContext.sessionId();
     }
 
+    @Override
     public boolean isAuthenticated(final long sessionId)
     {
         return currentlyAuthenticatedSessionIds.contains(sessionId);
     }
 
+    @Override
     public boolean isKnownSessionId(final long sessionId)
     {
         return lookupById(sessionId) != null;

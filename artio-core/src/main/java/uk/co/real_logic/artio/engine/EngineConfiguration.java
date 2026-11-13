@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,46 +16,67 @@
 package uk.co.real_logic.artio.engine;
 
 import io.aeron.Aeron;
+import io.aeron.CommonContext;
 import io.aeron.archive.client.AeronArchive;
+import org.agrona.BufferUtil;
 import org.agrona.CloseHelper;
 import org.agrona.IoUtil;
+import org.agrona.Strings;
 import org.agrona.Verify;
 import org.agrona.collections.IntHashSet;
+import org.agrona.collections.Long2ObjectCache;
 import org.agrona.concurrent.AtomicBuffer;
+import org.agrona.concurrent.EpochNanoClock;
 import org.agrona.concurrent.IdleStrategy;
 import org.agrona.concurrent.UnsafeBuffer;
 import org.agrona.concurrent.errors.ErrorConsumer;
 import uk.co.real_logic.artio.CommonConfiguration;
 import uk.co.real_logic.artio.ErrorHandlerFactory;
 import uk.co.real_logic.artio.MonitoringAgentFactory;
+import uk.co.real_logic.artio.ReproductionClock;
 import uk.co.real_logic.artio.decoder.AbstractLogonDecoder;
 import uk.co.real_logic.artio.dictionary.FixDictionary;
 import uk.co.real_logic.artio.dictionary.SessionConstants;
 import uk.co.real_logic.artio.engine.framer.DefaultTcpChannelSupplier;
+import uk.co.real_logic.artio.engine.framer.IncrementalSessionIdGenerator;
+import uk.co.real_logic.artio.engine.framer.SessionIdGenerator;
 import uk.co.real_logic.artio.engine.framer.TcpChannelSupplier;
+import uk.co.real_logic.artio.engine.logger.FixArchiveScanner;
+import uk.co.real_logic.artio.engine.logger.ReplayIndexDescriptor;
+import uk.co.real_logic.artio.fields.EpochFractionFormat;
+import uk.co.real_logic.artio.fixp.FixPCancelOnDisconnectTimeoutHandler;
+import uk.co.real_logic.artio.fixp.FixPProtocolFactory;
 import uk.co.real_logic.artio.library.SessionConfiguration;
+import uk.co.real_logic.artio.messages.CancelOnDisconnectOption;
 import uk.co.real_logic.artio.messages.FixPProtocolType;
 import uk.co.real_logic.artio.messages.InitialAcceptedSessionOwner;
 import uk.co.real_logic.artio.session.CancelOnDisconnectTimeoutHandler;
-import uk.co.real_logic.artio.validation.AuthenticationProxy;
-import uk.co.real_logic.artio.validation.AuthenticationStrategy;
-import uk.co.real_logic.artio.validation.FixPAuthenticationStrategy;
-import uk.co.real_logic.artio.validation.SessionPersistenceStrategy;
+import uk.co.real_logic.artio.session.ResendRequestController;
+import uk.co.real_logic.artio.session.SessionCustomisationStrategy;
+import uk.co.real_logic.artio.session.SessionIdStrategy;
+import uk.co.real_logic.artio.timing.HistogramHandler;
+import uk.co.real_logic.artio.validation.*;
 
 import java.io.File;
 import java.net.InetSocketAddress;
 import java.util.*;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 
 import static java.lang.Integer.getInteger;
 import static java.lang.System.getProperty;
 import static java.util.concurrent.TimeUnit.SECONDS;
+import static org.agrona.BitUtil.findNextPositivePowerOfTwo;
+import static uk.co.real_logic.artio.AtomicBuffers.checkAligned;
 import static uk.co.real_logic.artio.admin.ArtioAdminConfiguration.DEFAULT_INBOUND_ADMIN_STREAM_ID;
 import static uk.co.real_logic.artio.admin.ArtioAdminConfiguration.DEFAULT_OUTBOUND_ADMIN_STREAM_ID;
 import static uk.co.real_logic.artio.dictionary.generation.CodecUtil.MISSING_INT;
-import static uk.co.real_logic.artio.engine.logger.ReplayIndexDescriptor.INITIAL_RECORD_OFFSET;
+import static uk.co.real_logic.artio.engine.FixEngine.ENGINE_LIBRARY_ID;
+import static uk.co.real_logic.artio.engine.logger.ReplayIndexDescriptor.HEADER_FILE_SIZE;
+import static uk.co.real_logic.artio.engine.logger.ReplayIndexDescriptor.MAX_FILE_SEGMENT_CAPACITY;
 import static uk.co.real_logic.artio.library.SessionConfiguration.*;
-import static uk.co.real_logic.artio.messages.FixPProtocolType.BINARY_ENTRYPOINT;
+import static uk.co.real_logic.artio.messages.CancelOnDisconnectOption.DO_NOT_CANCEL_ON_DISCONNECT_OR_LOGOUT;
 import static uk.co.real_logic.artio.messages.FixPProtocolType.ILINK_3;
 import static uk.co.real_logic.artio.validation.SessionPersistenceStrategy.alwaysTransient;
 
@@ -79,10 +100,32 @@ public final class EngineConfiguration extends CommonConfiguration implements Au
      * Property name for the directory to log archive data into
      */
     public static final String LOG_FILE_DIR_PROP = "logging.dir";
+
     /**
-     * Property name for size of logging index files
+     * Property name for maximum number of records in logging index files
      */
+    public static final String REPLAY_INDEX_RECORD_CAPACITY_PROP = "logging.index.records";
+
+    /**
+     * Property name for enabling or disabling checksum calculation for index files
+     */
+    public static final String INDEX_CHECKSUM_ENABLED_PROP = "logging.checksum.enabled";
+
+    /**
+     * Deprecated property name for size of logging index files. Do not use this, set
+     * {@link #REPLAY_INDEX_RECORD_CAPACITY_PROP} instead.
+     */
+    @Deprecated
     public static final String REPLAY_INDEX_FILE_SIZE_PROP = "logging.index.size";
+
+    static
+    {
+        if (System.getProperty(REPLAY_INDEX_FILE_SIZE_PROP) != null)
+        {
+            System.err.println(REPLAY_INDEX_FILE_SIZE_PROP + " is deprecated, please use " +
+                REPLAY_INDEX_RECORD_CAPACITY_PROP + " instead.");
+        }
+    }
 
     // Care needs to be taken when setting the fragment limits, and buffer sizes
     // The inbound bytes received and buffer sizes should always be set low enough
@@ -135,7 +178,8 @@ public final class EngineConfiguration extends CommonConfiguration implements Au
     // ------------------------------------------------
 
     public static final String DEFAULT_LOG_FILE_DIR = "logs";
-    public static final int DEFAULT_REPLAY_INDEX_FILE_SIZE = 2 * 1024 * 1024 + INITIAL_RECORD_OFFSET;
+    public static final int DEFAULT_REPLAY_INDEX_RECORD_CAPACITY = 262144;
+    public static final int DEFAULT_REPLAY_INDEX_SEGMENT_CAPACITY = 65536;
     public static final int DEFAULT_LOGGER_CACHE_NUM_SETS = 8;
     public static final int DEFAULT_LOGGER_CACHE_SET_SIZE = 4;
 
@@ -171,6 +215,13 @@ public final class EngineConfiguration extends CommonConfiguration implements Au
     public static final int DEFAULT_MAX_CONCURRENT_SESSION_REPLAYS = 5;
     public static final long DEFAULT_DUPLICATE_ENGINE_TIMEOUT_IN_MS = SECONDS.toMillis(10);
     public static final int NO_THROTTLE_WINDOW = MISSING_INT;
+    public static final int DEFAULT_THROTTLE_BUSINESS_REJECT_REASON = 99;
+    public static final boolean DEFAULT_INDEX_CHECKSUM_ENABLED = true;
+
+    public static final long MAX_COD_TIMEOUT_IN_NS = 60_000_000_000L;
+    public static final long MAX_COD_TIMEOUT_IN_MS = 60_000L;
+
+    public static final long DEFAULT_TIME_INDEX_FLUSH_INTERVAL_IN_NS = TimeUnit.SECONDS.toNanos(1);
 
     static
     {
@@ -187,12 +238,17 @@ public final class EngineConfiguration extends CommonConfiguration implements Au
     public static final int DEFAULT_OUTBOUND_REPLAY_STREAM = 3;
     public static final int DEFAULT_ARCHIVE_REPLAY_STREAM = 4;
     public static final int DEFAULT_ARCHIVE_SCANNER_STREAM = 5;
+    public static final int DEFAULT_REPRODUCTION_LOG_STREAM = 6;
+    public static final int DEFAULT_REPRODUCTION_REPLAY_STREAM = 7;
 
     public static final int DEFAULT_INITIAL_SEQUENCE_INDEX = 0;
+    public static final int DEFAULT_CANCEL_ON_DISCONNECT_TIMEOUT_WINDOW_IN_MS = 0;
 
     private String host = null;
     private int port;
-    private int replayIndexFileSize = getInteger(REPLAY_INDEX_FILE_SIZE_PROP, DEFAULT_REPLAY_INDEX_FILE_SIZE);
+    private int replayIndexFileRecordCapacity = getInteger(
+        REPLAY_INDEX_RECORD_CAPACITY_PROP, DEFAULT_REPLAY_INDEX_RECORD_CAPACITY);
+    private int replayIndexSegmentRecordCapacity = DEFAULT_REPLAY_INDEX_SEGMENT_CAPACITY;
     private String logFileDir = getProperty(LOG_FILE_DIR_PROP, DEFAULT_LOG_FILE_DIR);
     private int loggerCacheNumSets = DEFAULT_LOGGER_CACHE_NUM_SETS;
     private int loggerCacheSetSize = DEFAULT_LOGGER_CACHE_SET_SIZE;
@@ -207,6 +263,7 @@ public final class EngineConfiguration extends CommonConfiguration implements Au
     private MappedFile receivedSequenceNumberIndex;
     private MappedFile sessionIdBuffer;
     private MappedFile fixPBuffer;
+    private SessionIdGenerator sessionIdGenerator;
     private Set<String> gapfillOnReplayMessageTypes = new HashSet<>(DEFAULT_GAPFILL_ON_REPLAY_MESSAGE_TYPES);
     private IntHashSet gapfillOnRetransmitILinkTemplateIds = new IntHashSet();
     private final AeronArchive.Context archiveContext = new AeronArchive.Context();
@@ -233,6 +290,7 @@ public final class EngineConfiguration extends CommonConfiguration implements Au
         getInteger(SENDER_MAX_BYTES_IN_BUFFER_PROP, DEFAULT_SENDER_MAX_BYTES_IN_BUFFER);
     private int noLogonDisconnectTimeoutInMs =
         getInteger(NO_LOGON_DISCONNECT_TIMEOUT_PROP, DEFAULT_NO_LOGON_DISCONNECT_TIMEOUT_IN_MS);
+    private boolean indexChecksumEnabled = getBoolean(INDEX_CHECKSUM_ENABLED_PROP, DEFAULT_INDEX_CHECKSUM_ENABLED);
 
     private String libraryAeronChannel = null;
     private Function<EngineConfiguration, TcpChannelSupplier> channelSupplierFactory = DefaultTcpChannelSupplier::new;
@@ -243,6 +301,8 @@ public final class EngineConfiguration extends CommonConfiguration implements Au
     private FixPRetransmitHandler fixPRetransmitHandler = DEFAULT_BINARY_FIXP_RETRANSMIT_HANDLER;
     private int outboundReplayStream = DEFAULT_OUTBOUND_REPLAY_STREAM;
     private int archiveReplayStream = DEFAULT_ARCHIVE_REPLAY_STREAM;
+    private int reproductionLogStream = DEFAULT_REPRODUCTION_LOG_STREAM;
+    private int reproductionReplayStream = DEFAULT_REPRODUCTION_REPLAY_STREAM;
     private boolean acceptedSessionClosedResendInterval = DEFAULT_CLOSED_RESEND_INTERVAL;
     private int acceptedSessionResendRequestChunkSize = NO_RESEND_REQUEST_CHUNK_SIZE;
     private boolean acceptedSessionSendRedundantResendRequests = DEFAULT_SEND_REDUNDANT_RESEND_REQUESTS;
@@ -265,10 +325,28 @@ public final class EngineConfiguration extends CommonConfiguration implements Au
     private boolean errorIfDuplicateEngineDetected = true;
     private int inboundAdminStream = DEFAULT_INBOUND_ADMIN_STREAM_ID;
     private int outboundAdminStream = DEFAULT_OUTBOUND_ADMIN_STREAM_ID;
-    private boolean acceptsBinaryEntryPoint = false;
+    private FixPProtocolType acceptorFixPProtocol = null;
     private CancelOnDisconnectTimeoutHandler cancelOnDisconnectTimeoutHandler = null;
+    private FixPCancelOnDisconnectTimeoutHandler fixPCancelOnDisconnectTimeoutHandler = null;
     private int throttleWindowInMs = NO_THROTTLE_WINDOW;
     private int throttleLimitOfMessages = NO_THROTTLE_WINDOW;
+    private int throttleBusinessRejectReason = DEFAULT_THROTTLE_BUSINESS_REJECT_REASON;
+    private long timeIndexReplayFlushIntervalInNs = DEFAULT_TIME_INDEX_FLUSH_INTERVAL_IN_NS;
+    private CancelOnDisconnectOption cancelOnDisconnectOption = DO_NOT_CANCEL_ON_DISCONNECT_OR_LOGOUT;
+    private int cancelOnDisconnectTimeoutWindowInMs = DEFAULT_CANCEL_ON_DISCONNECT_TIMEOUT_WINDOW_IN_MS;
+    private long initialConnectionId = (long)(Math.random() * Long.MAX_VALUE);;
+    private long framerCycleThresholdNs = DEFAULT_CYCLE_THRESHOLD_NS;
+    private long indexerCycleThresholdNs = DEFAULT_CYCLE_THRESHOLD_NS;
+
+    private EngineReproductionConfiguration reproductionConfiguration;
+    private ReproductionMessageHandler reproductionMessageHandler = (connectionId, bytes) ->
+    {
+    };
+    private boolean writeReproductionLog = false;
+
+    // ---------------------
+    // BEGIN SETTERS
+    // ---------------------
 
     /**
      * Sets the local address to bind to when the Gateway is used to accept connections.
@@ -290,9 +368,9 @@ public final class EngineConfiguration extends CommonConfiguration implements Au
     }
 
     /**
-     * Controls whether the engine should eagerly bind the network interface at startup when {@link #bindTo(String, int)} is used, or
-     * whether it is delayed delayed until {@link FixEngine#bind()} is invoked. If used in conjunction with
-     * {@link InitialAcceptedSessionOwner#SOLE_LIBRARY} then the binding operation will delayed until the library
+     * Controls whether the engine should eagerly bind the network interface at startup when {@link #bindTo(String, int)}
+     * is used, or whether it is delayed until {@link FixEngine#bind()} is invoked. If used in conjunction with
+     * {@link InitialAcceptedSessionOwner#SOLE_LIBRARY} then the binding operation will be delayed until the library
      * is connected.
      *
      * @param bindAtStartup false to delay binding until {@link FixEngine#bind()} is invoked.
@@ -305,15 +383,25 @@ public final class EngineConfiguration extends CommonConfiguration implements Au
     }
 
     /**
-     * Configures the engine to accept binary entrypoint connections. The Engine no longer accepts
-     * regular FIX protocol connections and only accepts this binary protocol. Automatically sets
+     * Configures the engine to accept the provided FIXP connections. The Engine no longer accepts
+     * regular FIX protocol connections and only accepts this binary protocol. Protocol must be a valid acceptor
+     * protocol.
+     *
+     * Automatically sets
      * <code>lookupDefaultAcceptorfixDictionary(false)</code>
      *
+     * @param acceptorFixPProtocol the protocol to accept
      * @return this
+     * @throws IllegalArgumentException if acceptorFixPProtocol isn't a valid protocol
      */
-    public EngineConfiguration acceptBinaryEntryPoint()
+    public EngineConfiguration acceptFixPProtocol(final FixPProtocolType acceptorFixPProtocol)
     {
-        this.acceptsBinaryEntryPoint = true;
+        if (!FixPProtocolFactory.isAcceptorImplemented(acceptorFixPProtocol))
+        {
+            throw new IllegalArgumentException(acceptorFixPProtocol + " isn't a valid acceptor protocol");
+        }
+
+        this.acceptorFixPProtocol = acceptorFixPProtocol;
         lookupDefaultAcceptorfixDictionary = false;
         return this;
     }
@@ -373,31 +461,71 @@ public final class EngineConfiguration extends CommonConfiguration implements Au
     }
 
     /**
-     * Sets the size of index files. This is the size in bytes for the replay index file that is used for each session.
-     * If you want to size in terms of the last N Fix message fragments that you have received then
-     * use the formula: INITIAL_RECORD_OFFSET + N * ReplayIndexDescriptor.RECORD_LENGTH.
+     * Sets the maximum size of index files. as calculated by the number of records that can be stored per FIX session.
+     * In business terms this is maximum number of messages back in history that Artio can respond to resend requests
+     * from. Each session's index storage is divided into segments, the size of a segment is configured by
+     * {@link #replayIndexSegmentRecordCapacity(int)}.
      *
-     * @param indexFileSize the size of index files.
+     * If this isn't a power of two, then the next positive power of two will be used.
+     *
+     * {@link #replayIndexFileCapacityToBytes(int)} can be used in order to calculate the maximum space required per
+     * FIX session.
+     *
+     * @param replayIndexFileRecordCapacity the number of fix messages to keep track of the replay index.
      * @return this
-     * @see EngineConfiguration#REPLAY_INDEX_FILE_SIZE_PROP
-     * @see EngineConfiguration#DEFAULT_REPLAY_INDEX_FILE_SIZE
      */
-    public EngineConfiguration replayIndexFileSize(final int indexFileSize)
+    public EngineConfiguration replayIndexFileRecordCapacity(final int replayIndexFileRecordCapacity)
     {
-        this.replayIndexFileSize = indexFileSize;
+        this.replayIndexFileRecordCapacity = findNextPositivePowerOfTwo(replayIndexFileRecordCapacity);
         return this;
     }
 
     /**
-     * Sets the set size of the logger's caches.
+     * Sets the capacity of an individual segment file. See {@link #replayIndexFileRecordCapacity(int)} for more
+     * details.
+     *
+     * If this isn't a power of two, then the next positive power of two will be used.
+     *
+     * @param indexSegmentCapacityInRecords the capacity of an individual segment file
+     * @throws IllegalArgumentException if the capacity is outside of the supported range
+     * @return this
+     */
+    public EngineConfiguration replayIndexSegmentRecordCapacity(final int indexSegmentCapacityInRecords)
+    {
+        this.replayIndexSegmentRecordCapacity = findNextPositivePowerOfTwo(indexSegmentCapacityInRecords);
+        if (replayIndexSegmentRecordCapacity > MAX_FILE_SEGMENT_CAPACITY || replayIndexSegmentRecordCapacity < 0)
+        {
+            throw new IllegalArgumentException("replayIndexSegmentRecordCapacity cannot be > " +
+                MAX_FILE_SEGMENT_CAPACITY + " or < 0 but is set to " + indexSegmentCapacityInRecords);
+        }
+        return this;
+    }
+
+    /**
+     * Convert the number of records in a replay index file to a file size. Note: because replay index file sizes must
+     * be a power of two this method can return a file size greater than the requested number of records but never less.
+     *
+     * @param requestedNumberOfRecordsToStore the number of records to store in the replay index.
+     * @return the replay index file size in bytes
+     */
+    public static long replayIndexFileCapacityToBytes(final int requestedNumberOfRecordsToStore)
+    {
+        return HEADER_FILE_SIZE + ReplayIndexDescriptor.RECORD_LENGTH *
+            (long)findNextPositivePowerOfTwo(requestedNumberOfRecordsToStore);
+    }
+
+    /**
+     * Sets the set size of the logger's caches. This is currently only used by the ReplayQuery size. See
+     * {@link Long2ObjectCache} for guidance on how to adjust the number of sets and the set size.
      * <p>
-     * The logging and archival mechanism
-     * has several caches of open memory mapped files which it stores streams of messages
-     * into. This and {@link #loggerCacheNumSets} controls the size of those caches.
-     * Should be increased if you see files being opened/closed in that area too frequently.
+     * The ReplayQuery class has a caches of open memory mapped files which it queries
+     * into. Replay queries are used by Artio in response to FIX resend requests, the memory mapped files themselves
+     * are cached between resend requests since it's often the case that a few FIX sessions are often responsible for
+     * most resend requests.
      * <p>
-     * {@link org.agrona.collections.Int2ObjectCache} explains the difference between set size
-     * and num sets.
+     * This and {@link #loggerCacheNumSets} controls the size of those caches.
+     * The {@link #loggerCacheNumSets} should be increased if you see files being opened/closed in that area too
+     * frequently.
      *
      * @param loggerCacheSetSize the set size of the logger's caches.
      * @return this
@@ -550,9 +678,9 @@ public final class EngineConfiguration extends CommonConfiguration implements Au
         return this;
     }
 
-    public EngineConfiguration sessionPersistenceStrategy(final SessionPersistenceStrategy sessionReplicationStrategy)
+    public EngineConfiguration sessionPersistenceStrategy(final SessionPersistenceStrategy sessionPersistenceStrategy)
     {
-        this.sessionPersistenceStrategy = sessionReplicationStrategy;
+        this.sessionPersistenceStrategy = sessionPersistenceStrategy;
         return this;
     }
 
@@ -662,7 +790,7 @@ public final class EngineConfiguration extends CommonConfiguration implements Au
      * Sets the {@link SessionConfiguration#closedResendInterval()} property for accepted Sessions.
      *
      * @param acceptedSessionClosedResendInterval the {@link SessionConfiguration#closedResendInterval()} property for
-     *                                           accepted Sessions.
+     *                                            accepted Sessions.
      * @return this
      */
     public EngineConfiguration acceptedSessionClosedResendInterval(final boolean acceptedSessionClosedResendInterval)
@@ -675,7 +803,7 @@ public final class EngineConfiguration extends CommonConfiguration implements Au
      * Sets the {@link SessionConfiguration#resendRequestChunkSize()} property for accepted Sessions.
      *
      * @param acceptedSessionResendRequestChunkSize the {@link SessionConfiguration#resendRequestChunkSize()} property
-     *                                             for accepted Sessions.
+     *                                              for accepted Sessions.
      * @return this
      */
     public EngineConfiguration acceptedSessionResendRequestChunkSize(final int acceptedSessionResendRequestChunkSize)
@@ -820,7 +948,7 @@ public final class EngineConfiguration extends CommonConfiguration implements Au
     /**
      * Override the acceptor FIX Dictionary for a given beginString. The beginString to use is extracted from the
      * Provided FIX Dictionary. If you wish to use multiple FIX dictionaries based upon the logon message and they
-     * both have the same beginString field then you should should implement a custom {@link AuthenticationStrategy}
+     * both have the same beginString field then you should implement a custom {@link AuthenticationStrategy}
      * and use the {@link AuthenticationProxy#accept(Class)} method in order to specify the dictionary.
      *
      * @param fixDictionaryClass the FIX Dictionary to use
@@ -917,12 +1045,25 @@ public final class EngineConfiguration extends CommonConfiguration implements Au
     }
 
     /**
+     * Sets the throttle business reject reason used on business message reject when session throttling limits are
+     * reached.
+     *
+     * @param throttleBusinessRejectReason  business reject reason used.
+     * @return this
+     */
+    public EngineConfiguration throttleBusinessRejectReason(final int throttleBusinessRejectReason)
+    {
+        this.throttleBusinessRejectReason = throttleBusinessRejectReason;
+        return this;
+    }
+
+    /**
      * Sets the maximum number of resend requests per session that Artio will process concurrently. Once the maximum is
      * hit further FIX resend requests will be ignored and an Exception will be logged noting the event. Note
      * this is a per-session parameter - ie the number of ResendRequests that will be queued for processing.
      *
      * @param maxConcurrentSessionReplays the maximum number of resend requests per session that Artio will enqueue
-     *                                    before rejecting any more.
+     *                                    before rejecting anymore.
      * @return this
      */
     public EngineConfiguration maxConcurrentSessionReplays(final int maxConcurrentSessionReplays)
@@ -980,13 +1121,15 @@ public final class EngineConfiguration extends CommonConfiguration implements Au
     }
 
     /**
-     * Sets the cancel on disconnect timeout handler. This is invoked when a cancel on disconnect event occurs.
+     * Sets the cancel on disconnect timeout handler for FIX sessions. This is invoked when a cancel on disconnect
+     * event occurs.
      *
-     * You can see <a href="https://github.com/real-logic/artio/wiki/Cancel-On-Disconnect-Notification">the wiki</a>
+     * You can see <a href="https://github.com/artiofix/artio/wiki/Cancel-On-Disconnect-Notification">the wiki</a>
      * for more details around Cancel on disconnect support.
      *
      * @param cancelOnDisconnectTimeoutHandler the handler to be invoked when a cancel on disconnect event occurs.
      * @return this
+     * @see #fixPCancelOnDisconnectTimeoutHandler(FixPCancelOnDisconnectTimeoutHandler)
      */
     public EngineConfiguration cancelOnDisconnectTimeoutHandler(
         final CancelOnDisconnectTimeoutHandler cancelOnDisconnectTimeoutHandler)
@@ -995,16 +1138,663 @@ public final class EngineConfiguration extends CommonConfiguration implements Au
         return this;
     }
 
+    /**
+     * Sets the cancel on disconnect timeout handler for FIXP connections. This is invoked when a cancel on disconnect
+     * event occurs.
+     *
+     * You can see <a href="https://github.com/artiofix/artio/wiki/Cancel-On-Disconnect-Notification">the wiki</a>
+     * for more details around Cancel on disconnect support.
+     *
+     * @param fixPCancelOnDisconnectTimeoutHandler the handler to be invoked when a cancel on disconnect event occurs.
+     * @return this
+     * @see #cancelOnDisconnectTimeoutHandler(CancelOnDisconnectTimeoutHandler)
+     */
+    public EngineConfiguration fixPCancelOnDisconnectTimeoutHandler(
+        final FixPCancelOnDisconnectTimeoutHandler fixPCancelOnDisconnectTimeoutHandler)
+    {
+        this.fixPCancelOnDisconnectTimeoutHandler = fixPCancelOnDisconnectTimeoutHandler;
+        return this;
+    }
+
+    /**
+     * Set the stream id from an admin API to a FIX Engine.
+     *
+     * @param inboundAdminStream the stream id from an admin API to a FIX Engine.
+     * @return this
+     */
+    public EngineConfiguration inboundAdminStream(final int inboundAdminStream)
+    {
+        this.inboundAdminStream = inboundAdminStream;
+        return this;
+    }
+
+    /**
+     * Set the stream id from a FIX Engine to an admin API.
+     *
+     * @param outboundAdminStream the stream id from a FIX Engine to an admin API.
+     * @return this
+     */
+    public EngineConfiguration outboundAdminStream(final int outboundAdminStream)
+    {
+        this.outboundAdminStream = outboundAdminStream;
+        return this;
+    }
+
+    /**
+     * Sets the interval that the time index, used for optimizing the {@link FixArchiveScanner}.
+     *
+     * Larger intervals reduce time index disk space consumption, smaller intervals improve time based archive scans.
+     *
+     * @param timeIndexReplayFlushIntervalInNs the interval before a record is written for the time index.
+     * @return this
+     */
+    public EngineConfiguration timeIndexReplayFlushIntervalInNs(final long timeIndexReplayFlushIntervalInNs)
+    {
+        this.timeIndexReplayFlushIntervalInNs = timeIndexReplayFlushIntervalInNs;
+        return this;
+    }
+
+    /**
+     * Allows disabling of the checksum calculation and validation of index files. Note: this does not affect the
+     * checksum calculation for AeronArchiver - only artio itself.
+     *
+     * @param indexChecksumEnabled true to enable, false to disable
+     * @return this
+     */
+    public EngineConfiguration indexChecksumEnabled(final boolean indexChecksumEnabled)
+    {
+        this.indexChecksumEnabled = indexChecksumEnabled;
+        return this;
+    }
+
+    /**
+     * Sets the message handler for outbound messages to be passed to when reproduction mode is enabled.
+     *
+     * See {@link #reproduceInbound(long, long)} in order to enable inbound reproduction.
+     *
+     * @param reproductionMessageHandler the message handler
+     * @return this
+     */
+    public EngineConfiguration reproductionMessageHandler(
+        final ReproductionMessageHandler reproductionMessageHandler)
+    {
+        this.reproductionMessageHandler = reproductionMessageHandler;
+        return this;
+    }
+
+    /**
+     * Enable inbound reproduction mode for the Engine.
+     *
+     * Inbound reproduction mode needs to be started using: {@link FixEngine#startReproduction()}. In order to use this
+     * with libraries then libraries must have their
+     * {@link uk.co.real_logic.artio.library.LibraryConfiguration#reproduceInbound(long, long)} mode enabled.
+     *
+     * @param startInNs the start time to reproduce from.
+     * @param endInNs the end time to reproduce until.
+     * @return this
+     */
+    public EngineConfiguration reproduceInbound(
+        final long startInNs, final long endInNs)
+    {
+        final ReproductionClock clock = new ReproductionClock(startInNs);
+        epochNanoClock(clock);
+        this.reproductionConfiguration = new EngineReproductionConfiguration(
+            startInNs, endInNs, clock);
+        writeReproductionLog(false);
+        return this;
+    }
+
+    /**
+     * Set whether writing the reproduction log is enabled or disabled. Disabled by default.
+     *
+     * This logs additional events on the {@link #reproductionLogStream(int)} in order to enable a more accurate
+     * reproduction of events. For example: at what point back-pressure happens. These events are not needed in order
+     * to perform an inbound reproduction: they just make the inbound reproduction more accurate.
+     *
+     * @param writeReproductionLog true to enable the reproduction log
+     * @return this
+     */
+    public EngineConfiguration writeReproductionLog(final boolean writeReproductionLog)
+    {
+        this.writeReproductionLog = writeReproductionLog;
+        return this;
+    }
+
+    /**
+     * Sets the Aeron stream id for the reproduction event stream. The Aeron channel used in conjunction with
+     * this stream is {@link io.aeron.CommonContext#IPC_CHANNEL}.
+     *
+     * This is unused unless {@link #writeReproductionLog(boolean)} is set to true.
+     *
+     * @param reproductionLogStream the Aeron stream id for the reproduction event stream.
+     * @return this
+     */
+    public EngineConfiguration reproductionLogStream(final int reproductionLogStream)
+    {
+        this.reproductionLogStream = reproductionLogStream;
+        return this;
+    }
+
+    /**
+     * Sets the Aeron stream id for replaying the archive log when running a reproduction. The Aeron channel used in
+     * conjunction with this stream is {@link io.aeron.CommonContext#IPC_CHANNEL}.
+     *
+     * This is unused unless {@link #reproduceInbound(long, long)} is enabled.
+     *
+     * @param reproductionReplayStream the Aeron stream id for the reproduction replay stream.
+     * @return this
+     */
+    public EngineConfiguration reproductionReplayStream(final int reproductionReplayStream)
+    {
+        this.reproductionReplayStream = reproductionReplayStream;
+        return this;
+    }
+
+    /**
+     * Sets the default option for accepted sessions in the case that no cancel on disconnect option is provided by the
+     * initiator on the logon message. The default value for this field is
+     * {@link CancelOnDisconnectOption#DO_NOT_CANCEL_ON_DISCONNECT_OR_LOGOUT}.
+     *
+     * @param cancelOnDisconnectOption the cancel on disconnect option to use if none is provided by the initiator.
+     * @return this
+     */
+    public EngineConfiguration cancelOnDisconnectOption(final CancelOnDisconnectOption cancelOnDisconnectOption)
+    {
+        this.cancelOnDisconnectOption = cancelOnDisconnectOption;
+        return this;
+    }
+
+    /**
+     * Sets the default cancel on disconnection timeout window for accepted sessions in the case that none is provided
+     * by the initiator on the logon message. This is only used when the resolved cancel on disconnect option is not
+     * {@link CancelOnDisconnectOption#DO_NOT_CANCEL_ON_DISCONNECT_OR_LOGOUT}. The default value for this field is
+     * {@link #DEFAULT_CANCEL_ON_DISCONNECT_TIMEOUT_WINDOW_IN_MS}.
+     *
+     * @param cancelOnDisconnectTimeoutWindowInMs the cancel on disconnect timeout window to use if none is provided by
+     *                                            the initiator.
+     * @return this
+     */
+    public EngineConfiguration cancelOnDisconnectTimeoutWindowInMs(final int cancelOnDisconnectTimeoutWindowInMs)
+    {
+        this.cancelOnDisconnectTimeoutWindowInMs = cancelOnDisconnectTimeoutWindowInMs;
+        return this;
+    }
+
+    /**
+     * Sets the initial connectionId to start with.
+     *
+     * @param initialConnectionId initial connection id
+     * @return this
+     */
+    public EngineConfiguration initialConnectionId(final long initialConnectionId)
+    {
+        this.initialConnectionId = initialConnectionId;
+        return this;
+    }
+
+    /**
+     * Set a threshold for the framer work cycle time which when exceeded it will increment the
+     * framer cycle time exceeded count.
+     *
+     * @param framerCycleThresholdNs value in nanoseconds. The value 0 will disable duty cycle tracking on the framer.
+     * @return this for fluent API.
+     */
+    public EngineConfiguration framerCycleThresholdNs(final long framerCycleThresholdNs)
+    {
+        this.framerCycleThresholdNs = framerCycleThresholdNs;
+        return this;
+    }
+
+    /**
+     * Set a threshold for the indexer work cycle time which when exceeded it will increment the
+     * indexer cycle time exceeded count.
+     *
+     * @param indexerCycleThresholdNs value in nanoseconds. The value 0 will disable duty cycle tracking on the indexer.
+     * @return this for fluent API.
+     */
+    public EngineConfiguration indexerCycleThresholdNs(final long indexerCycleThresholdNs)
+    {
+        this.indexerCycleThresholdNs = indexerCycleThresholdNs;
+        return this;
+    }
+
+    // ---------------------
+    // END SETTERS
+    // ---------------------
+
+    // ------------------------
+    // BEGIN INHERITED SETTERS
+    // ------------------------
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public EngineConfiguration sendingTimeWindowInMs(final long sendingTimeWindowInMs)
+    {
+        super.sendingTimeWindowInMs(sendingTimeWindowInMs);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public EngineConfiguration defaultHeartbeatIntervalInS(final int value)
+    {
+        super.defaultHeartbeatIntervalInS(value);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public EngineConfiguration forcedHeartbeatIntervalInS(final int value)
+    {
+        super.forcedHeartbeatIntervalInS(value);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public CommonConfiguration disableHeartbeatRepliesToTestRequests(
+        final boolean disableHeartbeatRepliesToTestRequests)
+    {
+        return super.disableHeartbeatRepliesToTestRequests(disableHeartbeatRepliesToTestRequests);
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public EngineConfiguration sessionIdStrategy(final SessionIdStrategy sessionIdStrategy)
+    {
+        super.sessionIdStrategy(sessionIdStrategy);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public EngineConfiguration sessionCustomisationStrategy(
+        final SessionCustomisationStrategy sessionCustomisationStrategy)
+    {
+        super.sessionCustomisationStrategy(sessionCustomisationStrategy);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public EngineConfiguration messageValidationStrategy(final MessageValidationStrategy messageValidationStrategy)
+    {
+        super.messageValidationStrategy(messageValidationStrategy);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public EngineConfiguration reasonableTransmissionTimeInMs(final long reasonableTransmissionTimeInMs)
+    {
+        super.reasonableTransmissionTimeInMs(reasonableTransmissionTimeInMs);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public EngineConfiguration monitoringBuffersLength(final Integer monitoringBuffersLength)
+    {
+        super.monitoringBuffersLength(monitoringBuffersLength);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public EngineConfiguration monitoringFile(final String monitoringFile)
+    {
+        super.monitoringFile(monitoringFile);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    @SuppressWarnings("Deprecated")
+    @Deprecated
+    public EngineConfiguration printErrorMessages(final boolean printErrorMessages)
+    {
+        super.printErrorMessages(printErrorMessages);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    @SuppressWarnings("Deprecated")
+    @Deprecated
+    public EngineConfiguration customErrorConsumer(final ErrorConsumer customErrorConsumer)
+    {
+        super.customErrorConsumer(customErrorConsumer);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public EngineConfiguration errorHandlerFactory(final ErrorHandlerFactory errorHandlerFactory)
+    {
+        super.errorHandlerFactory(errorHandlerFactory);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public EngineConfiguration monitoringAgentFactory(final MonitoringAgentFactory monitoringAgentFactory)
+    {
+        super.monitoringAgentFactory(monitoringAgentFactory);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public EngineConfiguration monitoringThreadIdleStrategy(final IdleStrategy errorPrinterIdleStrategy)
+    {
+        super.monitoringThreadIdleStrategy(errorPrinterIdleStrategy);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public EngineConfiguration replyTimeoutInMs(final long replyTimeoutInMs)
+    {
+        super.replyTimeoutInMs(replyTimeoutInMs);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public EngineConfiguration inboundMaxClaimAttempts(final int inboundMaxClaimAttempts)
+    {
+        super.inboundMaxClaimAttempts(inboundMaxClaimAttempts);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public EngineConfiguration outboundMaxClaimAttempts(final int outboundMaxClaimAttempts)
+    {
+        super.outboundMaxClaimAttempts(outboundMaxClaimAttempts);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public EngineConfiguration sessionBufferSize(final int bufferSize)
+    {
+        super.sessionBufferSize(bufferSize);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public EngineConfiguration histogramPollPeriodInMs(final long histogramPollPeriodInMs)
+    {
+        super.histogramPollPeriodInMs(histogramPollPeriodInMs);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public EngineConfiguration histogramLoggingFile(final String histogramLoggingFile)
+    {
+        super.histogramLoggingFile(histogramLoggingFile);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public EngineConfiguration histogramHandler(final HistogramHandler histogramHandler)
+    {
+        super.histogramHandler(histogramHandler);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public EngineConfiguration agentNamePrefix(final String agentNamePrefix)
+    {
+        super.agentNamePrefix(agentNamePrefix);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public EngineConfiguration printAeronStreamIdentifiers(final boolean printAeronStreamIdentifiers)
+    {
+        super.printAeronStreamIdentifiers(printAeronStreamIdentifiers);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public EngineConfiguration epochNanoClock(final EpochNanoClock epochNanoClock)
+    {
+        super.epochNanoClock(epochNanoClock);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public EngineConfiguration inboundLibraryStream(final int inboundLibraryStream)
+    {
+        super.inboundLibraryStream(inboundLibraryStream);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public EngineConfiguration outboundLibraryStream(final int outboundLibraryStream)
+    {
+        super.outboundLibraryStream(outboundLibraryStream);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public EngineConfiguration threadFactory(final ThreadFactory threadFactory)
+    {
+        super.threadFactory(threadFactory);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public EngineConfiguration validateCompIdsOnEveryMessage(final boolean validateCompIdsOnEveryMessage)
+    {
+        super.validateCompIdsOnEveryMessage(validateCompIdsOnEveryMessage);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public EngineConfiguration validateTimeStrictly(final boolean validateTimeStrictly)
+    {
+        super.validateTimeStrictly(validateTimeStrictly);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public EngineConfiguration sessionEpochFractionFormat(final EpochFractionFormat sessionEpochFractionFormat)
+    {
+        super.sessionEpochFractionFormat(sessionEpochFractionFormat);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public EngineConfiguration maxFixPKeepaliveTimeoutInMs(final long maxFixPKeepaliveTimeoutInMs)
+    {
+        super.maxFixPKeepaliveTimeoutInMs(maxFixPKeepaliveTimeoutInMs);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public EngineConfiguration minFixPKeepaliveTimeoutInMs(final long minFixPKeepaliveTimeoutInMs)
+    {
+        super.minFixPKeepaliveTimeoutInMs(minFixPKeepaliveTimeoutInMs);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public EngineConfiguration acceptorFixPKeepaliveTimeoutInMs(final long acceptorFixPKeepaliveTimeoutInMs)
+    {
+        super.acceptorFixPKeepaliveTimeoutInMs(acceptorFixPKeepaliveTimeoutInMs);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public EngineConfiguration noEstablishFixPTimeoutInMs(final long noEstablishFixPTimeoutInMs)
+    {
+        super.noEstablishFixPTimeoutInMs(noEstablishFixPTimeoutInMs);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public EngineConfiguration fixPAcceptedSessionMaxRetransmissionRange(
+        final int fixPAcceptedSessionMaxRetransmissionRange)
+    {
+        super.fixPAcceptedSessionMaxRetransmissionRange(fixPAcceptedSessionMaxRetransmissionRange);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public EngineConfiguration resendRequestController(final ResendRequestController resendRequestController)
+    {
+        super.resendRequestController(resendRequestController);
+        return this;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public EngineConfiguration gatewayId(final long gatewayId)
+    {
+        super.gatewayId(gatewayId);
+        return this;
+    }
+
+    // ------------------------
+    // END INHERITED SETTERS
+    // ------------------------
+
+    // ---------------------
+    // BEGIN GETTERS
+    // ---------------------
+
+    /**
+     * See {@link #cancelOnDisconnectTimeoutHandler(CancelOnDisconnectTimeoutHandler)} for details.
+     *
+     * @return the cancel on disconnect timeout handler
+     */
     public CancelOnDisconnectTimeoutHandler cancelOnDisconnectTimeoutHandler()
     {
         return cancelOnDisconnectTimeoutHandler;
     }
 
+    /**
+     * See {@link #fixPCancelOnDisconnectTimeoutHandler(FixPCancelOnDisconnectTimeoutHandler)} for details.
+     *
+     * @return the FIXP cancel on disconnect timeout handler
+     */
+    public FixPCancelOnDisconnectTimeoutHandler fixPCancelOnDisconnectTimeoutHandler()
+    {
+        return fixPCancelOnDisconnectTimeoutHandler;
+    }
+
+    /**
+     * See {@link #receiverBufferSize(int)} for details.
+     *
+     * @return the receiver buffer size
+     */
     public int receiverBufferSize()
     {
         return receiverBufferSize;
     }
 
+    /**
+     * See {@link #receiverSocketBufferSize(int)} for details.
+     *
+     * @return the receiver socket buffer size
+     */
     public int receiverSocketBufferSize()
     {
         return receiverSocketBufferSize;
@@ -1035,9 +1825,14 @@ public final class EngineConfiguration extends CommonConfiguration implements Au
         return logFileDir;
     }
 
-    public int replayIndexFileSize()
+    public int replayIndexFileRecordCapacity()
     {
-        return replayIndexFileSize;
+        return replayIndexFileRecordCapacity;
+    }
+
+    public int replayIndexSegmentRecordCapacity()
+    {
+        return replayIndexSegmentRecordCapacity;
     }
 
     public int loggerCacheSetSize()
@@ -1068,6 +1863,26 @@ public final class EngineConfiguration extends CommonConfiguration implements Au
     boolean logAnyMessages()
     {
         return logInboundMessages || logOutboundMessages;
+    }
+
+    public boolean isReproductionEnabled()
+    {
+        return reproductionConfiguration != null;
+    }
+
+    public ReproductionMessageHandler reproductionMessageHandler()
+    {
+        return reproductionMessageHandler;
+    }
+
+    boolean requiresAeronArchive()
+    {
+        return logAnyMessages() || isReproductionEnabled();
+    }
+
+    public boolean canReplayInbound()
+    {
+        return logInboundMessages() || isReproductionEnabled();
     }
 
     public boolean logAllMessages()
@@ -1132,6 +1947,30 @@ public final class EngineConfiguration extends CommonConfiguration implements Au
             fixPBuffer = mapFile(DEFAULT_FIXP_ID_FILE, sessionIdBufferSize);
         }
         return fixPBuffer;
+    }
+
+    /**
+     * Gets the SessionIdGenerator used for generating unique session identifiers.
+     * If not explicitly set, returns a default IncrementalSessionIdGenerator.
+     *
+     * @return the session ID generator
+     */
+    public SessionIdGenerator sessionIdGenerator()
+    {
+        return sessionIdGenerator;
+    }
+
+    /**
+     * Sets a custom SessionIdGenerator for generating session identifiers.
+     * This allows for distributed session ID generation strategies like Snowflake IDs.
+     *
+     * @param sessionIdGenerator the session ID generator to use
+     * @return this configuration for method chaining
+     */
+    public EngineConfiguration sessionIdGenerator(final SessionIdGenerator sessionIdGenerator)
+    {
+        this.sessionIdGenerator = sessionIdGenerator;
+        return this;
     }
 
     public Set<String> gapfillOnReplayMessageTypes()
@@ -1244,150 +2083,14 @@ public final class EngineConfiguration extends CommonConfiguration implements Au
         return errorIfDuplicateEngineDetected;
     }
 
-    public boolean acceptsBinaryEntryPoint()
+    public boolean acceptsFixP()
     {
-        return acceptsBinaryEntryPoint;
+        return acceptorFixPProtocol != null;
     }
 
     public FixPProtocolType supportedFixPProtocolType()
     {
-        return acceptsBinaryEntryPoint ? BINARY_ENTRYPOINT : ILINK_3;
-    }
-
-    /**
-     * {@inheritDoc}
-     */
-    public EngineConfiguration monitoringBuffersLength(final Integer monitoringBuffersLength)
-    {
-        super.monitoringBuffersLength(monitoringBuffersLength);
-        return this;
-    }
-
-    /**
-     * {@inheritDoc}
-     */
-    public EngineConfiguration monitoringFile(final String monitoringFile)
-    {
-        super.monitoringFile(monitoringFile);
-        return this;
-    }
-
-    /**
-     * {@inheritDoc}
-     */
-    public EngineConfiguration replyTimeoutInMs(final long replyTimeoutInMs)
-    {
-        super.replyTimeoutInMs(replyTimeoutInMs);
-        return this;
-    }
-
-    /**
-     * {@inheritDoc}
-     */
-    public EngineConfiguration agentNamePrefix(final String agentNamePrefix)
-    {
-        super.agentNamePrefix(agentNamePrefix);
-        return this;
-    }
-
-    /**
-     * {@inheritDoc}
-     */
-    public EngineConfiguration printAeronStreamIdentifiers(final boolean printAeronStreamIdentifiers)
-    {
-        super.printAeronStreamIdentifiers(printAeronStreamIdentifiers);
-        return this;
-    }
-
-    /**
-     * {@inheritDoc}
-     */
-    public EngineConfiguration inboundLibraryStream(final int inboundLibraryStream)
-    {
-        super.inboundLibraryStream(inboundLibraryStream);
-        return this;
-    }
-
-    /**
-     * {@inheritDoc}
-     */
-    public EngineConfiguration outboundLibraryStream(final int outboundLibraryStream)
-    {
-        super.outboundLibraryStream(outboundLibraryStream);
-        return this;
-    }
-
-    /**
-     * Set the stream id from an admin API to a FIX Engine.
-     *
-     * @param inboundAdminStream the stream id from an admin API to a FIX Engine.
-     * @return this
-     */
-    public EngineConfiguration inboundAdminStream(final int inboundAdminStream)
-    {
-        this.inboundAdminStream = inboundAdminStream;
-        return this;
-    }
-
-    /**
-     * Set the stream id from a FIX Engine to an admin API.
-     *
-     * @param outboundAdminStream the stream id from a FIX Engine to an admin API.
-     * @return this
-     */
-    public EngineConfiguration outboundAdminStream(final int outboundAdminStream)
-    {
-        this.outboundAdminStream = outboundAdminStream;
-        return this;
-    }
-
-    /**
-     * {@inheritDoc}
-     */
-    @SuppressWarnings("Deprecated")
-    @Deprecated
-    public EngineConfiguration printErrorMessages(final boolean printErrorMessages)
-    {
-        super.printErrorMessages(printErrorMessages);
-        return this;
-    }
-
-    /**
-     * {@inheritDoc}
-     */
-    @SuppressWarnings("Deprecated")
-    @Deprecated
-    public EngineConfiguration customErrorConsumer(final ErrorConsumer customErrorConsumer)
-    {
-        super.customErrorConsumer(customErrorConsumer);
-        return this;
-    }
-
-    /**
-     * {@inheritDoc}
-     */
-    public EngineConfiguration errorHandlerFactory(final ErrorHandlerFactory errorHandlerFactory)
-    {
-        super.errorHandlerFactory(errorHandlerFactory);
-        return this;
-    }
-
-    /**
-     * {@inheritDoc}
-     */
-    public EngineConfiguration monitoringAgentFactory(final MonitoringAgentFactory monitoringAgentFactory)
-    {
-        super.monitoringAgentFactory(monitoringAgentFactory);
-        return this;
-    }
-
-    /**
-     * {@inheritDoc}
-     */
-    public EngineConfiguration defaultHeartbeatIntervalInS(final int value)
-    {
-        super.defaultHeartbeatIntervalInS(value);
-        return this;
+        return acceptsFixP() ? acceptorFixPProtocol : ILINK_3;
     }
 
     public AeronArchive.Context aeronArchiveContext()
@@ -1460,9 +2163,90 @@ public final class EngineConfiguration extends CommonConfiguration implements Au
         return throttleLimitOfMessages;
     }
 
+    public int throttleBusinessRejectReason()
+    {
+        return throttleBusinessRejectReason;
+    }
+
+    public long timeIndexReplayFlushIntervalInNs()
+    {
+        return timeIndexReplayFlushIntervalInNs;
+    }
+
+    public CancelOnDisconnectOption cancelOnDisconnectOption()
+    {
+        return cancelOnDisconnectOption;
+    }
+
+    public int cancelOnDisconnectTimeoutWindowInMs()
+    {
+        return cancelOnDisconnectTimeoutWindowInMs;
+    }
+
+    public long initialConnectionId()
+    {
+        return initialConnectionId;
+    }
+
+    public long framerCycleThresholdNs()
+    {
+        return framerCycleThresholdNs;
+    }
+
+    public long indexerCycleThresholdNs()
+    {
+        return indexerCycleThresholdNs;
+    }
+
+    public boolean indexChecksumEnabled()
+    {
+        return indexChecksumEnabled;
+    }
+
+    public EngineReproductionConfiguration reproductionConfiguration()
+    {
+        return reproductionConfiguration;
+    }
+
+    public boolean writeReproductionLog()
+    {
+        return writeReproductionLog;
+    }
+
+    public int reproductionLogStream()
+    {
+        return reproductionLogStream;
+    }
+
+    public int reproductionReplayStream()
+    {
+        return reproductionReplayStream;
+    }
+
+    // ---------------------
+    // END GETTERS
+    // ---------------------
+
+    @SuppressWarnings("methodLength")
     public EngineConfiguration conclude()
     {
         super.conclude("engine");
+
+        if (isReproductionEnabled())
+        {
+            if (reproductionConfiguration.clock() != epochNanoClock())
+            {
+                throw new IllegalArgumentException("Do no set the nano clock when using reproduction mode");
+            }
+
+            if (writeReproductionLog())
+            {
+                throw new IllegalArgumentException(
+                    "Do not set writeReproductionLog(true) when using reproduction mode");
+            }
+
+            bindAtStartup(false);
+        }
 
         if (libraryAeronChannel() == null)
         {
@@ -1484,6 +2268,11 @@ public final class EngineConfiguration extends CommonConfiguration implements Au
                 sessionBufferSize()));
         }
 
+        if (acceptsFixP() && !logAllMessages())
+        {
+            throw new IllegalArgumentException("FIXP acceptor is not supported without logging messages");
+        }
+
         if (deleteLogFileDirOnStart())
         {
             final File logFileDir = new File(logFileDir());
@@ -1500,7 +2289,9 @@ public final class EngineConfiguration extends CommonConfiguration implements Au
 
         if (sentSequenceNumberBuffer() == null)
         {
-            sentSequenceNumberBuffer = new UnsafeBuffer(new byte[sequenceNumberIndexSize]);
+            // TODO (40619): Potential Issue...
+            sentSequenceNumberBuffer = checkAligned(new UnsafeBuffer(
+                BufferUtil.allocateDirectAligned(sequenceNumberIndexSize, AtomicBuffer.ALIGNMENT)));
         }
 
         if (receivedSequenceNumberIndex() == null)
@@ -1510,7 +2301,8 @@ public final class EngineConfiguration extends CommonConfiguration implements Au
 
         if (receivedSequenceNumberBuffer() == null)
         {
-            receivedSequenceNumberBuffer = new UnsafeBuffer(new byte[sequenceNumberIndexSize]);
+            receivedSequenceNumberBuffer = checkAligned(new UnsafeBuffer(
+                BufferUtil.allocateDirectAligned(sequenceNumberIndexSize, AtomicBuffer.ALIGNMENT)));
         }
 
         if (sessionIdBuffer() == null)
@@ -1528,8 +2320,28 @@ public final class EngineConfiguration extends CommonConfiguration implements Au
             acceptorfixDictionary(FixDictionary.findDefault());
         }
 
+        if (sessionIdGenerator == null)
+        {
+            sessionIdGenerator = new IncrementalSessionIdGenerator();
+        }
+
+        if (Strings.isEmpty(aeronContext().clientName()))
+        {
+            aeronContext().clientName("fix-library-" + gatewayId() + "-" + ENGINE_LIBRARY_ID);
+        }
+
+        if (Strings.isEmpty(archiveContext.clientName()))
+        {
+            archiveContext.clientName("fix-library-" + gatewayId() + "-" + ENGINE_LIBRARY_ID);
+        }
+
         aeronContextClone = aeronContext().clone();
         archiveContextClone = archiveContext.clone();
+
+        if (CommonContext.shouldPrintConfigurationOnStart())
+        {
+            System.out.println(this);
+        }
 
         return this;
     }
@@ -1555,11 +2367,104 @@ public final class EngineConfiguration extends CommonConfiguration implements Au
             (streamId == inboundLibraryStream() && logInboundMessages());
     }
 
+    @Override
     public void close()
     {
         CloseHelper.close(sentSequenceNumberIndex);
         CloseHelper.close(receivedSequenceNumberIndex);
         CloseHelper.close(sessionIdBuffer);
         CloseHelper.close(fixPBuffer);
+    }
+
+    @Override
+    public String toString()
+    {
+        return "EngineConfiguration" +
+            "\n{" +
+            "\n    host='" + host + '\'' +
+            "\n    port=" + port +
+            "\n    replayIndexFileRecordCapacity=" + replayIndexFileRecordCapacity +
+            "\n    replayIndexSegmentRecordCapacity=" + replayIndexSegmentRecordCapacity +
+            "\n    logFileDir='" + logFileDir + '\'' +
+            "\n    loggerCacheNumSets=" + loggerCacheNumSets +
+            "\n    loggerCacheSetSize=" + loggerCacheSetSize +
+            "\n    logInboundMessages=" + logInboundMessages +
+            "\n    logOutboundMessages=" + logOutboundMessages +
+            "\n    printStartupWarnings=" + printStartupWarnings +
+            "\n    framerIdleStrategy=" + framerIdleStrategy +
+            "\n    archiverIdleStrategy=" + archiverIdleStrategy +
+            "\n    sentSequenceNumberBuffer=" + sentSequenceNumberBuffer +
+            "\n    receivedSequenceNumberBuffer=" + receivedSequenceNumberBuffer +
+            "\n    sentSequenceNumberIndex=" + sentSequenceNumberIndex +
+            "\n    receivedSequenceNumberIndex=" + receivedSequenceNumberIndex +
+            "\n    sessionIdBuffer=" + sessionIdBuffer +
+            "\n    fixPBuffer=" + fixPBuffer +
+            "\n    sessionIdGenerator=" + sessionIdGenerator +
+            "\n    gapfillOnReplayMessageTypes=" + gapfillOnReplayMessageTypes +
+            "\n    gapfillOnRetransmitILinkTemplateIds=" + gapfillOnRetransmitILinkTemplateIds +
+            "\n    archiveContext=" + archiveContext +
+            "\n    archiveContextClone=" + archiveContextClone +
+            "\n    aeronContextClone=" + aeronContextClone +
+            "\n    outboundLibraryFragmentLimit=" + outboundLibraryFragmentLimit +
+            "\n    replayFragmentLimit=" + replayFragmentLimit +
+            "\n    inboundBytesReceivedLimit=" + inboundBytesReceivedLimit +
+            "\n    receiverBufferSize=" + receiverBufferSize +
+            "\n    receiverSocketBufferSize=" + receiverSocketBufferSize +
+            "\n    senderSocketBufferSize=" + senderSocketBufferSize +
+            "\n    sequenceNumberIndexSize=" + sequenceNumberIndexSize +
+            "\n    sessionIdBufferSize=" + sessionIdBufferSize +
+            "\n    senderMaxBytesInBuffer=" + senderMaxBytesInBuffer +
+            "\n    noLogonDisconnectTimeoutInMs=" + noLogonDisconnectTimeoutInMs +
+            "\n    indexChecksumEnabled=" + indexChecksumEnabled +
+            "\n    libraryAeronChannel='" + libraryAeronChannel + '\'' +
+            "\n    channelSupplierFactory=" + channelSupplierFactory +
+            "\n    sessionPersistenceStrategy=" + sessionPersistenceStrategy +
+            "\n    slowConsumerTimeoutInMs=" + slowConsumerTimeoutInMs +
+            "\n    scheduler=" + scheduler +
+            "\n    replayHandler=" + replayHandler +
+            "\n    fixPRetransmitHandler=" + fixPRetransmitHandler +
+            "\n    outboundReplayStream=" + outboundReplayStream +
+            "\n    archiveReplayStream=" + archiveReplayStream +
+            "\n    reproductionLogStream=" + reproductionLogStream +
+            "\n    reproductionReplayStream=" + reproductionReplayStream +
+            "\n    acceptedSessionClosedResendInterval=" + acceptedSessionClosedResendInterval +
+            "\n    acceptedSessionResendRequestChunkSize=" + acceptedSessionResendRequestChunkSize +
+            "\n    acceptedSessionSendRedundantResendRequests=" + acceptedSessionSendRedundantResendRequests +
+            "\n    acceptedEnableLastMsgSeqNumProcessed=" + acceptedEnableLastMsgSeqNumProcessed +
+            "\n    initialAcceptedSessionOwner=" + initialAcceptedSessionOwner +
+            "\n    authenticationStrategy=" + authenticationStrategy +
+            "\n    fixPAuthenticationStrategy=" + fixPAuthenticationStrategy +
+            "\n    indexFileStateFlushTimeoutInMs=" + indexFileStateFlushTimeoutInMs +
+            "\n    acceptorfixDictionary=" + acceptorfixDictionary +
+            "\n    lookupDefaultAcceptorfixDictionary=" + lookupDefaultAcceptorfixDictionary +
+            "\n    acceptorFixDictionaryOverrides=" + acceptorFixDictionaryOverrides +
+            "\n    deleteLogFileDirOnStart=" + deleteLogFileDirOnStart +
+            "\n    authenticationTimeoutInMs=" + authenticationTimeoutInMs +
+            "\n    bindAtStartup=" + bindAtStartup +
+            "\n    initialSequenceIndex=" + initialSequenceIndex +
+            "\n    messageTimingHandler=" + messageTimingHandler +
+            "\n    maxConcurrentSessionReplays=" + maxConcurrentSessionReplays +
+            "\n    replayPositionBufferSize=" + replayPositionBufferSize +
+            "\n    duplicateEngineTimeoutInMs=" + duplicateEngineTimeoutInMs +
+            "\n    errorIfDuplicateEngineDetected=" + errorIfDuplicateEngineDetected +
+            "\n    inboundAdminStream=" + inboundAdminStream +
+            "\n    outboundAdminStream=" + outboundAdminStream +
+            "\n    acceptorFixPProtocol=" + acceptorFixPProtocol +
+            "\n    cancelOnDisconnectTimeoutHandler=" + cancelOnDisconnectTimeoutHandler +
+            "\n    fixPCancelOnDisconnectTimeoutHandler=" + fixPCancelOnDisconnectTimeoutHandler +
+            "\n    throttleWindowInMs=" + throttleWindowInMs +
+            "\n    throttleLimitOfMessages=" + throttleLimitOfMessages +
+            "\n    throttleBusinessRejectReason=" + throttleBusinessRejectReason +
+            "\n    timeIndexReplayFlushIntervalInNs=" + timeIndexReplayFlushIntervalInNs +
+            "\n    cancelOnDisconnectOption=" + cancelOnDisconnectOption +
+            "\n    cancelOnDisconnectTimeoutWindowInMs=" + cancelOnDisconnectTimeoutWindowInMs +
+            "\n    initialConnectionId=" + initialConnectionId +
+            "\n    framerCycleThresholdNs=" + framerCycleThresholdNs +
+            "\n    indexerCycleThresholdNs=" + indexerCycleThresholdNs +
+            "\n    reproductionConfiguration=" + reproductionConfiguration +
+            "\n    reproductionMessageHandler=" + reproductionMessageHandler +
+            "\n    writeReproductionLog=" + writeReproductionLog +
+            "\n}" +
+            "\nEngineConfiguration." + super.toString();
     }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,16 +19,11 @@ import io.aeron.logbuffer.ControlledFragmentHandler.Action;
 import org.agrona.DirectBuffer;
 import org.agrona.concurrent.EpochNanoClock;
 import org.agrona.concurrent.status.AtomicCounter;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 import org.mockito.verification.VerificationMode;
-import uk.co.real_logic.artio.builder.Encoder;
-import uk.co.real_logic.artio.builder.HeaderEncoder;
-import uk.co.real_logic.artio.builder.SessionHeaderEncoder;
-import uk.co.real_logic.artio.builder.TestRequestEncoder;
-import uk.co.real_logic.artio.builder.ExampleMessageEncoder;
+import uk.co.real_logic.artio.builder.*;
 import uk.co.real_logic.artio.decoder.ExampleMessageDecoder;
 import uk.co.real_logic.artio.decoder.SequenceResetDecoder;
 import uk.co.real_logic.artio.dictionary.FixDictionary;
@@ -50,19 +45,20 @@ import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.lessThanOrEqualTo;
-import static org.junit.Assert.*;
+import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
-import static uk.co.real_logic.artio.messages.CancelOnDisconnectOption.DO_NOT_CANCEL_ON_DISCONNECT_OR_LOGOUT;
 import static uk.co.real_logic.artio.CommonConfiguration.DEFAULT_REASONABLE_TRANSMISSION_TIME_IN_S;
+import static uk.co.real_logic.artio.CommonConfiguration.NO_FORCED_HEARTBEAT_INTERVAL;
 import static uk.co.real_logic.artio.Constants.NEW_SEQ_NO;
 import static uk.co.real_logic.artio.dictionary.generation.CodecUtil.MISSING_INT;
 import static uk.co.real_logic.artio.dictionary.generation.CodecUtil.MISSING_LONG;
 import static uk.co.real_logic.artio.fields.RejectReason.*;
-import static uk.co.real_logic.artio.messages.DisconnectReason.APPLICATION_DISCONNECT;
+import static uk.co.real_logic.artio.messages.CancelOnDisconnectOption.DO_NOT_CANCEL_ON_DISCONNECT_OR_LOGOUT;
+import static uk.co.real_logic.artio.messages.DisconnectReason.*;
 import static uk.co.real_logic.artio.messages.SessionState.*;
+import static uk.co.real_logic.artio.session.DirectSessionProxy.NO_LAST_MSG_SEQ_NUM_PROCESSED;
 import static uk.co.real_logic.artio.session.Session.TEST_REQ_ID;
 import static uk.co.real_logic.artio.session.Session.UNKNOWN;
-import static uk.co.real_logic.artio.session.DirectSessionProxy.NO_LAST_MSG_SEQ_NUM_PROCESSED;
 
 public abstract class AbstractSessionTest
 {
@@ -77,6 +73,8 @@ public abstract class AbstractSessionTest
     static final int SEQUENCE_INDEX = 0;
 
     private static final char[] MSG_TYPE_CHARS = "D".toCharArray();
+
+    final char[] testReqId = "ABC".toCharArray();
 
     static final long POSITION = 1024;
 
@@ -93,7 +91,10 @@ public abstract class AbstractSessionTest
     ArgumentCaptor<Integer> offsetCaptor = ArgumentCaptor.forClass(Integer.class);
     ArgumentCaptor<Integer> lengthCaptor = ArgumentCaptor.forClass(Integer.class);
     TestRequestEncoder testRequest = new TestRequestEncoder();
-    SessionProcessHandler mockLogonListener = mock(SessionProcessHandler.class);
+    FixSessionOwner fixSessionOwner = mock(FixSessionOwner.class);
+    int forcedHeartbeatIntervalInS = NO_FORCED_HEARTBEAT_INTERVAL;
+    boolean disableHeartbeatRepliesToTestRequests = false;
+    Session session;
 
     AbstractSessionTest()
     {
@@ -118,6 +119,20 @@ public abstract class AbstractSessionTest
             anyInt(),
             eq(null),
             eq(0))).thenReturn(POSITION);
+        when(mockPublication.saveMessage(
+            bufferCaptor.capture(),
+            offsetCaptor.capture(),
+            lengthCaptor.capture(),
+            anyInt(),
+            anyLong(),
+            anyLong(),
+            anyInt(),
+            anyLong(),
+            any(),
+            anyInt(),
+            anyLong(),
+            eq(null),
+            eq(0))).thenReturn(POSITION);
 
         when(sessionProxy.sendResendRequest(anyInt(), anyInt(), anyInt(), eq(SEQUENCE_INDEX), anyInt()))
             .thenReturn(POSITION);
@@ -126,12 +141,6 @@ public abstract class AbstractSessionTest
     FixDictionary makeDictionary()
     {
         return FixDictionary.of(FixDictionary.findDefault());
-    }
-
-    @Before
-    public void shouldSetupDictionary()
-    {
-        verify(sessionProxy).fixDictionary(any());
     }
 
     @Test
@@ -258,10 +267,9 @@ public abstract class AbstractSessionTest
 
         session().trySendSequenceReset(newSentSeqNo, newReceivedSeqNo);
 
-        final int nextSequenceIndex = SEQUENCE_INDEX + 1;
-        verify(sessionProxy).sendSequenceReset(anyInt(), eq(newSentSeqNo), eq(nextSequenceIndex), anyInt());
+        verify(sessionProxy).sendSequenceReset(anyInt(), eq(newSentSeqNo), eq(SEQUENCE_INDEX), anyInt());
         assertEquals(newSentSeqNo - 1, session().lastSentMsgSeqNum());
-        assertSequenceIndexIs(nextSequenceIndex);
+        assertSequenceIndexIs(SEQUENCE_INDEX);
     }
 
     @Test
@@ -372,7 +380,10 @@ public abstract class AbstractSessionTest
 
     private void backPressureLogout()
     {
-        when(sessionProxy.sendLogout(anyInt(), eq(SEQUENCE_INDEX), anyInt())).thenReturn(BACK_PRESSURED, POSITION);
+        when(sessionProxy.sendLogout(anyInt(),
+          eq(SEQUENCE_INDEX),
+          anyInt(),
+          any())).thenReturn(BACK_PRESSURED, POSITION);
 
         backPressureDisconnect();
     }
@@ -390,15 +401,29 @@ public abstract class AbstractSessionTest
     @Test
     public void shouldReplyToTestRequestsWithAHeartbeat()
     {
-        final char[] testReqId = "ABC".toCharArray();
-        final int testReqIdLength = testReqId.length;
-
-        session().id(SESSION_ID);
-
-        session().onTestRequest(1, testReqId, testReqIdLength, sendingTime(), UNKNOWN, false, false, POSITION);
+        receiveTestRequest();
 
         verify(sessionProxy).sendHeartbeat(
-            1, testReqId, testReqIdLength, SEQUENCE_INDEX, NO_LAST_MSG_SEQ_NUM_PROCESSED);
+            1, testReqId, testReqId.length, SEQUENCE_INDEX, NO_LAST_MSG_SEQ_NUM_PROCESSED);
+    }
+
+    @Test
+    public void shouldReplyToTestRequestsWithAHeartbeatOnlyWhenConfigured()
+    {
+        disableHeartbeatRepliesToTestRequests = true;
+
+        receiveTestRequest();
+
+        verifyNoFurtherMessages();
+    }
+
+    private void receiveTestRequest()
+    {
+        final Session session = session();
+
+        session.id(SESSION_ID);
+        session.state(ACTIVE);
+        session.onTestRequest(1, testReqId, testReqId.length, sendingTime(), UNKNOWN, false, false, POSITION);
     }
 
     @Test
@@ -582,7 +607,76 @@ public abstract class AbstractSessionTest
 
         poll();
 
-        verifyDisconnect(times(1));
+        verifyLogout(9, times(1));
+    }
+
+    @Test
+    public void shouldLogoutAndDisconnectUponTimeoutOnlyOnce()
+    {
+        shouldSendTestRequestUponTimeout();
+
+        twoHeartBeatIntervalsPass();
+
+        poll();
+
+        assertState(DISCONNECTED);
+
+        poll();
+
+        verifyLogoutOnlyOnce();
+    }
+
+    @Test
+    public void shouldLogoutAndDisconnectUponTimeoutOnlyOnceWithCluster()
+    {
+        when(sessionProxy.isAsync()).thenReturn(true);
+
+        shouldSendTestRequestUponTimeout();
+
+        twoHeartBeatIntervalsPass();
+
+        poll();
+
+        // Initially we wait for the logout to be roundtripped via a cluster
+        assertState(AWAITING_ASYNC_PROXY_LOGOUT);
+
+        poll();
+
+        verifyLogoutOnlyOnce();
+
+        // Roundtrip completed, so we disconnect the session
+        session.onSessionWriterLogout();
+        verify(sessionProxy).sendRequestDisconnect(CONNECTION_ID, FIX_HEARTBEAT_TIMEOUT);
+        assertState(DISCONNECTED);
+    }
+
+    @Test
+    public void shouldLogoutOnLogonWithLowSequenceNumberAndWithAsyncProxy()
+    {
+        when(sessionProxy.isAsync()).thenReturn(true);
+
+        session().lastSentMsgSeqNum(10);
+        session().lastReceivedMsgSeqNum(5);
+
+        readyForLogon();
+        onLogon(2);
+
+        verify(sessionProxy).sendLowSequenceNumberLogout(
+            11, 6, 2, SEQUENCE_INDEX, NO_LAST_MSG_SEQ_NUM_PROCESSED);
+
+        // Initially we wait for the logout to be roundtripped via a cluster
+        assertState(AWAITING_ASYNC_PROXY_LOGOUT);
+
+        // Roundtrip completed, so we disconnect the session
+        session.onSessionWriterLogout();
+        verify(sessionProxy).sendRequestDisconnect(CONNECTION_ID, MSG_SEQ_NO_TOO_LOW);
+        assertState(DISCONNECTED);
+    }
+
+    private void verifyLogoutOnlyOnce()
+    {
+        verify(sessionProxy, times(1)).sendLogout(
+            anyInt(), eq(SEQUENCE_INDEX), eq(NO_LAST_MSG_SEQ_NUM_PROCESSED), any());
     }
 
     @Test
@@ -592,15 +686,36 @@ public abstract class AbstractSessionTest
 
         twoHeartBeatIntervalsPass();
 
-        backPressureDisconnect();
+        backPressureLogout();
+
+        poll();
+
+        assertState(LOGGING_OUT_AND_DISCONNECTING);
+
+        poll();
+
+        verifyLogout(9, times(2));
+    }
+
+    @Test
+    public void shouldKeepCustomLogoutTextWhenBackPressured()
+    {
+        shouldSendTestRequestUponTimeout();
+
+        fakeClock.advanceSeconds(1);
+
+        backPressureLogout();
+
+        final byte[] logoutTextBytes = "customText".getBytes();
+        session().logoutAndDisconnect(logoutTextBytes);
+
+        assertState(LOGGING_OUT_AND_DISCONNECTING);
 
         poll();
 
         assertState(DISCONNECTING);
 
-        poll();
-
-        verifyDisconnect(times(2));
+        verifyLogout(8, times(2), logoutTextBytes);
     }
 
     @Test
@@ -1034,6 +1149,37 @@ public abstract class AbstractSessionTest
         assertNotEquals(timeAsString1, timeAsString2); // make sure time has moved forward
     }
 
+    @Test
+    public void shouldTakeForcedHeartbeatConfigurationIntoAccount()
+    {
+        forcedHeartbeatIntervalInS = 5;
+        assertForcedHeartbeatInterval();
+
+        onLogon(1);
+        assertForcedHeartbeatInterval();
+
+        session().heartbeatIntervalInS(3);
+        assertForcedHeartbeatInterval();
+    }
+
+    @Test
+    public void shouldTakeForcedHeartbeatConfigurationIntoAccountForResetBasedLogons()
+    {
+        forcedHeartbeatIntervalInS = 5;
+        givenActive();
+
+        session().tryResetSequenceNumbers();
+        verifySendLogon(1, true);
+
+        onLogon(HEARTBEAT_INTERVAL_IN_S, 1, true);
+        assertForcedHeartbeatInterval();
+    }
+
+    void assertForcedHeartbeatInterval()
+    {
+        assertEquals(5_000, session().heartbeatIntervalInMs());
+    }
+
     private void verifySendingTimeAccuracyLogout()
     {
         verify(sessionProxy, times(1)).sendLogout(3, SEQUENCE_INDEX,
@@ -1085,11 +1231,16 @@ public abstract class AbstractSessionTest
 
     private void verifySetsSentSequenceNumbersToTwo(final int sequenceIndex)
     {
-        verify(sessionProxy).sendLogon(
-            eq(1), eq(HEARTBEAT_INTERVAL_IN_S), any(), any(), eq(true), eq(sequenceIndex), anyInt(),
-            any(), anyInt());
+        verifySendLogon(sequenceIndex, true);
         assertEquals(1, session().lastSentMsgSeqNum());
         verifyNoFurtherMessages();
+    }
+
+    void verifySendLogon(final int sequenceIndex, final boolean resetSeqNumFlag)
+    {
+        verify(sessionProxy).sendLogon(
+            eq(1), eq(HEARTBEAT_INTERVAL_IN_S), any(), any(), eq(resetSeqNumFlag), eq(sequenceIndex), anyInt(),
+            any(), anyInt());
     }
 
     private void sequenceNumbersAreThreeAndActive()
@@ -1163,7 +1314,12 @@ public abstract class AbstractSessionTest
 
     public void verifyLogout(final int msgSeqNo, final VerificationMode times)
     {
-        verify(sessionProxy, times).sendLogout(msgSeqNo, SEQUENCE_INDEX, NO_LAST_MSG_SEQ_NUM_PROCESSED);
+        verifyLogout(msgSeqNo, times, null);
+    }
+
+    public void verifyLogout(final int msgSeqNo, final VerificationMode times, final byte[] text)
+    {
+        verify(sessionProxy, times).sendLogout(msgSeqNo, SEQUENCE_INDEX, NO_LAST_MSG_SEQ_NUM_PROCESSED, text);
     }
 
     public void assertState(final SessionState state)
@@ -1272,7 +1428,20 @@ public abstract class AbstractSessionTest
         session().poll(nanoClock.nanoTime());
     }
 
-    protected abstract Session session();
+    protected abstract Session newSession();
+
+    protected Session session()
+    {
+        if (session == null)
+        {
+            session = newSession();
+
+            verify(sessionProxy).fixDictionary(any());
+            verify(sessionProxy).connectionId(CONNECTION_ID);
+        }
+
+        return session;
+    }
 
     protected void verifyNotifiesLoginListener()
     {
@@ -1298,17 +1467,17 @@ public abstract class AbstractSessionTest
 
     private void assertAwaitingResend()
     {
-        assertTrue("Session is not awaiting resend", session().awaitingResend());
+        assertTrue(session().awaitingResend(), "Session is not awaiting resend");
     }
 
     private void assertAwaitingHeartbeat()
     {
-        assertTrue("Session is not awaiting heartbeat", session().awaitingHeartbeat());
+        assertTrue(session().awaitingHeartbeat(), "Session is not awaiting heartbeat");
     }
 
     private void assertNotAwaitingResend()
     {
-        assertFalse("Session is awaiting resend", session().awaitingResend());
+        assertFalse(session().awaitingResend(), "Session is awaiting resend");
     }
 
     private void onGapFill(final int msgSeqNo, final int newSeqNo)
@@ -1318,6 +1487,6 @@ public abstract class AbstractSessionTest
 
     private void verifyNotifiesLoginListener(final VerificationMode verificationMode)
     {
-        verify(mockLogonListener, verificationMode).onLogon(any());
+        verify(fixSessionOwner, verificationMode).onLogon(any());
     }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,7 +15,6 @@
  */
 package uk.co.real_logic.artio.protocol;
 
-import io.aeron.logbuffer.ControlledFragmentHandler;
 import io.aeron.logbuffer.ControlledFragmentHandler.Action;
 
 /**
@@ -23,8 +22,9 @@ import io.aeron.logbuffer.ControlledFragmentHandler.Action;
  *
  * @see Action
  */
-@FunctionalInterface
 public interface ReplayProtocolHandler
 {
-    ControlledFragmentHandler.Action onReplayComplete(long connectionId);
+    Action onReplayComplete(long connectionId, long correlationId);
+
+    Action onStartReplay(long session, long connection, long correlationId, long position);
 }

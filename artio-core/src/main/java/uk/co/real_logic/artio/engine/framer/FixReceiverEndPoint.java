@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd., Monotonic Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd., Monotonic Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,7 +15,6 @@
  */
 package uk.co.real_logic.artio.engine.framer;
 
-import org.agrona.BitUtil;
 import org.agrona.DirectBuffer;
 import org.agrona.ErrorHandler;
 import org.agrona.concurrent.EpochNanoClock;
@@ -30,6 +29,7 @@ import uk.co.real_logic.artio.dictionary.generation.Exceptions;
 import uk.co.real_logic.artio.engine.ByteBufferUtil;
 import uk.co.real_logic.artio.messages.DisconnectReason;
 import uk.co.real_logic.artio.protocol.GatewayPublication;
+import uk.co.real_logic.artio.session.CompositeKey;
 import uk.co.real_logic.artio.util.AsciiBuffer;
 import uk.co.real_logic.artio.util.CharFormatter;
 import uk.co.real_logic.artio.util.MutableAsciiBuffer;
@@ -38,19 +38,18 @@ import java.io.IOException;
 import java.nio.ByteOrder;
 import java.nio.channels.ClosedChannelException;
 import java.util.Arrays;
+import java.util.Map;
 import java.util.Objects;
 
 import static java.nio.charset.StandardCharsets.US_ASCII;
-import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static org.agrona.BitUtil.SIZE_OF_CHAR;
 import static uk.co.real_logic.artio.LogTag.*;
 import static uk.co.real_logic.artio.dictionary.SessionConstants.*;
-import static uk.co.real_logic.artio.dictionary.generation.CodecUtil.MISSING_INT;
-import static uk.co.real_logic.artio.dictionary.generation.CodecUtil.MISSING_LONG;
 import static uk.co.real_logic.artio.messages.MessageStatus.*;
 import static uk.co.real_logic.artio.session.Session.UNKNOWN;
 import static uk.co.real_logic.artio.util.AsciiBuffer.SEPARATOR;
 import static uk.co.real_logic.artio.util.AsciiBuffer.UNKNOWN_INDEX;
+import static uk.co.real_logic.artio.util.MessageTypeEncoding.MAX_MESSAGE_TYPE_LENGTH;
 
 /**
  * Handles incoming data from sockets.
@@ -97,6 +96,8 @@ class FixReceiverEndPoint extends ReceiverEndPoint
     } ipv4_addr; */
     private static final int PROXY_V2_TCP4_ADDR_SIZE = 4;
     private static final int PROXY_V2_TCP4_PORT_SIZE = 2;
+    private static final int PROXY_V2_TCP4_TOTAL_ADDR_LENGTH =
+        (PROXY_V2_TCP4_ADDR_SIZE * 2) + (PROXY_V2_TCP4_PORT_SIZE * 2);
 
     private static final int PROXY_V2_TCP4_SRC_ADDR_OFFSET = PROXY_V2_ADDRESS_OFFSET;
     private static final int PROXY_V2_TCP4_DST_ADDR_OFFSET = PROXY_V2_TCP4_SRC_ADDR_OFFSET + PROXY_V2_TCP4_ADDR_SIZE;
@@ -111,6 +112,8 @@ class FixReceiverEndPoint extends ReceiverEndPoint
         } ipv6_addr; */
     private static final int PROXY_V2_TCP6_ADDR_SIZE = 16;
     private static final int PROXY_V2_TCP6_PORT_SIZE = 2;
+    private static final int PROXY_V2_TCP6_TOTAL_ADDR_LENGTH =
+        (PROXY_V2_TCP6_ADDR_SIZE * 2) + (PROXY_V2_TCP6_PORT_SIZE * 2);
     private static final int IPV6_DIGITS = 8;
     private static final int[] IPV6_LOCALHOST_DIGITS = {0, 0, 0, 0, 0, 0, 0, 1};
     private static final String IPV6_LOCALHOST = "::1:";
@@ -139,6 +142,8 @@ class FixReceiverEndPoint extends ReceiverEndPoint
 
     private static final int UNKNOWN_INDEX_BACKPRESSURED = -2;
 
+    private static final int PASSWORD_CLEANED = 0;
+
     static class FixReceiverEndPointFormatters
     {
         private final CharFormatter noProxyProtocol = new CharFormatter("No proxy protocol usage for connId=%s");
@@ -156,16 +161,16 @@ class FixReceiverEndPoint extends ReceiverEndPoint
     private final EpochNanoClock clock;
     private final AcceptorFixDictionaryLookup acceptorFixDictionaryLookup;
     private final FixReceiverEndPointFormatters formatters;
-
-    private long throttleWindowInNs;
-    private int throttleLimitOfMessages;
-    private long[] lastMessageTimestampsInNs;
-    private int lastMessageTimestampsInNsMask;
-    private int throttlePosition;
+    private final boolean reproductionEnabled;
 
     private FixGatewaySession gatewaySession;
     private long sessionId;
     private int sequenceIndex;
+    /**
+     * Sequence index update can be pending after we send a Logon with ResetSeqNumFlag=Y, until we receive a response.
+     * A disconnect when a sequence index update is pending will finish the update.
+     */
+    private int pendingSequenceIndex;
     private boolean isPaused = false;
 
     private int pendingAcceptorLogonMsgOffset;
@@ -191,9 +196,11 @@ class FixReceiverEndPoint extends ReceiverEndPoint
         final AcceptorFixDictionaryLookup acceptorFixDictionaryLookup,
         final FixReceiverEndPointFormatters formatters,
         final int throttleWindowInMs,
-        final int throttleLimitOfMessages)
+        final int throttleLimitOfMessages,
+        final boolean reproductionEnabled)
     {
-        super(publication, channel, connectionId, bufferSize, errorHandler, framer, libraryId);
+        super(publication, channel, connectionId, bufferSize, errorHandler, framer, libraryId,
+            throttleWindowInMs, throttleLimitOfMessages);
         Objects.requireNonNull(fixContexts, "sessionContexts");
         Objects.requireNonNull(gatewaySessions, "gatewaySessions");
         Objects.requireNonNull(clock, "clock");
@@ -206,52 +213,9 @@ class FixReceiverEndPoint extends ReceiverEndPoint
         this.gatewaySessions = gatewaySessions;
         this.clock = clock;
         this.acceptorFixDictionaryLookup = acceptorFixDictionaryLookup;
+        this.reproductionEnabled = reproductionEnabled;
 
-        configureThrottle(throttleWindowInMs, throttleLimitOfMessages);
-
-        address = channel.remoteAddress();
-    }
-
-    void configureThrottle(final int throttleWindowInMs, final int throttleLimitOfMessages)
-    {
-        if (this.throttleWindowInNs == throttleWindowInMs && this.throttleLimitOfMessages == throttleLimitOfMessages)
-        {
-            return;
-        }
-
-        final long[] oldLastMessageTimestampsInNs = this.lastMessageTimestampsInNs;
-        final int oldThrottleLimitOfMessages = this.throttleLimitOfMessages;
-        final int oldLastMessageTimestampsInNsMask = this.lastMessageTimestampsInNsMask;
-        final int oldThrottlePosition = this.throttlePosition;
-
-        if (throttleWindowInMs == MISSING_INT)
-        {
-            this.throttleWindowInNs = MISSING_LONG;
-            lastMessageTimestampsInNs = null;
-            lastMessageTimestampsInNsMask = 0;
-        }
-        else
-        {
-            this.throttleWindowInNs = MILLISECONDS.toNanos(throttleWindowInMs);
-            final int lastMessageTimestampsInNsCapacity = BitUtil.findNextPositivePowerOfTwo(throttleLimitOfMessages);
-            lastMessageTimestampsInNs = new long[lastMessageTimestampsInNsCapacity];
-            lastMessageTimestampsInNsMask = lastMessageTimestampsInNsCapacity - 1;
-        }
-        this.throttleLimitOfMessages = throttleLimitOfMessages;
-        throttlePosition = 0;
-
-        if (oldLastMessageTimestampsInNs != null && lastMessageTimestampsInNs != null)
-        {
-            final int minLimitOfMessages = Math.min(oldThrottleLimitOfMessages, throttleLimitOfMessages);
-            int srcPosition = Math.max(0, oldThrottlePosition - minLimitOfMessages);
-            while (srcPosition < oldThrottlePosition)
-            {
-                lastMessageTimestampsInNs[throttlePosition & lastMessageTimestampsInNsMask] =
-                    oldLastMessageTimestampsInNs[srcPosition & oldLastMessageTimestampsInNsMask];
-                srcPosition++;
-                throttlePosition++;
-            }
-        }
+        address = channel.remoteAddr();
     }
 
     private int readData() throws IOException
@@ -273,6 +237,7 @@ class FixReceiverEndPoint extends ReceiverEndPoint
         return dataRead;
     }
 
+    @Override
     int poll()
     {
         if (isPaused || hasDisconnected())
@@ -289,6 +254,13 @@ class FixReceiverEndPoint extends ReceiverEndPoint
         {
             final long latestReadTimestampInNs = clock.nanoTime();
             final int bytesRead = readData();
+            if (bytesRead == SOCKET_DISCONNECTED)
+            {
+                // Don't return the negative bytesRead below as that will indicate back-pressure
+                // And trigger blocking of other receiver end points.
+                return 0;
+            }
+
             if (frameMessages(bytesRead == 0 ? lastReadTimestampInNs : latestReadTimestampInNs))
             {
                 lastReadTimestampInNs = latestReadTimestampInNs;
@@ -329,44 +301,54 @@ class FixReceiverEndPoint extends ReceiverEndPoint
             }
             else
             {
-                int offset = this.pendingAcceptorLogonMsgOffset;
-                int length = this.pendingAcceptorLogonMsgLength;
-                DirectBuffer buffer = this.buffer;
-
-                passwordCleaner.clean(buffer, offset, length);
-
-                offset = 0;
-                buffer = passwordCleaner.cleanedBuffer();
-                length = passwordCleaner.cleanedLength();
-
-                // No need to save this sequenceIndex update as we are at a point where a genuine session doesn't exist
-                sequenceIndex++;
-
-                final long position = publication.saveMessage(
-                    buffer,
-                    offset,
-                    length,
-                    libraryId,
-                    LOGON_MESSAGE_TYPE,
-                    sessionId,
-                    sequenceIndex,
-                    connectionId,
-                    AUTH_REJECT,
-                    0,
-                    lastReadTimestampInNs);
-
-                if (Pressure.isBackPressured(position))
-                {
-                    return 1;
-                }
-
-                DebugLogger.log(FIX_MESSAGE, "Auth Reject ", buffer, offset, length);
-
                 completeDisconnect(pendingAcceptorLogon.reason());
             }
         }
 
         return 1;
+    }
+
+    @Override
+    boolean sendRejectedPendingLogon()
+    {
+        final int pendingAcceptorLogonMsgLength = this.pendingAcceptorLogonMsgLength;
+        final PasswordCleaner passwordCleaner = this.passwordCleaner;
+
+        if (pendingAcceptorLogonMsgLength != PASSWORD_CLEANED)
+        {
+            passwordCleaner.clean(buffer, pendingAcceptorLogonMsgOffset, pendingAcceptorLogonMsgLength);
+
+            // No need to save this sequenceIndex update as we are at a point where a genuine session doesn't exist
+            sequenceIndex++;
+
+            this.pendingAcceptorLogonMsgLength = PASSWORD_CLEANED;
+        }
+
+        final DirectBuffer buffer = passwordCleaner.cleanedBuffer();
+        final int length = passwordCleaner.cleanedLength();
+
+        final long position = publication.saveMessage(
+            buffer,
+            0,
+            length,
+            libraryId,
+            LOGON_MESSAGE_TYPE,
+            sessionId,
+            sequenceIndex,
+            connectionId,
+            AUTH_REJECT,
+            0,
+            lastReadTimestampInNs);
+
+        if (Pressure.isBackPressured(position))
+        {
+            // This gets retried by the TimerEventHandler due to not being disconnected
+            return false;
+        }
+
+        DebugLogger.logFixMessage(FIX_MESSAGE, LOGON_MESSAGE_TYPE, "Auth Reject ", buffer, 0, length);
+
+        return true;
     }
 
     private int sendInitialLoginMessage()
@@ -392,7 +374,11 @@ class FixReceiverEndPoint extends ReceiverEndPoint
             this.sequenceIndex = sequenceIndex;
             pendingAcceptorLogon = null;
 
-            framer.receiverEndPointPollingOptional(connectionId);
+            if (!reproductionEnabled)
+            {
+                // Keep polling in the reproduction case as we're stubbing the IO layer
+                framer.receiverEndPointPollingOptional(connectionId);
+            }
 
             // Move any data received after the logon message.
             offset += length;
@@ -405,6 +391,7 @@ class FixReceiverEndPoint extends ReceiverEndPoint
         }
     }
 
+    @Override
     boolean retryFrameMessages()
     {
         return frameMessages(lastReadTimestampInNs);
@@ -413,6 +400,7 @@ class FixReceiverEndPoint extends ReceiverEndPoint
     // true - no more framed messages in the buffer data to process. This could mean no more messages, or some data
     // that is an incomplete message.
     // false - needs to be retried, aka back-pressured
+    @SuppressWarnings("MethodLength")
     private boolean frameMessages(final long readTimestampInNs)
     {
         final MutableAsciiBuffer buffer = this.buffer;
@@ -428,6 +416,14 @@ class FixReceiverEndPoint extends ReceiverEndPoint
 
             try
             {
+                //                8=FIX.4.4|9=60|35=5|49=initiator|56=acceptor|34=3|52=20231220-13:12:16.021|10=234|
+                //                            ^ ^                                                           ^    ^ ^
+                // startOfBodyLength ---------+ |                                                           |    | |
+                // endOfBodyLength -------------+                                                           |    | |
+                // startOfChecksumTag ----------------------------------------------------------------------+    | |
+                // endOfChecksumTag/startOfChecksumValue --------------------------------------------------------+ |
+                // endOfMessage -----------------------------------------------------------------------------------+
+
                 final int startOfBodyLength = scanForBodyLength(offset, readTimestampInNs);
                 if (startOfBodyLength < 0)
                 {
@@ -445,6 +441,10 @@ class FixReceiverEndPoint extends ReceiverEndPoint
                 final int endOfChecksumTag = startOfChecksumTag + MIN_CHECKSUM_SIZE;
                 if (endOfChecksumTag >= usedBufferData)
                 {
+                    if (isMessageOversized(offset))
+                    {
+                        return saveOversizedMessageAndDisconnect(offset, readTimestampInNs);
+                    }
                     break;
                 }
 
@@ -462,14 +462,27 @@ class FixReceiverEndPoint extends ReceiverEndPoint
                 final int endOfMessage = scanEndOfMessage(startOfChecksumValue);
                 if (endOfMessage == UNKNOWN_INDEX)
                 {
+                    if (isMessageOversized(offset))
+                    {
+                        return saveOversizedMessageAndDisconnect(offset, readTimestampInNs);
+                    }
                     break; // Need more data
                 }
 
-                final long messageType = getMessageType(endOfBodyLength, endOfMessage);
                 final int length = (endOfMessage + 1) - offset;
-                if (!validateChecksum(endOfMessage, startOfChecksumValue, offset, startOfChecksumTag))
+
+                final long messageType = getMessageType(endOfBodyLength, endOfMessage);
+                if (messageType == 0)
                 {
-                    DebugLogger.log(FIX_MESSAGE, "Invalidated (checksum): ", buffer, offset, length);
+                    if (saveInvalidMsgTypeMessage(offset, length, readTimestampInNs))
+                    {
+                        return false;
+                    }
+                }
+                else if (!validateChecksum(endOfMessage, startOfChecksumValue, offset, startOfChecksumTag))
+                {
+                    DebugLogger.logFixMessage(
+                        FIX_MESSAGE, messageType, "Invalidated (checksum): ", buffer, offset, length);
                     if (saveInvalidChecksumMessage(offset, messageType, length, readTimestampInNs))
                     {
                         return false;
@@ -481,7 +494,7 @@ class FixReceiverEndPoint extends ReceiverEndPoint
                     if (requiresAuthentication())
                     {
                         startAuthenticationFlow(offset, length, messageType);
-                        // Actually has a logon message in it's buffer, but we return true because it's not
+                        // Actually has a logon message in its buffer, but we return true because it's not
                         // a back-pressure scenario.
                         return true;
                     }
@@ -489,6 +502,7 @@ class FixReceiverEndPoint extends ReceiverEndPoint
                     {
                         onLogon(readTimestampInNs, firstMessage);
                     }
+
                     if (!saveMessage(offset, messageType, length, readTimestampInNs, firstMessage))
                     {
                         return false;
@@ -529,7 +543,7 @@ class FixReceiverEndPoint extends ReceiverEndPoint
 
             if (usedBufferData > PROXY_V2_MIN_LENGTH && checkSignature(buffer, PROXY_V2_SIG))
             {
-                return parseProxyV2(buffer);
+                return parseProxyV2(buffer, usedBufferData);
             }
             else if (usedBufferData > 8 && checkSignature(buffer, PROXY_V1_SIG))
             {
@@ -545,15 +559,29 @@ class FixReceiverEndPoint extends ReceiverEndPoint
         return 0;
     }
 
-    private int parseProxyV2(final MutableAsciiBuffer buffer)
+    @SuppressWarnings("methodLength")
+    private int parseProxyV2(final MutableAsciiBuffer buffer, final int usedBufferData)
     {
         final byte verCmd = buffer.getByte(PROXY_V2_VER_CMD_OFFSET);
 
         if ((verCmd & 0xF0) != PROXY_V2_VER)
         {
-            // Bad protocol version
-            requiresProxyCheck = false;
-            return 0;
+            throw new RuntimeException("Invalid Proxy v2 protocol version: " + (verCmd & 0xF0));
+        }
+
+        final int proxyAdressLength = proxyV2BodyLength(buffer);
+        final int totalLength = PROXY_V2_ADDRESS_OFFSET + proxyAdressLength;
+        if (totalLength > buffer.capacity())
+        {
+            throw new RuntimeException("Proxy v2 address length exceeds buffer capacity, addressLength=" +
+                proxyAdressLength + ", buffer.capacity=" + buffer.capacity());
+        }
+
+        if (totalLength > usedBufferData)
+        {
+            //TODO: retry polling with timeout
+            throw new RuntimeException("Proxy v2 address length exceeds bytes read, addressLength=" +
+                proxyAdressLength + ", bytes read=" + usedBufferData);
         }
 
         switch (verCmd & 0xF)
@@ -566,6 +594,12 @@ class FixReceiverEndPoint extends ReceiverEndPoint
                 {
                     case PROXY_V2_FAMILY_TCP_4:
                     {
+                        if (proxyAdressLength < PROXY_V2_TCP4_TOTAL_ADDR_LENGTH)
+                        {
+                            throw new RuntimeException("Proxy v2 TCP over IPv4 requires minimum of 12 " +
+                                "address length but addressLength=" + proxyAdressLength);
+                        }
+
                         final int srcAddr = buffer.getInt(PROXY_V2_TCP4_SRC_ADDR_OFFSET, ByteOrder.BIG_ENDIAN);
                         final int srcPort = buffer.getChar(PROXY_V2_TCP4_SRC_PORT_OFFSET, ByteOrder.BIG_ENDIAN);
 
@@ -583,6 +617,12 @@ class FixReceiverEndPoint extends ReceiverEndPoint
 
                     case PROXY_V2_FAMILY_TCP_6:
                     {
+                        if (proxyAdressLength < PROXY_V2_TCP6_TOTAL_ADDR_LENGTH)
+                        {
+                            throw new RuntimeException("Proxy v2 TCP over IPv6 requires minimum of 36 " +
+                                "address length but addressLength=" + proxyAdressLength);
+                        }
+
                         final int[] digits = new int[IPV6_DIGITS];
                         for (int i = 0; i < IPV6_DIGITS; i++)
                         {
@@ -629,10 +669,9 @@ class FixReceiverEndPoint extends ReceiverEndPoint
             }
         }
 
-        final int endIndex = PROXY_V2_ADDRESS_OFFSET + proxyV2BodyLength(buffer);
-        logProxyV2(buffer, endIndex);
+        logProxyV2(buffer, totalLength);
         requiresProxyCheck = false;
-        return endIndex;
+        return totalLength;
     }
 
     private int parseProxyV1(final MutableAsciiBuffer buffer, final int usedBufferData)
@@ -674,9 +713,9 @@ class FixReceiverEndPoint extends ReceiverEndPoint
         }
     }
 
-    private short proxyV2BodyLength(final MutableAsciiBuffer buffer)
+    private int proxyV2BodyLength(final MutableAsciiBuffer buffer)
     {
-        return buffer.getShort(PROXY_V2_BODY_LENGTH_OFFSET, ByteOrder.BIG_ENDIAN);
+        return buffer.getShort(PROXY_V2_BODY_LENGTH_OFFSET, ByteOrder.BIG_ENDIAN) & 0xFFFF;
     }
 
     private boolean checkSignature(final MutableAsciiBuffer buffer, final byte[] proxyV1Sig)
@@ -722,6 +761,7 @@ class FixReceiverEndPoint extends ReceiverEndPoint
         return offset;
     }
 
+    @Override
     boolean requiresAuthentication()
     {
         return sessionId == UNKNOWN;
@@ -796,7 +836,7 @@ class FixReceiverEndPoint extends ReceiverEndPoint
             pendingAcceptorLogonMsgLength = length;
 
             pendingAcceptorLogon = gatewaySessions.authenticate(
-                logonDecoder, connectionId(), gatewaySession, channel, fixDictionary, framer);
+                logonDecoder, connectionId(), gatewaySession, channel, fixDictionary, framer, address, this);
         }
         else
         {
@@ -925,30 +965,6 @@ class FixReceiverEndPoint extends ReceiverEndPoint
         }
     }
 
-    private boolean shouldThrottle(final long readTimestampInNs)
-    {
-        final long throttleWindowInNs = this.throttleWindowInNs;
-        if (throttleWindowInNs == MISSING_LONG)
-        {
-            return false;
-        }
-
-        final long[] lastMessageTimestampsInNs = this.lastMessageTimestampsInNs;
-        final int lastMessageTimestampsMask = this.lastMessageTimestampsInNsMask;
-        final int throttlePosition = this.throttlePosition;
-
-        final int oldestMessagePosition = throttlePosition - throttleLimitOfMessages;
-        final int oldestMessageIndex = oldestMessagePosition & lastMessageTimestampsMask;
-        final long oldestMessageTimestampInNs = lastMessageTimestampsInNs[oldestMessageIndex];
-
-        final int currentIndex = throttlePosition & lastMessageTimestampsMask;
-        lastMessageTimestampsInNs[currentIndex] = readTimestampInNs;
-        this.throttlePosition = throttlePosition + 1;
-
-        final long timeAgoOfOldestMessageInNs = readTimestampInNs - oldestMessageTimestampInNs;
-        return timeAgoOfOldestMessageInNs < throttleWindowInNs;
-    }
-
     private boolean validateBodyLength(final int startOfChecksumTag)
     {
         return isStartOfChecksum(startOfChecksumTag);
@@ -964,12 +980,26 @@ class FixReceiverEndPoint extends ReceiverEndPoint
 
     private long getMessageType(final int endOfBodyLength, final int indexOfLastByteOfMessage)
     {
-        final int start = buffer.scan(endOfBodyLength, indexOfLastByteOfMessage, '=');
-        if (buffer.getByte(start + 2) == START_OF_HEADER)
+        if (0x3d353301 /* <SOH>35= */ != buffer.getInt(endOfBodyLength))
         {
-            return buffer.getByte(start + 1);
+            return 0;
         }
-        return buffer.getMessageType(start + 1, 2);
+
+        final int start = endOfBodyLength + 4;
+        final int limit = Math.min(start + MAX_MESSAGE_TYPE_LENGTH, indexOfLastByteOfMessage) + 1;
+        final int end = buffer.scan(start, limit, START_OF_HEADER);
+        if (UNKNOWN_INDEX == end)
+        {
+            return 0;
+        }
+
+        final int length = end - start;
+        if (0 == length)
+        {
+            return 0;
+        }
+
+        return buffer.getMessageType(start, length);
     }
 
     private int getBodyLength(final int startOfBodyLength, final int endOfBodyLength)
@@ -986,7 +1016,7 @@ class FixReceiverEndPoint extends ReceiverEndPoint
         }
         catch (final IllegalArgumentException ex)
         {
-            return false;
+            return true;
         }
     }
 
@@ -995,6 +1025,29 @@ class FixReceiverEndPoint extends ReceiverEndPoint
     {
         DebugLogger.log(FIX_MESSAGE, "Invalidated (IAE): ", buffer, offset, MIN_MESSAGE_SIZE);
         return saveInvalidMessage(offset, readTimestamp);
+    }
+
+    private boolean isMessageOversized(final int offset)
+    {
+        return offset == 0 && byteBuffer.remaining() == 0;
+    }
+
+    // returns false if back-pressured
+    private boolean saveOversizedMessageAndDisconnect(final int offset, final long readTimestamp)
+    {
+        DebugLogger.log(FIX_MESSAGE, "Invalidated (oversized): ", buffer, offset, usedBufferData - offset);
+
+        if (saveInvalidMessage(offset, readTimestamp))
+        {
+            return false;
+        }
+
+        errorHandler.onError(new Exception(
+            "Unable to frame message, receiver buffer too small. connectionId=" + connectionId));
+
+        completeDisconnect(DisconnectReason.EXCEPTION);
+
+        return true;
     }
 
     private boolean saveInvalidMessage(final int offset, final int length, final long readTimestamp)
@@ -1073,6 +1126,32 @@ class FixReceiverEndPoint extends ReceiverEndPoint
         return stashIfBackPressured(offset, position);
     }
 
+    private boolean saveInvalidMsgTypeMessage(final int offset, final int length, final long readTimestamp)
+    {
+        DebugLogger.log(FIX_MESSAGE, "Invalidated (MsgType): ", buffer, offset, length);
+
+        final long position = publication.saveMessage(
+            buffer,
+            offset,
+            length,
+            libraryId,
+            INVALID_MESSAGE_TYPE,
+            sessionId,
+            sequenceIndex,
+            connectionId,
+            INVALID,
+            0,
+            readTimestamp);
+
+        return stashIfBackPressured(offset, position);
+    }
+
+    void onLogonSent(final int sequenceIndex)
+    {
+        pendingSequenceIndex = sequenceIndex;
+    }
+
+    @Override
     void closeResources()
     {
         try
@@ -1086,13 +1165,29 @@ class FixReceiverEndPoint extends ReceiverEndPoint
         }
     }
 
+    @Override
     void removeEndpointFromFramer()
     {
         framer.onDisconnect(libraryId, connectionId, null);
     }
 
+    @Override
     void cleanupDisconnectState(final DisconnectReason reason)
     {
+        final Map.Entry<CompositeKey, SessionContext> entry = fixContexts.lookupById(sessionId);
+        if (entry != null)
+        {
+            final SessionContext sessionContext = entry.getValue();
+            final int currentSequenceIndex = sessionContext.sequenceIndex();
+            if (pendingSequenceIndex > currentSequenceIndex)
+            {
+                sessionContext.onSequenceIndex(clock.nanoTime(), pendingSequenceIndex);
+                // Need to reset inbound sequence number index, as it's queried for the last received sequence number
+                // when a session gets accepted.
+                framer.schedule(() -> publication.saveResetSequenceNumber(sessionId));
+            }
+        }
+
         fixContexts.onDisconnect(sessionId);
         gatewaySessions.onDisconnect(sessionId, connectionId, reason);
     }
@@ -1117,6 +1212,7 @@ class FixReceiverEndPoint extends ReceiverEndPoint
         return address;
     }
 
+    @Override
     public String toString()
     {
         return "ReceiverEndPoint: " + connectionId;

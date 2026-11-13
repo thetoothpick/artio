@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -46,6 +46,7 @@ class HistogramLogWriter implements HistogramHandler
         this.logFile = open(logFile);
     }
 
+    @Override
     public void identifyTimer(final int id, final String name)
     {
         final byte[] nameBytes = name.getBytes(StandardCharsets.UTF_8);
@@ -54,23 +55,27 @@ class HistogramLogWriter implements HistogramHandler
         buffer.put(nameBytes);
     }
 
+    @Override
     public void onEndTimerIdentification()
     {
         writeBuffer();
     }
 
+    @Override
     public void onTimerUpdate(final int id, final Histogram histogram)
     {
         buffer.putInt(id);
         histogram.encodeIntoByteBuffer(buffer);
     }
 
+    @Override
     public void onBeginTimerUpdate(final long currentTimeInMs)
     {
         buffer.clear();
         buffer.putLong(currentTimeInMs);
     }
 
+    @Override
     public void onEndTimerUpdate()
     {
         writeBuffer();
@@ -109,6 +114,7 @@ class HistogramLogWriter implements HistogramHandler
         }
     }
 
+    @Override
     public void close()
     {
         try

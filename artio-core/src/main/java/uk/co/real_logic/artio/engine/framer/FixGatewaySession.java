@@ -33,9 +33,10 @@ import static uk.co.real_logic.artio.GatewayProcess.NO_CONNECTION_ID;
 import static uk.co.real_logic.artio.LogTag.FIX_MESSAGE;
 import static uk.co.real_logic.artio.LogTag.GATEWAY_MESSAGE;
 import static uk.co.real_logic.artio.engine.FixEngine.ENGINE_LIBRARY_ID;
-import static uk.co.real_logic.artio.messages.CancelOnDisconnectOption.DO_NOT_CANCEL_ON_DISCONNECT_OR_LOGOUT;
+import static uk.co.real_logic.artio.engine.logger.SequenceNumberIndexWriter.NO_REQUIRED_POSITION;
+import static uk.co.real_logic.artio.messages.DisconnectReason.ENGINE_SHUTDOWN;
 
-class FixGatewaySession extends GatewaySession implements ConnectedSessionInfo, SessionProcessHandler
+class FixGatewaySession extends GatewaySession implements ConnectedSessionInfo, FixSessionOwner
 {
     private final boolean closedResendInterval;
     private final int resendRequestChunkSize;
@@ -44,6 +45,7 @@ class FixGatewaySession extends GatewaySession implements ConnectedSessionInfo, 
     private final EngineConfiguration configuration;
 
     private FixDictionary fixDictionary;
+    // receiverEndPoint & senderEndPoint null iff session is offline.
     private FixReceiverEndPoint receiverEndPoint;
     private FixSenderEndPoint senderEndPoint;
 
@@ -99,6 +101,7 @@ class FixGatewaySession extends GatewaySession implements ConnectedSessionInfo, 
         fixDictionary(fixDictionary);
     }
 
+    @Override
     public String address()
     {
         if (receiverEndPoint != null)
@@ -109,6 +112,7 @@ class FixGatewaySession extends GatewaySession implements ConnectedSessionInfo, 
         return address;
     }
 
+    @Override
     public CompositeKey sessionKey()
     {
         return sessionKey;
@@ -117,38 +121,43 @@ class FixGatewaySession extends GatewaySession implements ConnectedSessionInfo, 
     void manage(
         final SessionParser sessionParser,
         final InternalSession session,
-        final BlockablePosition blockablePosition,
         final DirectSessionProxy proxy)
     {
+        lastLibraryId = libraryId;
+        libraryId = ENGINE_LIBRARY_ID;
         this.sessionParser = sessionParser;
         this.session = session;
         this.proxy = proxy;
         this.session.sessionProcessHandler(this);
-        receiverEndPoint.libraryId(ENGINE_LIBRARY_ID);
-        senderEndPoint.libraryId(ENGINE_LIBRARY_ID, blockablePosition);
+        if (receiverEndPoint != null)
+        {
+            receiverEndPoint.libraryId(ENGINE_LIBRARY_ID);
+            senderEndPoint.libraryId(ENGINE_LIBRARY_ID);
+        }
     }
 
     // sets management to a library and also cleans up locally associated session.
     void handoverManagementTo(
-        final int libraryId,
-        final BlockablePosition blockablePosition)
+        final int libraryId)
     {
-        setManagementTo(libraryId, blockablePosition);
+        setManagementTo(libraryId);
 
         sessionParser = null;
-        session.sessionProcessHandler(null);
         context.updateAndSaveFrom(session);
         session.close();
         session = null;
         proxy = null;
     }
 
-    void setManagementTo(final int libraryId, final BlockablePosition blockablePosition)
+    void setManagementTo(final int libraryId)
     {
         libraryId(libraryId);
-        receiverEndPoint.libraryId(libraryId);
-        receiverEndPoint.pause();
-        senderEndPoint.libraryId(libraryId, blockablePosition);
+        if (receiverEndPoint != null)
+        {
+            receiverEndPoint.libraryId(libraryId);
+            receiverEndPoint.pause();
+            senderEndPoint.libraryId(libraryId);
+        }
     }
 
     void play()
@@ -159,18 +168,21 @@ class FixGatewaySession extends GatewaySession implements ConnectedSessionInfo, 
         }
     }
 
+    @Override
     int poll(final long timeInMs, final long timeInNs)
     {
         final int events = session != null ? session.poll(timeInNs) : 0;
         return events + checkNoLogonDisconnect(timeInMs);
     }
 
+    @Override
     public void onLogon(final Session session)
     {
         context.updateFrom(session);
         onGatewaySessionLogon.accept(this);
     }
 
+    @Override
     public Reply<ReplayMessagesStatus> replayReceivedMessages(
         final long sessionId,
         final int replayFromSequenceNumber,
@@ -182,15 +194,23 @@ class FixGatewaySession extends GatewaySession implements ConnectedSessionInfo, 
         return unsupported();
     }
 
+    @Override
     public void enqueueTask(final BooleanSupplier task)
     {
         unsupported();
     }
 
+    @Override
     public Reply<ThrottleConfigurationStatus> messageThrottle(
         final long sessionId, final int throttleWindowInMs, final int throttleLimitOfMessages)
     {
         return unsupported();
+    }
+
+    @Override
+    public long inboundMessagePosition()
+    {
+        return NO_REQUIRED_POSITION;
     }
 
     private <T> T unsupported()
@@ -212,7 +232,7 @@ class FixGatewaySession extends GatewaySession implements ConnectedSessionInfo, 
     {
         if (sessionParser != null)
         {
-            DebugLogger.log(FIX_MESSAGE, "Gateway Received ", buffer, offset, length);
+            DebugLogger.logFixMessage(FIX_MESSAGE, messageType, "Gateway Received ", buffer, offset, length);
 
             session.messageInfo().isValid(true);
 
@@ -230,12 +250,15 @@ class FixGatewaySession extends GatewaySession implements ConnectedSessionInfo, 
         this.heartbeatIntervalInS = heartbeatIntervalInS;
         if (session != null)
         {
-            session.setupSession(sessionId, sessionKey);
+            session.setupSession(sessionId, sessionKey, null);
             sessionParser.sessionKey(sessionKey);
             sessionParser.sequenceIndex(context.sequenceIndex());
             DebugLogger.log(GATEWAY_MESSAGE, "Setup Session As: ", sessionKey.localCompId());
         }
-        senderEndPoint.sessionId(sessionId);
+        if (senderEndPoint != null)
+        {
+            senderEndPoint.sessionId(sessionId);
+        }
     }
 
     public void onLogon(
@@ -277,6 +300,7 @@ class FixGatewaySession extends GatewaySession implements ConnectedSessionInfo, 
         return heartbeatIntervalInS;
     }
 
+    @Override
     void acceptorSequenceNumbers(final int retrievedSentSequenceNumber, final int retrievedReceivedSequenceNumber)
     {
         if (session != null)
@@ -297,6 +321,7 @@ class FixGatewaySession extends GatewaySession implements ConnectedSessionInfo, 
         return (lastSequenceNumber == UNK_SESSION) ? 0 : lastSequenceNumber;
     }
 
+    @Override
     public String toString()
     {
         return "GatewaySession{" +
@@ -305,16 +330,19 @@ class FixGatewaySession extends GatewaySession implements ConnectedSessionInfo, 
             '}';
     }
 
+    @Override
     public long bytesInBuffer()
     {
         return senderEndPoint.bytesInBuffer();
     }
 
+    @Override
     void close()
     {
         CloseHelper.close(session);
     }
 
+    @Override
     public int sequenceIndex()
     {
         return context.sequenceIndex();
@@ -322,7 +350,12 @@ class FixGatewaySession extends GatewaySession implements ConnectedSessionInfo, 
 
     SlowStatus slowStatus()
     {
-        return bytesInBuffer() > 0 ? SlowStatus.SLOW : SlowStatus.NOT_SLOW;
+        if (isOffline())
+        {
+            return SlowStatus.NOT_SLOW;
+        }
+
+        return senderEndPoint.isSlowConsumer() ? SlowStatus.SLOW : SlowStatus.NOT_SLOW;
     }
 
     public boolean closedResendInterval()
@@ -386,7 +419,7 @@ class FixGatewaySession extends GatewaySession implements ConnectedSessionInfo, 
 
     public CancelOnDisconnectOption cancelOnDisconnectOption()
     {
-        return cancelOnDisconnectOption == null ? DO_NOT_CANCEL_ON_DISCONNECT_OR_LOGOUT : cancelOnDisconnectOption;
+        return cancelOnDisconnectOption == null ? configuration.cancelOnDisconnectOption() : cancelOnDisconnectOption;
     }
 
     public long cancelOnDisconnectTimeoutWindowInNs()
@@ -417,6 +450,7 @@ class FixGatewaySession extends GatewaySession implements ConnectedSessionInfo, 
         }
     }
 
+    @Override
     long lastLogonTime()
     {
         return lastLogonTime;
@@ -431,16 +465,12 @@ class FixGatewaySession extends GatewaySession implements ConnectedSessionInfo, 
         }
     }
 
-    public boolean isOffline()
-    {
-        return receiverEndPoint == null;
-    }
-
     public void goOffline()
     {
         // Library retains ownership of a disconnected session, reset state to that of an offline GatewaySession object
         connectionId = NO_CONNECTION_ID;
         address = ":" + NO_CONNECTION_ID;
+        super.receiverEndPoint = null;
         receiverEndPoint = null;
         senderEndPoint = null;
         onGatewaySessionLogon = null;
@@ -451,6 +481,7 @@ class FixGatewaySession extends GatewaySession implements ConnectedSessionInfo, 
         return proxy.lastSentPosition();
     }
 
+    @Override
     public void onDisconnectReleasedByOwner()
     {
         if (session != null)
@@ -480,6 +511,7 @@ class FixGatewaySession extends GatewaySession implements ConnectedSessionInfo, 
         return true;
     }
 
+    @Override
     public boolean configureThrottle(final int throttleWindowInMs, final int throttleLimitOfMessages)
     {
         final boolean ok = senderEndPoint.configureThrottle(throttleWindowInMs, throttleLimitOfMessages);
@@ -493,5 +525,53 @@ class FixGatewaySession extends GatewaySession implements ConnectedSessionInfo, 
     public void onSequenceReset(final long resetTimeInNs)
     {
         context.onSequenceReset(resetTimeInNs);
+    }
+
+    @Override
+    public long startEndOfDay()
+    {
+        final InternalSession session = this.session;
+        if (session != null)
+        {
+            final SessionState state = session.state();
+            switch (state)
+            {
+                case SENT_LOGON:
+                case ACTIVE:
+                case AWAITING_LOGOUT:
+                case LOGGING_OUT_AND_DISCONNECTING:
+                case LOGGING_OUT:
+                {
+                    final long position = session.logoutAndDisconnect(ENGINE_SHUTDOWN);
+                    if (position < 0)
+                    {
+                        return position;
+                    }
+
+                    break;
+                }
+
+                case CONNECTED:
+                case CONNECTING:
+                case DISCONNECTING:
+                {
+                    final long position = session.requestDisconnect(ENGINE_SHUTDOWN);
+                    if (position < 0)
+                    {
+                        return position;
+                    }
+
+                    break;
+                }
+
+                case DISCONNECTED:
+                case DISABLED:
+                default:
+                    // deliberately blank
+                    break;
+            }
+        }
+
+        return 1;
     }
 }

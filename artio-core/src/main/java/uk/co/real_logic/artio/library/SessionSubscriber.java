@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,20 +17,26 @@ package uk.co.real_logic.artio.library;
 
 import io.aeron.logbuffer.ControlledFragmentHandler.Action;
 import org.agrona.DirectBuffer;
+import org.agrona.ErrorHandler;
 import uk.co.real_logic.artio.Reply;
 import uk.co.real_logic.artio.messages.DisconnectReason;
 import uk.co.real_logic.artio.messages.MessageStatus;
 import uk.co.real_logic.artio.messages.ReplayMessagesStatus;
 import uk.co.real_logic.artio.messages.ThrottleConfigurationStatus;
-import uk.co.real_logic.artio.session.*;
+import uk.co.real_logic.artio.session.FixSessionOwner;
+import uk.co.real_logic.artio.session.InternalSession;
+import uk.co.real_logic.artio.session.Session;
+import uk.co.real_logic.artio.session.SessionParser;
 import uk.co.real_logic.artio.timing.Timer;
 
 import java.util.function.BooleanSupplier;
 
-import static io.aeron.logbuffer.ControlledFragmentHandler.Action.*;
+import static io.aeron.logbuffer.ControlledFragmentHandler.Action.ABORT;
+import static io.aeron.logbuffer.ControlledFragmentHandler.Action.CONTINUE;
+import static uk.co.real_logic.artio.engine.logger.SequenceNumberIndexWriter.NO_REQUIRED_POSITION;
 import static uk.co.real_logic.artio.messages.GatewayError.UNABLE_TO_LOGON;
 
-class SessionSubscriber implements AutoCloseable, SessionProcessHandler
+class SessionSubscriber implements AutoCloseable, FixSessionOwner
 {
     private final OnMessageInfo info;
     private final SessionParser parser;
@@ -39,10 +45,12 @@ class SessionSubscriber implements AutoCloseable, SessionProcessHandler
     private final Timer sessionTimer;
     private final LibraryPoller libraryPoller;
     private final long replyTimeoutInMs;
+    private final ErrorHandler errorHandler;
 
     private SessionHandler handler;
     private InitiateSessionReply initiateSessionReply;
     private boolean userAbortedLastMessage = false;
+    private long lastReceivedPosition = NO_REQUIRED_POSITION;
 
     SessionSubscriber(
         final OnMessageInfo info,
@@ -51,7 +59,8 @@ class SessionSubscriber implements AutoCloseable, SessionProcessHandler
         final Timer receiveTimer,
         final Timer sessionTimer,
         final LibraryPoller libraryPoller,
-        final long replyTimeoutInMs)
+        final long replyTimeoutInMs,
+        final ErrorHandler errorHandler)
     {
         this.info = info;
         this.parser = parser;
@@ -60,6 +69,7 @@ class SessionSubscriber implements AutoCloseable, SessionProcessHandler
         this.sessionTimer = sessionTimer;
         this.libraryPoller = libraryPoller;
         this.replyTimeoutInMs = replyTimeoutInMs;
+        this.errorHandler = errorHandler;
         this.session.sessionProcessHandler(this);
     }
 
@@ -118,6 +128,8 @@ class SessionSubscriber implements AutoCloseable, SessionProcessHandler
                         {
                             return ABORT;
                         }
+
+                        lastReceivedPosition = position;
 
                         final Action handlerAction = handler.onMessage(
                             buffer,
@@ -182,19 +194,40 @@ class SessionSubscriber implements AutoCloseable, SessionProcessHandler
         return action;
     }
 
+    @Override
     public void onLogon(final Session session)
     {
-        handler.onSessionStart(session);
-
-        if (initiateSessionReply != null)
+        try
         {
-            initiateSessionReply.onComplete(session);
-            // Don't want to hold a reference to the reply object for the
-            // lifetime of the Session
-            initiateSessionReply = null;
+            handler.onSessionStart(session);
+
+            if (initiateSessionReply != null)
+            {
+                initiateSessionReply.onComplete(session);
+                // Don't want to hold a reference to the reply object for the
+                // lifetime of the Session
+                initiateSessionReply = null;
+            }
+        }
+        catch (final Throwable t)
+        {
+            if (initiateSessionReply != null)
+            {
+                initiateSessionReply.onError(t);
+                // Don't want to hold a reference to the reply object for the
+                // lifetime of the Session
+                initiateSessionReply = null;
+            }
+            else
+            {
+                errorHandler.onError(t);
+            }
+
+            ((InternalSession)session).logoutAndDisconnect(DisconnectReason.CALLBACK_EXCEPTION);
         }
     }
 
+    @Override
     public Reply<ReplayMessagesStatus> replayReceivedMessages(
         final long sessionId,
         final int replayFromSequenceNumber,
@@ -213,6 +246,7 @@ class SessionSubscriber implements AutoCloseable, SessionProcessHandler
             replayToSequenceIndex);
     }
 
+    @Override
     public Reply<ThrottleConfigurationStatus> messageThrottle(
         final long sessionId, final int throttleWindowInMs, final int throttleLimitOfMessages)
     {
@@ -224,6 +258,13 @@ class SessionSubscriber implements AutoCloseable, SessionProcessHandler
             throttleLimitOfMessages);
     }
 
+    @Override
+    public long inboundMessagePosition()
+    {
+        return lastReceivedPosition;
+    }
+
+    @Override
     public void enqueueTask(final BooleanSupplier task)
     {
         libraryPoller.enqueueTask(task);
@@ -236,9 +277,11 @@ class SessionSubscriber implements AutoCloseable, SessionProcessHandler
 
     void onSlowStatusNotification(final int libraryId, final boolean hasBecomeSlow)
     {
+        session.isSlowConsumer(hasBecomeSlow);
         handler.onSlowStatus(libraryId, session, hasBecomeSlow);
     }
 
+    @Override
     public void close()
     {
         session.requestDisconnect();
@@ -269,5 +312,10 @@ class SessionSubscriber implements AutoCloseable, SessionProcessHandler
         return session.onThrottleNotification(
             refMsgType, refSeqNum, businessRejectRefIDBuffer, businessRejectRefIDOffset, businessRejectRefIDLength
         );
+    }
+
+    void onReplayComplete(final long correlationId)
+    {
+        session.onReplayComplete(correlationId);
     }
 }

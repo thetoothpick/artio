@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ import io.aeron.UnavailableImageHandler;
 
 import java.util.Hashtable;
 import java.util.Map;
+import java.util.Objects;
 import java.util.function.BiFunction;
 
 // This is written to on the client conductor thread and read from the Framer thread.
@@ -36,13 +37,14 @@ class FinalImagePositions implements UnavailableImageHandler
     // Hashtable picked over CHM due to low contention factor + expected small size
     private final Map<Integer, Long> sessionIdToPosition = new Hashtable<>();
 
+    @Override
     public void onUnavailableImage(final Image image)
     {
         final Integer sessionId = image.sessionId();
         final long position = image.position();
 
         final Long old = sessionIdToPosition.remove(sessionId);
-        if (old != LEAK_WITNESS) // lgtm [java/reference-equality-of-boxed-types]
+        if (!Objects.equals(old, LEAK_WITNESS))
         {
             sessionIdToPosition.put(sessionId, position);
         }

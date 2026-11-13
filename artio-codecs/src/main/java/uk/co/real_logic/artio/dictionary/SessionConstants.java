@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,6 +27,7 @@ public final class SessionConstants
 
     // Message Types
     public static final int BEGIN_SEQ_NO = 7;
+    public static final int END_SEQ_NO = 16;
     public static final int BODY_LENGTH = 9;
     public static final int CHECKSUM = 10;
     public static final int MSG_SEQ_NO = 34;

@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -43,6 +43,7 @@ class RequestSessionReply extends LibraryReply<SessionReplyStatus>
         }
     }
 
+    @Override
     protected void sendMessage()
     {
         final long position = libraryPoller.saveRequestSession(
@@ -51,6 +52,7 @@ class RequestSessionReply extends LibraryReply<SessionReplyStatus>
         requiresResend = position < 0;
     }
 
+    @Override
     void onComplete(final SessionReplyStatus result)
     {
         super.onComplete(result);

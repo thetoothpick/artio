@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,17 +15,19 @@
  */
 package uk.co.real_logic.artio.dictionary.generation;
 
-import org.junit.BeforeClass;
-import org.junit.Test;
+import org.agrona.AsciiSequenceView;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
 import uk.co.real_logic.artio.builder.Decoder;
 
-import static uk.co.real_logic.artio.dictionary.ExampleDictionary.INVALID_FLOAT_VALUE_MESSAGE;
-import static uk.co.real_logic.artio.dictionary.ExampleDictionary.INVALID_INT_VALUE_MESSAGE;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static uk.co.real_logic.artio.dictionary.ExampleDictionary.*;
 import static uk.co.real_logic.artio.util.CustomMatchers.assertTargetThrows;
+import static uk.co.real_logic.artio.util.Reflection.getAsciiSequenceView;
 
 public class DecoderGeneratorFlyweightTest extends AbstractDecoderGeneratorTest
 {
-    @BeforeClass
+    @BeforeAll
     public static void generate() throws Exception
     {
         generate(true);
@@ -37,7 +39,7 @@ public class DecoderGeneratorFlyweightTest extends AbstractDecoderGeneratorTest
         final Decoder decoder = decodeHeartbeat(INVALID_INT_VALUE_MESSAGE);
 
         assertTargetThrows(() -> getIntField(decoder), NumberFormatException.class,
-            "'A' is not a valid digit @ 33 tag=116");
+            "error parsing int: A tag=116");
     }
 
     @Test
@@ -47,5 +49,20 @@ public class DecoderGeneratorFlyweightTest extends AbstractDecoderGeneratorTest
 
         assertTargetThrows(() -> getFloatField(decoder), NumberFormatException.class,
             "'A' isn't a valid digit @ 39 tag=117");
+    }
+
+    @Test
+    public void shouldNotThrowWhenAccessingUnsetString() throws Exception
+    {
+        final Decoder decoder = decodeHeartbeat(INVALID_FLOAT_VALUE_MESSAGE);
+        final Decoder decoderWithoutValidation = decodeHeartbeatWithoutValidation(INVALID_FLOAT_VALUE_MESSAGE);
+
+        // generated with wrapEmptyBuffer=true
+        final AsciiSequenceView view = getAsciiSequenceView(decoderWithoutValidation, "testReqID");
+        assertEquals(0, view.length());
+
+        // generated with wrapEmptyBuffer=false
+        assertTargetThrows(() -> getAsciiSequenceView(decoder, "testReqID"), IllegalArgumentException.class,
+            "No value for optional field: TestReqID");
     }
 }

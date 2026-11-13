@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@ import uk.co.real_logic.artio.otf.MessageControl;
 import uk.co.real_logic.artio.otf.OtfMessageAcceptor;
 import uk.co.real_logic.artio.util.AsciiBuffer;
 
-public class PossDupFinder implements OtfMessageAcceptor
+class PossDupFinder implements OtfMessageAcceptor
 {
     public static final int NO_ENTRY = -1;
 
@@ -34,7 +34,9 @@ public class PossDupFinder implements OtfMessageAcceptor
     private int lengthOfBodyLength;
     private int origSendingTimeOffset;
     private int origSendingTimeLength;
+    private int checkSumOffset;
 
+    @Override
     public MessageControl onNext()
     {
         possDupOffset = NO_ENTRY;
@@ -45,9 +47,11 @@ public class PossDupFinder implements OtfMessageAcceptor
         bodyLength = NO_ENTRY;
         bodyLengthOffset = NO_ENTRY;
         lengthOfBodyLength = NO_ENTRY;
+        checkSumOffset = NO_ENTRY;
         return MessageControl.CONTINUE;
     }
 
+    @Override
     public MessageControl onField(final int tag, final AsciiBuffer buffer, final int offset, final int length)
     {
         switch (tag)
@@ -71,30 +75,40 @@ public class PossDupFinder implements OtfMessageAcceptor
                 lengthOfBodyLength = length;
                 bodyLength = buffer.getInt(offset, offset + length);
                 break;
+
+            case SessionConstants.CHECKSUM:
+                checkSumOffset = offset;
+                break;
+
         }
         return MessageControl.CONTINUE;
     }
 
+    @Override
     public MessageControl onGroupHeader(final int tag, final int numInGroup)
     {
         return MessageControl.CONTINUE;
     }
 
+    @Override
     public MessageControl onGroupBegin(final int tag, final int numInGroup, final int index)
     {
         return MessageControl.CONTINUE;
     }
 
+    @Override
     public MessageControl onGroupEnd(final int tag, final int numInGroup, final int index)
     {
         return MessageControl.CONTINUE;
     }
 
+    @Override
     public MessageControl onComplete()
     {
         return MessageControl.CONTINUE;
     }
 
+    @Override
     public boolean onError(
         final ValidationError error,
         final long messageType,
@@ -107,6 +121,11 @@ public class PossDupFinder implements OtfMessageAcceptor
     int possDupOffset()
     {
         return possDupOffset;
+    }
+
+    public int checkSumOffset()
+    {
+        return checkSumOffset;
     }
 
     int sendingTimeEnd()
@@ -129,7 +148,7 @@ public class PossDupFinder implements OtfMessageAcceptor
         return origSendingTimeOffset;
     }
 
-    public int origSendingTimeLength()
+    int origSendingTimeLength()
     {
         return origSendingTimeLength;
     }

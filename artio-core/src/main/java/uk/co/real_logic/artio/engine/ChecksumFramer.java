@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,6 +21,8 @@ import org.agrona.concurrent.AtomicBuffer;
 import java.nio.ByteBuffer;
 import java.util.zip.CRC32;
 
+import static uk.co.real_logic.artio.AtomicBuffers.checkAligned;
+
 // TODO: optimisation: write and checksum only needed bytes
 public class ChecksumFramer extends SectorFramer
 {
@@ -31,31 +33,40 @@ public class ChecksumFramer extends SectorFramer
     private final int errorReportingOffset;
     private final ChecksumConsumer validateChecksumFunc;
     private final String fileName;
+    private final boolean indexChecksumEnabled;
 
     public ChecksumFramer(
         final AtomicBuffer buffer,
         final int capacity,
         final ErrorHandler errorHandler,
         final int errorReportingOffset,
-        final String fileName)
+        final String fileName,
+        final boolean indexChecksumEnabled)
     {
         super(capacity);
-        this.buffer = buffer;
+        this.buffer = checkAligned(buffer);
         saveChecksumFunc = buffer::putInt;
         this.errorHandler = errorHandler;
         this.errorReportingOffset = errorReportingOffset;
         this.fileName = fileName;
+        this.indexChecksumEnabled = indexChecksumEnabled;
         validateChecksumFunc = this::validateChecksum;
     }
 
     public void validateCheckSums()
     {
-        withChecksums(validateChecksumFunc);
+        if (indexChecksumEnabled)
+        {
+            withChecksums(validateChecksumFunc);
+        }
     }
 
     public void updateChecksums()
     {
-        withChecksums(saveChecksumFunc);
+        if (indexChecksumEnabled)
+        {
+            withChecksums(saveChecksumFunc);
+        }
     }
 
     private void validateChecksum(final int checksumOffset, final int calculatedChecksum)

@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,21 +15,26 @@
  */
 package uk.co.real_logic.artio.system_tests;
 
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+
 import uk.co.real_logic.artio.engine.FixEngine;
 import uk.co.real_logic.artio.library.FixLibrary;
 import uk.co.real_logic.artio.library.LibraryConfiguration;
 import uk.co.real_logic.artio.session.Session;
 
+import static org.hamcrest.Matchers.hasItems;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static uk.co.real_logic.artio.TestFixtures.launchMediaDriver;
+import static uk.co.real_logic.artio.Timing.assertEventuallyTrue;
 import static uk.co.real_logic.artio.messages.SessionReplyStatus.INVALID_CONFIGURATION_NOT_LOGGING_MESSAGES;
 import static uk.co.real_logic.artio.system_tests.SystemTestUtil.*;
 
 public class NoLoggingGatewayToGatewaySystemTest extends AbstractGatewayToGatewaySystemTest
 {
 
-    @Before
+    @BeforeEach
     public void launch()
     {
         mediaDriver = launchMediaDriver();
@@ -39,7 +44,8 @@ public class NoLoggingGatewayToGatewaySystemTest extends AbstractGatewayToGatewa
         acceptingEngine = FixEngine.launch(acceptingConfig(port, ACCEPTOR_ID, INITIATOR_ID, nanoClock)
             .logInboundMessages(false)
             .logOutboundMessages(false)
-            .deleteLogFileDirOnStart(true));
+            .deleteLogFileDirOnStart(true)
+            .resendRequestController(fakeResendRequestController));
 
         initiatingEngine = FixEngine.launch(initiatingConfig(libraryAeronPort, nanoClock)
             .logInboundMessages(false)
@@ -47,6 +53,7 @@ public class NoLoggingGatewayToGatewaySystemTest extends AbstractGatewayToGatewa
             .deleteLogFileDirOnStart(true));
 
         final LibraryConfiguration acceptingLibraryConfig = acceptingLibraryConfig(acceptingHandler, nanoClock);
+        acceptingLibraryConfig.resendRequestController(fakeResendRequestController);
         acceptingLibrary = connect(acceptingLibraryConfig);
         initiatingLibrary = newInitiatingLibrary(libraryAeronPort, initiatingHandler, nanoClock);
         testSystem = new TestSystem(acceptingLibrary, initiatingLibrary);
@@ -54,7 +61,8 @@ public class NoLoggingGatewayToGatewaySystemTest extends AbstractGatewayToGatewa
         connectSessions();
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void messagesCanBeSentFromInitiatorToAcceptor()
     {
         messagesCanBeExchanged();
@@ -62,7 +70,8 @@ public class NoLoggingGatewayToGatewaySystemTest extends AbstractGatewayToGatewa
         assertInitiatingSequenceIndexIs(0);
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void messagesCanBeSentFromInitiatorToAcceptingLibrary()
     {
         acquireAcceptingSession();
@@ -72,13 +81,16 @@ public class NoLoggingGatewayToGatewaySystemTest extends AbstractGatewayToGatewa
         assertSequenceIndicesAre(0);
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Override
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void sessionsCanReconnect()
     {
         super.sessionsCanReconnect();
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void librariesShouldBeAbleToReleaseInitiatedSessionToEngine()
     {
         acquireAcceptingSession();
@@ -86,7 +98,8 @@ public class NoLoggingGatewayToGatewaySystemTest extends AbstractGatewayToGatewa
         releaseSessionToEngine(initiatingSession, initiatingLibrary, initiatingEngine);
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void librariesShouldBeAbleToReleaseAcceptedSessionToEngine()
     {
         acquireAcceptingSession();
@@ -94,7 +107,8 @@ public class NoLoggingGatewayToGatewaySystemTest extends AbstractGatewayToGatewa
         releaseSessionToEngine(acceptingSession, acceptingLibrary, acceptingEngine);
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void enginesShouldManageAcceptingSession()
     {
         acquireAcceptingSession();
@@ -102,7 +116,8 @@ public class NoLoggingGatewayToGatewaySystemTest extends AbstractGatewayToGatewa
         engineShouldManageSession(acceptingSession, acceptingLibrary, initiatingSession, initiatingOtfAcceptor);
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void enginesShouldManageInitiatingSession()
     {
         acquireAcceptingSession();
@@ -110,7 +125,8 @@ public class NoLoggingGatewayToGatewaySystemTest extends AbstractGatewayToGatewa
         engineShouldManageSession(initiatingSession, initiatingLibrary, acceptingSession, acceptingOtfAcceptor);
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void engineShouldAcquireTimedOutAcceptingSessions()
     {
         acquireAcceptingSession();
@@ -118,14 +134,46 @@ public class NoLoggingGatewayToGatewaySystemTest extends AbstractGatewayToGatewa
         testSystem.remove(acceptingLibrary);
 
         acceptingEngineHasSessionAndLibraryIsNotified();
+
+        messagesCanBeExchanged();
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void engineShouldAcquireTimedOutInitiatingSessions()
     {
+        acquireAcceptingSession();
+
         testSystem.remove(initiatingLibrary);
 
         initiatingEngineHasSessionAndLibraryIsNotified();
+
+        // Ensure that messages can be exchanged after the acquisition.
+        acceptingMessagesCanBeExchanged();
+    }
+
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
+    public void resendRequestsShouldGetGapFilled()
+    {
+        acquireAcceptingSession();
+
+        messagesCanBeExchanged();
+
+        sendResendRequest(1, 0, initiatingOtfAcceptor, initiatingSession);
+
+        assertEventuallyTrue(() -> "Failed to receive gap fill: " + initiatingOtfAcceptor.messages(),
+            () ->
+            {
+                testSystem.poll();
+
+                assertEquals(1, initiatingOtfAcceptor
+                    .receivedReplayGapFill(1, 3)
+                    .count());
+            }, 5000);
+
+        assertResendsCompleted(1, hasItems(0));
+        messagesCanBeExchanged();
     }
 
     private void engineShouldManageSession(

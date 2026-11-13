@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,43 +15,40 @@
  */
 package uk.co.real_logic.artio.fields;
 
-import org.junit.Test;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
-import org.junit.runners.Parameterized.Parameters;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
+
+import java.util.stream.Stream;
 import uk.co.real_logic.artio.util.MutableAsciiBuffer;
 
 import static java.nio.charset.StandardCharsets.US_ASCII;
 import static org.hamcrest.MatcherAssert.assertThat;
-import static org.junit.Assert.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static uk.co.real_logic.artio.fields.CalendricalUtil.*;
 import static uk.co.real_logic.artio.fields.UtcTimestampDecoderValidCasesTest.toEpochMillis;
 import static uk.co.real_logic.artio.fields.EpochFractionFormat.*;
 import static uk.co.real_logic.artio.util.CustomMatchers.sequenceEqualsAscii;
 
-@RunWith(Parameterized.class)
 public class UtcTimestampEncoderValidCasesTest
 {
-    private final String expectedTimestamp;
-    private final boolean validNanoSecondTestCase;
-    private final String expectedTimestampMicros;
-    private final String expectedTimestampNanos;
-    private final long epochMillis;
-    private final long epochMicros;
-    private final long epochNanos;
-    private final int expectedLength;
-    private final int expectedLengthMicros;
-    private final int expectedLengthNanos;
+    private String expectedTimestamp;
+    private String expectedTimestampMicros;
+    private String expectedTimestampNanos;
+    private long epochMillis;
+    private long epochMicros;
+    private long epochNanos;
+    private int expectedLength;
+    private int expectedLengthMicros;
+    private int expectedLengthNanos;
 
-    @Parameters(name = "{0}")
-    public static Iterable<Object[]> data()
+    public static Stream<Arguments> data()
     {
         return UtcTimestampDecoderValidCasesTest.data();
     }
 
-    public UtcTimestampEncoderValidCasesTest(final String timestamp, final boolean validNanoSecondTestCase)
+    public void prepareExpected(final String timestamp, final boolean validNanoSecondTestCase)
     {
-        this.validNanoSecondTestCase = validNanoSecondTestCase;
         epochMillis = toEpochMillis(timestamp);
         expectedLength = UtcTimestampEncoder.LENGTH_WITH_MILLISECONDS;
         expectedTimestamp = timestamp;
@@ -63,42 +60,54 @@ public class UtcTimestampEncoderValidCasesTest
         epochNanos = epochMillis * NANOS_IN_MILLIS + 1;
     }
 
-    @Test
-    public void canStaticEncodeTimestampWithOffset()
+    @ParameterizedTest
+    @MethodSource(value = "data")
+    public void canStaticEncodeTimestampWithOffset(final String timestamp, final boolean validNanoSecondTestCase)
     {
+        prepareExpected(timestamp, validNanoSecondTestCase);
         assertInstanceEncodesTimestampMillisWithOffset(epochMillis, expectedTimestamp, expectedLength);
     }
 
-    @Test
-    public void canInstanceEncodeTimestamp()
+    @ParameterizedTest
+    @MethodSource(value = "data")
+    public void canInstanceEncodeTimestamp(final String timestamp, final boolean validNanoSecondTestCase)
     {
+        prepareExpected(timestamp, validNanoSecondTestCase);
         assertInstanceEncodesTimestampMillis(epochMillis, expectedTimestamp, expectedLength);
     }
 
-    @Test
-    public void canStaticEncodeTimestampWithOffsetMicros()
+    @ParameterizedTest
+    @MethodSource(value = "data")
+    public void canStaticEncodeTimestampWithOffsetMicros(final String timestamp, final boolean validNanoSecondTestCase)
     {
+        prepareExpected(timestamp, validNanoSecondTestCase);
         assertInstanceEncodesTimestampMicrosWithOffset(epochMicros, expectedTimestampMicros, expectedLengthMicros);
     }
 
-    @Test
-    public void canInstanceEncodeTimestampMicros()
+    @ParameterizedTest
+    @MethodSource(value = "data")
+    public void canInstanceEncodeTimestampMicros(final String timestamp, final boolean validNanoSecondTestCase)
     {
+        prepareExpected(timestamp, validNanoSecondTestCase);
         assertInstanceEncodesTimestampMicros(epochMicros, expectedTimestampMicros, expectedLengthMicros);
     }
 
-    @Test
-    public void canStaticEncodeTimestampWithOffsetNanos()
+    @ParameterizedTest
+    @MethodSource(value = "data")
+    public void canStaticEncodeTimestampWithOffsetNanos(final String timestamp, final boolean validNanoSecondTestCase)
     {
+        prepareExpected(timestamp, validNanoSecondTestCase);
         if (validNanoSecondTestCase)
         {
             assertInstanceEncodesTimestampNanosWithOffset(epochNanos, expectedTimestampNanos, expectedLengthNanos);
         }
     }
 
-    @Test
-    public void canInstanceEncodeTimestampNanos()
+    @ParameterizedTest
+    @MethodSource(value = "data")
+    public void canInstanceEncodeTimestampNanos(final String timestamp, final boolean validNanoSecondTestCase)
     {
+        prepareExpected(timestamp, validNanoSecondTestCase);
         if (validNanoSecondTestCase)
         {
             assertInstanceEncodesTimestampNanos(epochNanos, expectedTimestampNanos, expectedLengthNanos);
@@ -118,7 +127,7 @@ public class UtcTimestampEncoderValidCasesTest
         final int length = encoder.encode(epochMillis);
 
         assertEquals(expectedTimestamp, new String(encoder.buffer(), 0, length, US_ASCII));
-        assertEquals("encoded wrong length", expectedLength, length);
+        assertEquals(expectedLength, length, "encoded wrong length");
     }
 
     static void assertInstanceEncodesTimestampMicrosWithOffset(
@@ -129,7 +138,7 @@ public class UtcTimestampEncoderValidCasesTest
         final int length = UtcTimestampEncoder.encodeMicros(epochMicros, string, 1);
 
         assertThat(string, sequenceEqualsAscii(expectedTimestampMicros, 1, length));
-        assertEquals("encoded wrong length", expectedLength, length);
+        assertEquals(expectedLength, length, "encoded wrong length");
     }
 
     static void assertInstanceEncodesTimestampMicros(
@@ -146,7 +155,7 @@ public class UtcTimestampEncoderValidCasesTest
         final int length = UtcTimestampEncoder.encodeNanos(epochNanos, string, 1);
 
         assertThat(string, sequenceEqualsAscii(expectedTimestampNanos, 1, length));
-        assertEquals("encoded wrong length", expectedLength, length);
+        assertEquals(expectedLength, length, "encoded wrong length");
     }
 
     static void assertInstanceEncodesTimestampNanos(
@@ -165,7 +174,7 @@ public class UtcTimestampEncoderValidCasesTest
         final int length = encoder.encode(epochFraction);
 
         assertEquals(expectedTimestamp, new String(encoder.buffer(), 0, length, US_ASCII));
-        assertEquals("encoded wrong length", expectedLength, length);
+        assertEquals(expectedLength, length, "encoded wrong length");
     }
 
 }

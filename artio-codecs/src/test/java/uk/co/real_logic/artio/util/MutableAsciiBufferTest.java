@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,20 +15,14 @@
  */
 package uk.co.real_logic.artio.util;
 
-import org.junit.experimental.theories.DataPoints;
-import org.junit.experimental.theories.Theories;
-import org.junit.experimental.theories.Theory;
-import org.junit.runner.RunWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
 
-import static org.junit.Assert.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
-@RunWith(Theories.class)
 public class MutableAsciiBufferTest
 {
 
-    private final MutableAsciiBuffer string = new MutableAsciiBuffer(new byte[8 * 1024]);
-
-    @DataPoints
     public static int[][] valuesAndLengths()
     {
         return new int[][]
@@ -47,12 +41,13 @@ public class MutableAsciiBufferTest
         };
     }
 
-    @Theory
+    @ParameterizedTest
+    @MethodSource(value = "valuesAndLengths")
     public void shouldCalculateCorrectAsciiLength(final int[] valueAndLength)
     {
         final int value = valueAndLength[0];
         final int length = valueAndLength[1];
-        assertEquals("Wrong length for " + value, length, MutableAsciiBuffer.lengthInAscii(value));
+        assertEquals(length, MutableAsciiBuffer.lengthInAscii(value), "Wrong length for " + value);
     }
 
 }

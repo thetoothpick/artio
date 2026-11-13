@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,6 +22,9 @@ import java.util.concurrent.TimeUnit;
 import static uk.co.real_logic.artio.fields.CalendricalUtil.*;
 import static uk.co.real_logic.artio.fields.UtcTimeOnlyDecoder.*;
 
+/**
+ * An encoder for FIX's Utc timestamp data types. See {@link UtcTimestampDecoder} for details of the format.
+ */
 public final class UtcTimestampEncoder
 {
 

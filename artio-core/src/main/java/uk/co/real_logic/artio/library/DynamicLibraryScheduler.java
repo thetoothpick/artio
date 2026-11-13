@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -37,6 +37,7 @@ public class DynamicLibraryScheduler implements LibraryScheduler
 
     private AgentRunner runner;
 
+    @Override
     public synchronized void launch(
         final LibraryConfiguration configuration,
         final ErrorHandler errorHandler,
@@ -76,6 +77,7 @@ public class DynamicLibraryScheduler implements LibraryScheduler
         }
     }
 
+    @Override
     public synchronized void close(final int libraryId)
     {
         final Agent agentToRemove = libraryIdToDelegateAgent.remove(libraryId);
@@ -100,6 +102,7 @@ public class DynamicLibraryScheduler implements LibraryScheduler
         }
     }
 
+    @Override
     public void configure(final Aeron.Context aeronContext)
     {
         aeronContext
@@ -125,20 +128,28 @@ public class DynamicLibraryScheduler implements LibraryScheduler
             this.errorHandler = errorHandler;
         }
 
+        @Override
         public void onStart()
         {
             FixLibrary.setClientConductorThread();
-            monitoringAgent.onStart();
+            if (monitoringAgent != null)
+            {
+                monitoringAgent.onStart();
+            }
             clientConductorAgent.onStart();
         }
 
+        @Override
         public int doWork()
         {
             int count = 0;
 
             try
             {
-                count += monitoringAgent.doWork();
+                if (monitoringAgent != null)
+                {
+                    count += monitoringAgent.doWork();
+                }
                 count += clientConductorAgent.doWork();
             }
             catch (final Throwable throwable)
@@ -149,6 +160,7 @@ public class DynamicLibraryScheduler implements LibraryScheduler
             return count;
         }
 
+        @Override
         public String roleName()
         {
             return roleName;

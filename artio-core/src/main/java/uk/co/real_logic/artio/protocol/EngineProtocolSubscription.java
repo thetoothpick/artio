@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -46,6 +46,8 @@ public final class EngineProtocolSubscription implements ControlledFragmentHandl
     private final CancelOnDisconnectTriggerDecoder cancelOnDisconnectTrigger = new CancelOnDisconnectTriggerDecoder();
     private final ThrottleRejectDecoder throttleReject = new ThrottleRejectDecoder();
     private final ThrottleConfigurationDecoder throttleConfiguration = new ThrottleConfigurationDecoder();
+    private final SeqIndexSyncDecoder seqIndexSync = new SeqIndexSyncDecoder();
+    private final ValidResendRequestDecoder validResendRequest = new ValidResendRequestDecoder();
 
     private final EngineEndPointHandler handler;
 
@@ -54,6 +56,7 @@ public final class EngineProtocolSubscription implements ControlledFragmentHandl
         this.handler = handler;
     }
 
+    @Override
     @SuppressWarnings("FinalParameters")
     public Action onFragment(final DirectBuffer buffer, int offset, final int length, final Header header)
     {
@@ -109,9 +112,48 @@ public final class EngineProtocolSubscription implements ControlledFragmentHandl
 
             case ThrottleConfigurationDecoder.TEMPLATE_ID:
                 return onThrottleConfiguration(buffer, offset, blockLength, version, header);
+
+            case SeqIndexSyncDecoder.TEMPLATE_ID:
+                return onSeqIndexSync(buffer, offset, blockLength, version, header);
+
+            case ValidResendRequestDecoder.TEMPLATE_ID:
+                return onValidResendRequest(buffer, offset, blockLength, version, header);
         }
 
         return CONTINUE;
+    }
+
+    private Action onValidResendRequest(
+        final DirectBuffer buffer, final int offset, final int blockLength, final int version, final Header header)
+    {
+        final ValidResendRequestDecoder validResendRequest = this.validResendRequest;
+        validResendRequest.wrap(buffer, offset, blockLength, version);
+
+        return handler.onValidResendRequest(
+            validResendRequest.session(),
+            validResendRequest.connection(),
+            validResendRequest.correlationId(),
+            header);
+    }
+
+    private Action onSeqIndexSync(
+        final DirectBuffer buffer, final int offset, final int blockLength, final int version, final Header header)
+    {
+        final SeqIndexSyncDecoder seqIndexSync = this.seqIndexSync;
+        seqIndexSync.wrap(buffer, offset, blockLength, version);
+
+        final int libraryId = seqIndexSync.libraryId();
+        final Action action = handler.onApplicationHeartbeat(
+            libraryId, header.sessionId(), SeqIndexSyncDecoder.TEMPLATE_ID, 0);
+        if (action != null)
+        {
+            return action; // Continue processing messages, but not this message.
+        }
+
+        return handler.onSeqIndexSync(
+            libraryId,
+            seqIndexSync.sessionId(),
+            seqIndexSync.sequenceIndex());
     }
 
     private Action onThrottleConfiguration(
@@ -120,8 +162,16 @@ public final class EngineProtocolSubscription implements ControlledFragmentHandl
         final ThrottleConfigurationDecoder throttleConfiguration = this.throttleConfiguration;
         throttleConfiguration.wrap(buffer, offset, blockLength, version);
 
+        final int libraryId = throttleConfiguration.libraryId();
+        final Action action = handler.onApplicationHeartbeat(
+            libraryId, header.sessionId(), ThrottleConfigurationDecoder.TEMPLATE_ID, 0);
+        if (action != null)
+        {
+            return action; // Continue processing messages, but not this message.
+        }
+
         return handler.onThrottleConfiguration(
-            throttleConfiguration.libraryId(),
+            libraryId,
             throttleConfiguration.correlationId(),
             throttleConfiguration.session(),
             throttleConfiguration.throttleWindowInMs(),
@@ -137,16 +187,20 @@ public final class EngineProtocolSubscription implements ControlledFragmentHandl
         final int businessRejectRefIDOffset =
             throttleReject.limit() + ThrottleRejectDecoder.businessRejectRefIDHeaderLength();
 
+        final int libraryId = throttleReject.libraryId();
+        handler.onApplicationHeartbeat(libraryId, header.sessionId(), ThrottleRejectDecoder.TEMPLATE_ID, 0);
+
         return handler.onThrottleReject(
-            throttleReject.libraryId(),
+            libraryId,
             throttleReject.connection(),
             throttleReject.refMsgType(),
             throttleReject.refSeqNum(),
             throttleReject.sequenceNumber(),
+            throttleReject.sequenceIndex(),
             buffer,
             businessRejectRefIDOffset,
             throttleReject.businessRejectRefIDLength(),
-            header.position());
+            header);
     }
 
     private Action onCancelOnDisconnectTrigger(
@@ -167,8 +221,12 @@ public final class EngineProtocolSubscription implements ControlledFragmentHandl
         final int version,
         final Header header)
     {
+        final ApplicationHeartbeatDecoder applicationHeartbeat = this.applicationHeartbeat;
         applicationHeartbeat.wrap(buffer, offset, blockLength, version);
-        handler.onApplicationHeartbeat(applicationHeartbeat.libraryId(), header.sessionId());
+        final int libraryId = applicationHeartbeat.libraryId();
+        final long timestampInNs = applicationHeartbeat.timestampInNs();
+        final int sessionId = header.sessionId();
+        handler.onApplicationHeartbeat(libraryId, sessionId, ApplicationHeartbeatDecoder.TEMPLATE_ID, timestampInNs);
         return CONTINUE;
     }
 
@@ -197,9 +255,11 @@ public final class EngineProtocolSubscription implements ControlledFragmentHandl
         final int version,
         final Header header)
     {
+        final ReleaseSessionDecoder releaseSession = this.releaseSession;
         releaseSession.wrap(buffer, offset, blockLength, version);
         final int libraryId = releaseSession.libraryId();
-        final Action action = handler.onApplicationHeartbeat(libraryId, header.sessionId());
+        final Action action = handler.onApplicationHeartbeat(
+            libraryId, header.sessionId(), ReleaseSessionDecoder.TEMPLATE_ID, 0);
         if (action != null)
         {
             return action; // Continue processing messages, but not this message.
@@ -226,9 +286,11 @@ public final class EngineProtocolSubscription implements ControlledFragmentHandl
         final int version,
         final Header header)
     {
+        final RequestSessionDecoder requestSession = this.requestSession;
         requestSession.wrap(buffer, offset, blockLength, version);
         final int libraryId = requestSession.libraryId();
-        final Action action = handler.onApplicationHeartbeat(libraryId, header.sessionId());
+        final Action action = handler.onApplicationHeartbeat(
+            libraryId, header.sessionId(), RequestSessionDecoder.TEMPLATE_ID, 0);
         if (action != null)
         {
             return action; // Continue processing messages but not this message.
@@ -249,9 +311,11 @@ public final class EngineProtocolSubscription implements ControlledFragmentHandl
         final int version,
         final Header header)
     {
+        final InitiateConnectionDecoder initiateConnection = this.initiateConnection;
         initiateConnection.wrap(buffer, offset, blockLength, version);
         final int libraryId = initiateConnection.libraryId();
-        final Action action = handler.onApplicationHeartbeat(libraryId, header.sessionId());
+        final Action action = handler.onApplicationHeartbeat(
+            libraryId, header.sessionId(), InitiateConnectionDecoder.TEMPLATE_ID, 0);
         if (action != null)
         {
             return action; // Continue processing messages, but don't process this message.
@@ -291,9 +355,11 @@ public final class EngineProtocolSubscription implements ControlledFragmentHandl
         final int version,
         final Header header)
     {
+        final RequestDisconnectDecoder requestDisconnect = this.requestDisconnect;
         requestDisconnect.wrap(buffer, offset, blockLength, version);
         final int libraryId = requestDisconnect.libraryId();
-        final Action action = handler.onApplicationHeartbeat(libraryId, header.sessionId());
+        final Action action = handler.onApplicationHeartbeat(
+            libraryId, header.sessionId(), RequestDisconnectDecoder.TEMPLATE_ID, 0);
         if (action != null)
         {
             return action; // Continue processing messages, but not this message.
@@ -311,9 +377,11 @@ public final class EngineProtocolSubscription implements ControlledFragmentHandl
         final int version,
         final Header header)
     {
+        final MidConnectionDisconnectDecoder midConnectionDisconnect = this.midConnectionDisconnect;
         midConnectionDisconnect.wrap(buffer, offset, blockLength, version);
         final int libraryId = midConnectionDisconnect.libraryId();
-        final Action action = handler.onApplicationHeartbeat(libraryId, header.sessionId());
+        final Action action = handler.onApplicationHeartbeat(
+            libraryId, header.sessionId(), MidConnectionDisconnectDecoder.TEMPLATE_ID, 0);
         if (action != null)
         {
             return action; // Continue processing messages, but not this message.
@@ -330,9 +398,11 @@ public final class EngineProtocolSubscription implements ControlledFragmentHandl
         final int version,
         final Header header)
     {
+        final FollowerSessionRequestDecoder followerSessionRequest = this.followerSessionRequest;
         followerSessionRequest.wrap(buffer, offset, blockLength, version);
         final int libraryId = followerSessionRequest.libraryId();
-        final Action action = handler.onApplicationHeartbeat(libraryId, header.sessionId());
+        final Action action = handler.onApplicationHeartbeat(
+            libraryId, header.sessionId(), FollowerSessionRequestDecoder.TEMPLATE_ID, 0);
         if (action != null)
         {
             return action; // Continue processing messages, but not this message.
@@ -341,6 +411,7 @@ public final class EngineProtocolSubscription implements ControlledFragmentHandl
         return handler.onFollowerSessionRequest(
             libraryId,
             followerSessionRequest.correlationId(),
+            followerSessionRequest.protocolType(),
             buffer,
             offset + FOLLOWER_SESSION_REQUEST_LENGTH,
             messageLength,
@@ -354,9 +425,11 @@ public final class EngineProtocolSubscription implements ControlledFragmentHandl
         final int version,
         final Header header)
     {
+        final WriteMetaDataDecoder writeMetaData = this.writeMetaData;
         writeMetaData.wrap(buffer, offset, blockLength, version);
         final int libraryId = writeMetaData.libraryId();
-        final Action action = handler.onApplicationHeartbeat(libraryId, header.sessionId());
+        final Action action = handler.onApplicationHeartbeat(
+            libraryId, header.sessionId(), WriteMetaDataDecoder.TEMPLATE_ID, 0);
         if (action != null)
         {
             return action; // Continue processing messages, but not this message.
@@ -379,9 +452,11 @@ public final class EngineProtocolSubscription implements ControlledFragmentHandl
         final int version,
         final Header header)
     {
+        final ReadMetaDataDecoder readMetaData = this.readMetaData;
         readMetaData.wrap(buffer, offset, blockLength, version);
         final int libraryId = readMetaData.libraryId();
-        final Action action = handler.onApplicationHeartbeat(libraryId, header.sessionId());
+        final Action action = handler.onApplicationHeartbeat(
+            libraryId, header.sessionId(), ReadMetaDataDecoder.TEMPLATE_ID, 0);
         if (action != null)
         {
             return action; // Continue processing messages, but not this message.
@@ -399,9 +474,11 @@ public final class EngineProtocolSubscription implements ControlledFragmentHandl
         final int version,
         final Header header)
     {
+        final ReplayMessagesDecoder replayMessages = this.replayMessages;
         replayMessages.wrap(buffer, offset, blockLength, version);
         final int libraryId = replayMessages.libraryId();
-        final Action action = handler.onApplicationHeartbeat(libraryId, header.sessionId());
+        final Action action = handler.onApplicationHeartbeat(
+            libraryId, header.sessionId(), ReplayMessagesDecoder.TEMPLATE_ID, 0);
         if (action != null)
         {
             return action; // Continue processing messages, but not this message.
@@ -411,7 +488,7 @@ public final class EngineProtocolSubscription implements ControlledFragmentHandl
             replayMessages.session(),
             replayMessages.correlationId(),
             replayMessages.replayFromSequenceNumber(),
-            replayMessages.replayToSequenceIndex(),
+            replayMessages.replayFromSequenceIndex(),
             replayMessages.replayToSequenceNumber(),
             replayMessages.replayToSequenceIndex(),
             replayMessages.latestReplyArrivalTimeInMs());
@@ -424,9 +501,11 @@ public final class EngineProtocolSubscription implements ControlledFragmentHandl
         final int version,
         final Header header)
     {
+        final InitiateILinkConnectionDecoder initiateILinkConnection = this.initiateILinkConnection;
         initiateILinkConnection.wrap(buffer, offset, blockLength, version);
         final int libraryId = initiateILinkConnection.libraryId();
-        final Action action = handler.onApplicationHeartbeat(libraryId, header.sessionId());
+        final Action action = handler.onApplicationHeartbeat(
+            libraryId, header.sessionId(), InitiateILinkConnectionDecoder.TEMPLATE_ID, 0);
         if (action != null)
         {
             return action; // Continue processing messages, but not this message.

@@ -17,19 +17,15 @@ package uk.co.real_logic.artio.engine.framer;
 
 import org.agrona.DirectBuffer;
 import org.agrona.concurrent.UnsafeBuffer;
-import org.junit.Test;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
 
 import java.util.Arrays;
 
-import static org.junit.Assert.*;
+import static org.junit.jupiter.api.Assertions.*;
 
-@RunWith(Parameterized.class)
 public class PasswordCleanerTest
 {
-    // TODO: checksums?
-
     private static final String EXAMPLE_LOGON =
         "8=FIX.4.4\0019=099\00135=A\00149=initiator\00156=acceptor\00134=1\00152=20191002-16:54:47.446" +
         "\00198=0\001108=10\001141=N\001553=bob\001554=Uv1aegoh\00110=062\001";
@@ -92,74 +88,79 @@ public class PasswordCleanerTest
 
     private final PasswordCleaner passwordCleaner = new PasswordCleaner();
 
-    private final int offset;
-
-    public PasswordCleanerTest(final int offset)
+    @ParameterizedTest
+    @MethodSource(value = "decimalFloatCodecData")
+    public void shouldCleanPasswordFromLogon(final int offset)
     {
-        this.offset = offset;
+        shouldCleanMessage(EXAMPLE_LOGON, EXPECTED_CLEANED_LOGON, offset);
     }
 
-    @Test
-    public void shouldCleanPasswordFromLogon()
+    @ParameterizedTest
+    @MethodSource(value = "decimalFloatCodecData")
+    public void shouldCleanLongPasswordFromLogon(final int offset)
     {
-        shouldCleanMessage(EXAMPLE_LOGON, EXPECTED_CLEANED_LOGON);
+        shouldCleanMessage(LONG_EXAMPLE_LOGON, EXPECTED_CLEANED_LOGON, offset);
     }
 
-    @Test
-    public void shouldCleanLongPasswordFromLogon()
+    @ParameterizedTest
+    @MethodSource(value = "decimalFloatCodecData")
+    public void shouldNotChangeLogonWithoutPassword(final int offset)
     {
-        shouldCleanMessage(LONG_EXAMPLE_LOGON, EXPECTED_CLEANED_LOGON);
+        shouldCleanMessage(NO_PASSWORD_LOGON, NO_PASSWORD_LOGON, offset);
     }
 
-    @Test
-    public void shouldNotChangeLogonWithoutPassword()
+    @ParameterizedTest
+    @MethodSource(value = "decimalFloatCodecData")
+    public void shouldCleanPasswordFromLogonWithShortPassword(final int offset)
     {
-        shouldCleanMessage(NO_PASSWORD_LOGON, NO_PASSWORD_LOGON);
+        shouldCleanMessage(EXAMPLE_LOGON_SHORT_PASSWORD, EXPECTED_CLEANED_LOGON_SHORT_OR_EMPTY_PASSWORD, offset);
     }
 
-    @Test
-    public void shouldCleanPasswordFromLogonWithShortPassword()
+    @ParameterizedTest
+    @MethodSource(value = "decimalFloatCodecData")
+    public void shouldCleanPasswordFromLogonWithShortNamePassword(final int offset)
     {
-        shouldCleanMessage(EXAMPLE_LOGON_SHORT_PASSWORD, EXPECTED_CLEANED_LOGON_SHORT_OR_EMPTY_PASSWORD);
+        shouldCleanMessage(EXAMPLE_LOGON_SHORT_NAME_PASSWORD, EXPECTED_CLEANED_LOGON_SHORT_NAME_PASSWORD, offset);
     }
 
-    @Test
-    public void shouldCleanPasswordFromLogonWithShortNamePassword()
+    @ParameterizedTest
+    @MethodSource(value = "decimalFloatCodecData")
+    public void shouldCleanPasswordFromLogonWithEmptyPassword(final int offset)
     {
-        shouldCleanMessage(EXAMPLE_LOGON_SHORT_NAME_PASSWORD, EXPECTED_CLEANED_LOGON_SHORT_NAME_PASSWORD);
+        shouldCleanMessage(EXAMPLE_LOGON_EMPTY_PASSWORD, EXPECTED_CLEANED_LOGON_SHORT_OR_EMPTY_PASSWORD, offset);
     }
 
-    @Test
-    public void shouldCleanPasswordFromLogonWithEmptyPassword()
+    @ParameterizedTest
+    @MethodSource(value = "decimalFloatCodecData")
+    public void shouldCleanPasswordsFromUserRequest(final int offset)
     {
-        shouldCleanMessage(EXAMPLE_LOGON_EMPTY_PASSWORD, EXPECTED_CLEANED_LOGON_SHORT_OR_EMPTY_PASSWORD);
+        shouldCleanMessage(EXAMPLE_USER_REQUEST, CLEAN_USER_REQUEST, offset);
     }
 
-    @Test
-    public void shouldCleanPasswordsFromUserRequest()
+    @ParameterizedTest
+    @MethodSource(value = "decimalFloatCodecData")
+    public void shouldCleanPasswordsFromUserRequestShort(final int offset)
     {
-        shouldCleanMessage(EXAMPLE_USER_REQUEST, CLEAN_USER_REQUEST);
+        shouldCleanMessage(EXAMPLE_USER_REQUEST_SHORT_PASSWORD, CLEAN_USER_REQUEST, offset);
     }
 
-    @Test
-    public void shouldCleanPasswordsFromUserRequestShort()
+    @ParameterizedTest
+    @MethodSource(value = "decimalFloatCodecData")
+    public void shouldCleanPasswordsFromUserRequestWithFieldsFlipped(final int offset)
     {
-        shouldCleanMessage(EXAMPLE_USER_REQUEST_SHORT_PASSWORD, CLEAN_USER_REQUEST);
+        shouldCleanMessage(EXAMPLE_USER_REQUEST_FLIPPED_FIELD_ORDER, CLEAN_USER_REQUEST_FLIPPED_FIELD_ORDER, offset);
     }
 
-    @Test
-    public void shouldCleanPasswordsFromUserRequestWithFieldsFlipped()
+    @ParameterizedTest
+    @MethodSource(value = "decimalFloatCodecData")
+    public void shouldCleanPasswordsFromUserRequestWithFieldsFlippedShort(final int offset)
     {
-        shouldCleanMessage(EXAMPLE_USER_REQUEST_FLIPPED_FIELD_ORDER, CLEAN_USER_REQUEST_FLIPPED_FIELD_ORDER);
+        shouldCleanMessage(EXAMPLE_USER_REQUEST_FLIPPED_FIELD_ORDER_SHORT,
+            CLEAN_USER_REQUEST_FLIPPED_FIELD_ORDER,
+            offset);
     }
 
-    @Test
-    public void shouldCleanPasswordsFromUserRequestWithFieldsFlippedShort()
-    {
-        shouldCleanMessage(EXAMPLE_USER_REQUEST_FLIPPED_FIELD_ORDER_SHORT, CLEAN_USER_REQUEST_FLIPPED_FIELD_ORDER);
-    }
-
-    private void shouldCleanMessage(final String inputMessage, final String expectedCleanedMessage)
+    private void shouldCleanMessage(final String inputMessage, final String expectedCleanedMessage, final int offset)
     {
         final UnsafeBuffer buffer = new UnsafeBuffer(new byte[1024]);
         final int length = buffer.putStringWithoutLengthAscii(offset, inputMessage);
@@ -172,7 +173,6 @@ public class PasswordCleanerTest
         assertEquals(expectedCleanedMessage, cleanedLogon);
     }
 
-    @Parameterized.Parameters(name = "offset={0}")
     public static Iterable<Object[]> decimalFloatCodecData()
     {
         return Arrays.asList(new Object[][]

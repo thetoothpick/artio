@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
  */
 package uk.co.real_logic.artio.otf;
 
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 import uk.co.real_logic.artio.dictionary.LongDictionary;
 import uk.co.real_logic.artio.fields.AsciiFieldFlyweight;
 import uk.co.real_logic.artio.util.MutableAsciiBuffer;
@@ -37,52 +37,41 @@ public class OtfValidatorTest
     @Test
     public void validStartMessageDelegates()
     {
-        when:
         validator.onNext();
 
-        then:
         verify(acceptor).onNext();
     }
 
     @Test
     public void validEndMessageDelegates()
     {
-        given:
         heartBeatsAreKnownMessages();
         messageIsAHeartBeat();
         validateMessageType();
 
-        when:
         validator.onComplete();
 
-        then:
         verify(acceptor).onComplete();
     }
 
     @Test
     public void validMessageTypeDelegates()
     {
-        given:
         heartBeatsAreKnownMessages();
         messageIsAHeartBeat();
 
-        when:
         validateMessageType();
 
-        then:
         verifyAcceptorReceivesMessageType();
     }
 
     @Test
     public void invalidMessageTypeNotifiesErrorHandler()
     {
-        given:
         messageIsAHeartBeat();
 
-        when:
         validateMessageType();
 
-        then:
         verifyAcceptorNotNotifiedOf(MESSAGE_TYPE);
         verifyUnknownMessage();
     }
@@ -90,30 +79,24 @@ public class OtfValidatorTest
     @Test
     public void validFieldDelegates()
     {
-        given:
         heartbeatsHaveATestReqId();
         messageIsAHeartBeat();
 
-        when:
         validateMessageType();
         validateTestReqId();
 
-        then:
         verifyAcceptorReceivesMessageType();
     }
 
     @Test
     public void unknownFieldNotifiesErrorHandler()
     {
-        given:
         heartBeatsAreKnownMessages();
         messageIsAHeartBeat();
 
-        when:
         validateMessageType();
         validateTestReqId();
 
-        then:
         verifyAcceptorNotNotifiedOf(112);
         verifyUnknownField();
     }
@@ -121,16 +104,13 @@ public class OtfValidatorTest
     @Test
     public void missingRequiredFieldsNotifiesErrorHandler()
     {
-        given:
         heartBeatsAreKnownMessages();
         testReqIdIsARequiredHeartBeatField();
         messageIsAHeartBeat();
 
-        when:
         validateMessageType();
         validator.onComplete();
 
-        then:
         verifyMissingRequiredField();
     }
 

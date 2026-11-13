@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd., Monotonic Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd., Monotonic Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,51 +13,38 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
-buildscript {
-    ext {
-        awsAccessKeyId = System.env.AWS_ACCESS_KEY_ID
-        awsSecretAccessKey = System.env.AWS_SECRET_ACCESS_KEY
-    }
-
-    repositories {
-        mavenCentral()
-    }
-}
-
 plugins {
-    id 'com.github.johnrengelman.shadow' version '6.1.0' apply false
-    id 'net.researchgate.release' version '2.8.1'
-    id "com.github.ben-manes.versions" version "0.38.0"
+    alias(libs.plugins.shadow).apply(false)
+    alias(libs.plugins.versions)
 }
 
-def checkstyleVersion = '8.39'
-def hamcrestVersion = '2.2'
-def junitVersion = '4.13.2'
-def mockitoVersion = '3.9.0'
-def hdrHistogramVersion = '2.1.12'
-def jmhVersion = '1.29'
-
-def aeronVersion = '1.32.0'
-def agronaVersion = '1.9.0'
-def sbeVersion = '1.21.0'
-def artioJavaVersion = JavaVersion.VERSION_1_8
 def artioGroup = 'uk.co.real-logic'
-def iLink3Enabled = false
 
-defaultTasks 'clean', 'build', 'javadoc', 'publishToMavenLocal'
+defaultTasks 'clean', 'build'
+
+static int getBuildJavaVersion() {
+    def buildJavaVersion = System.getenv('BUILD_JAVA_VERSION') ?: JavaVersion.current().getMajorVersion()
+    if (buildJavaVersion.indexOf('.') > 0) {
+        buildJavaVersion = buildJavaVersion.substring(0, buildJavaVersion.indexOf('.'))
+    }
+    if (buildJavaVersion.indexOf('-') > 0) {
+        buildJavaVersion = buildJavaVersion.substring(0, buildJavaVersion.indexOf('-'))
+    }
+    Integer.parseInt(buildJavaVersion)
+}
+int buildJavaVersion = getBuildJavaVersion()
 
 def projectPom = {
     name = 'artio'
     packaging = 'jar'
     description = 'High-Performance FIX Gateway'
 
-    url = 'https://github.com/real-logic/artio'
+    url = 'https://github.com/artiofix/artio'
 
     scm {
-        connection = 'scm:git:https://github.com/real-logic/artio.git'
-        developerConnection = 'scm:git:https://github.com/real-logic/artio.git'
-        url = 'https://github.com/real-logic/artio.git'
+        connection = 'scm:git:https://github.com/artiofix/artio.git'
+        developerConnection = 'scm:git:https://github.com/artiofix/artio.git'
+        url = 'https://github.com/artiofix/artio.git'
     }
 
     licenses {
@@ -83,48 +70,62 @@ def projectPom = {
     }
 }
 
-ext {
-    group = artioGroup
-    isReleaseVersion = !version.endsWith("SNAPSHOT")
-    iLink3Enabled = Boolean.getBoolean("fix.core.iLink3Enabled")
-
-    if (!project.hasProperty('repoUsername')) {
-        repoUsername = ''
-    }
-
-    if (!project.hasProperty('repoPassword')) {
-        repoPassword = ''
-    }
-
-    if (!project.hasProperty('repoUrl')) {
-        repoUrl = ''
-    }
-
-    if (!project.hasProperty('snapshotUrl')) {
-        snapshotUrl = ''
-    }
-}
-
-allprojects {
-    apply plugin: 'maven-publish'
-    apply plugin: 'signing'
-    apply plugin: 'eclipse'
-    apply plugin: 'idea'
-
-    repositories {
-        mavenLocal()
-        mavenCentral()
-    }
-
-    idea {
-        module {
-            downloadJavadoc = true
-            downloadSources = true
+def getConfigProperty(final String projectPropertyName, final String envVarName) {
+    String value = project.findProperty(projectPropertyName)
+    if (!value) {
+        value = System.getenv(envVarName)
+        if (!value) {
+            return null
         }
     }
 
-    tasks.withType(Sign) {
-        onlyIf { isReleaseVersion }
+    value = value.trim()
+
+    return value ? value : null
+}
+
+def isReleaseVersion = !version.endsWith('-SNAPSHOT')
+def iLink3Enabled = Boolean.getBoolean("fix.core.iLink3Enabled")
+def sonatypeCentralPortalReleasesRepoUrl = 'https://ossrh-staging-api.central.sonatype.com/service/local/staging/deploy/maven2/'
+def sonatypeCentralPortalSnapshotsRepoUrl = 'https://central.sonatype.com/repository/maven-snapshots/'
+def sonatypeCentralPortalUsername = getConfigProperty('sonatypeCentralPortalUsername', 'SONATYPE_CENTRAL_PORTAL_USERNAME')
+def sonatypeCentralPortalPassword = getConfigProperty('sonatypeCentralPortalPassword', 'SONATYPE_CENTRAL_PORTAL_PASSWORD')
+def signingKey = getConfigProperty('signingKey', 'SIGNING_GPG_SECRET_KEY')         // NOTE: ASCII armored secret key
+def signingPassword = getConfigProperty('signingPassword', 'SIGNING_GPG_PASSWORD') // NOTE: Plain text
+
+def libs = rootProject.libs
+
+allprojects {
+    repositories {
+        mavenLocal()
+        mavenCentral()
+        maven {
+            name = "maven central snapshots"
+            url = uri("https://central.sonatype.com/repository/maven-snapshots/")
+            content {
+                includeModule("io.aeron", "aeron-agent")
+                includeModule("io.aeron", "aeron-annotations")
+                includeModule("io.aeron", "aeron-archive")
+                includeModule("io.aeron", "aeron-client")
+                includeModule("io.aeron", "aeron-driver")
+                includeModule("io.aeron", "aeron-cluster")
+                includeModule("io.aeron", "aeron-samples")
+                includeModule("io.aeron", "aeron-test-support")
+            }
+        }
+    }
+
+    configurations.configureEach {
+        resolutionStrategy {
+            failOnVersionConflict()
+
+            force libs.agrona,
+                    // patching conflicting Checkstyle dependencies
+                    libs.commons.codec,
+                    libs.commons.lang3,
+                    libs.httpcore,
+                    libs.plexus.utils
+        }
     }
 }
 
@@ -135,82 +136,139 @@ subprojects {
     group = artioGroup
     version = version
 
-    tasks.withType(JavaCompile) {
-        sourceCompatibility = artioJavaVersion
-        targetCompatibility = artioJavaVersion
+    def toolchainLauncher = javaToolchains.launcherFor {
+        languageVersion = JavaLanguageVersion.of(buildJavaVersion)
+    }
+
+    java {
+        toolchain {
+            languageVersion = JavaLanguageVersion.of(buildJavaVersion)
+        }
+        sourceCompatibility = JavaVersion.VERSION_17
+    }
+
+    tasks.withType(JavaCompile).configureEach {
         options.encoding = 'UTF-8'
         options.deprecation = true
     }
 
-    dependencies {
-        testImplementation "org.hamcrest:hamcrest:${hamcrestVersion}"
-        testImplementation "org.mockito:mockito-core:${mockitoVersion}"
-        testImplementation "junit:junit:${junitVersion}"
+    tasks.withType(Sign).configureEach {
+        onlyIf {
+            isReleaseVersion && gradle.taskGraph.hasTask(tasks.publish)
+        }
     }
 
-    checkstyle.toolVersion = "${checkstyleVersion}"
+    dependencies {
+        testImplementation libs.hamcrest
+        testImplementation libs.mockito
+        testImplementation platform(libs.junit.bom)
+        testImplementation "org.junit.jupiter:junit-jupiter"
+        testRuntimeOnly "org.junit.platform:junit-platform-launcher"
+    }
 
-    test {
-        if (JavaVersion.current().isJava9Compatible()) {
-            jvmArgs('--add-opens', 'java.base/sun.nio.ch=ALL-UNNAMED')
+    checkstyle.toolVersion = libs.versions.checkstyle.get()
+
+    tasks.withType(Test).configureEach {
+        useJUnitPlatform()
+
+        jvmArgs('--add-opens', 'java.base/sun.nio.ch=ALL-UNNAMED')
+        jvmArgs('--add-opens', 'java.base/jdk.internal.misc=ALL-UNNAMED')
+        jvmArgs('--add-opens', 'java.base/java.util.zip=ALL-UNNAMED')
+
+        if (buildJavaVersion >= 21) {
+            jvmArgs('-XX:+EnableDynamicAgentLoading')
         }
+
+        testClassesDirs = testing.suites.test.sources.output.classesDirs
+        classpath = testing.suites.test.sources.runtimeClasspath
+        maxHeapSize = "1g"
+        jvmArgs("-XX:MaxDirectMemorySize=1g",
+                "-XX:+HeapDumpOnOutOfMemoryError",
+                "-XX:+CrashOnOutOfMemoryError",
+                "-XX:HeapDumpPath=" + project.rootDir + "/heap.hprof")
 
         testLogging {
             events 'skipped', 'failed'
             showStandardStreams = true
             exceptionFormat = 'full'
-            afterSuite { desc, result ->
-                if (!desc.parent) {
+        }
+
+        addTestListener(new TestListener()
+        {
+            void beforeSuite(final TestDescriptor suite)
+            {
+            }
+
+            void afterSuite(final TestDescriptor suite, final TestResult result)
+            {
+                if (!suite.parent) {
                     println "Results: ${result.resultType} (${result.testCount} tests, " +
-                        "${result.successfulTestCount} successes, " +
-                        "${result.failedTestCount} failures, " +
-                        "${result.skippedTestCount} skipped)"
+                            "${result.successfulTestCount} successes, " +
+                            "${result.failedTestCount} failures, " +
+                            "${result.skippedTestCount} skipped)"
                 }
             }
-        }
 
-        systemProperty 'fix.core.close_checker', 'true'
-        systemProperty "fix.core.debug", System.getProperty("fix.core.debug")
-
-        beforeTest { desc ->
-            if (System.properties["printTestNames"] != null) {
-                print "Executing test ${desc.name} [${desc.className}]"
+            void beforeTest(final TestDescriptor testDescriptor) {
+                if (System.properties["printTestNames"] != null) {
+                    print "Executing test ${testDescriptor.name} [${testDescriptor.className}]"
+                }
             }
-        }
 
-        afterTest { desc, result ->
-            if (System.properties["printTestNames"] != null) {
-                println " with result: ${result.resultType}"
+            void afterTest(final TestDescriptor testDescriptor, final TestResult result) {
+                if (System.properties["printTestNames"] != null) {
+                    println " with result: ${result.resultType}"
+                }
             }
-        }
+        })
+
+        systemProperties(
+            'fix.core.close_checker': 'true',
+            'fix.core.debug': System.getProperty("fix.core.debug"),
+            'fix.core.ci': System.getProperty("fix.core.ci"),
+            'aeron.dir.warn.if.exists': 'false',
+            'aeron.use.windows.high.res.timer': 'true',
+            'aeron.term.buffer.sparse.file': 'true',
+            'aeron.perform.storage.checks': 'false',
+            'aeron.publication.unblock.timeout': '35000000000',
+            'aeron.client.liveness.timeout': '30000000000')
+
+        def threshold = System.getProperty("org.agrona.transport.iteration.threshold")
+        systemProperty "org.agrona.transport.iteration.threshold", threshold
+
+        javaLauncher.set(toolchainLauncher)
+    }
+
+    tasks.withType(JavaExec).configureEach {
+        javaLauncher.set(toolchainLauncher)
     }
 
     javadoc {
         title = '<h1>Artio</h1>'
-        options.bottom = '<i>Copyright &#169; 2015-2021 Real Logic Limited. All Rights Reserved.</i>'
+        options.bottom = '<i>Copyright &#169; 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd., Monotonic Ltd. All Rights Reserved.</i>'
         options.encoding = 'UTF-8'
         options.docEncoding = 'UTF-8'
         options.charSet = 'UTF-8'
-        if (JavaVersion.current().isJava10Compatible()) {
-            options.addBooleanOption 'html5', true
-        }
+        options.addBooleanOption('html5', true)
+        options.addStringOption('Xdoclint:all,-missing', '-quiet')
     }
 
     jar {
         manifest.attributes(
             'Implementation-Title': 'Artio',
             'Implementation-Version': archiveVersion,
-            'Implementation-Vendor': 'Real Logic Limited'
+            'Implementation-Vendor': 'Adaptive Financial Consulting'
         )
     }
 
-    task testJar(type: Jar, dependsOn: testClasses) {
+    tasks.register('testJar', Jar) {
+        dependsOn testClasses
         archiveClassifier.set('tests')
-        archiveBaseName.set("test-${project.archivesBaseName}")
+        archiveBaseName.set("test-${base.archivesName}")
         from sourceSets.test.output
     }
 
-    task allDeps(type: DependencyReportTask) {}
+    tasks.register('allDeps', DependencyReportTask) {}
 
     configurations {
         tests
@@ -218,11 +276,6 @@ subprojects {
 
     artifacts {
         tests testJar
-    }
-
-    signing {
-        required { isReleaseVersion && gradle.taskGraph.hasTask("uploadArchives") }
-        sign configurations.archives
     }
 
     java {
@@ -234,22 +287,23 @@ subprojects {
 def validationXsdPath = project(':artio-codecs').projectDir.toString() + '/src/main/resources/fpl/sbe.xsd'
 
 project(':artio-codecs') {
-    apply plugin: 'com.github.johnrengelman.shadow'
+    apply plugin: 'com.gradleup.shadow'
+    apply plugin: 'maven-publish'
+    apply plugin: 'signing'
 
     configurations {
         codecGeneration
     }
 
     dependencies {
-        api "org.agrona:agrona:${agronaVersion}"
-        api "io.aeron:aeron-client:${aeronVersion}"
-        codecGeneration "uk.co.real-logic:sbe-tool:${sbeVersion}"
-        api "uk.co.real-logic:sbe-tool:${sbeVersion}"
-        api files('build/classes/java/generated')
-        testImplementation files('build/classes/java/generated')
+        api libs.agrona
+        api libs.aeron.client
+        api libs.sbe
+        api files("${layout.buildDirectory.get()}/classes/java/generated")
+        codecGeneration libs.sbe
     }
 
-    def generatedDir = file("${buildDir}/generated-src")
+    def generatedDir = file("${layout.buildDirectory.get()}/generated-src")
     sourceSets {
         generated {
             java.srcDir generatedDir
@@ -261,16 +315,17 @@ project(':artio-codecs') {
 
     compileGeneratedJava.dependsOn 'generateMessages'
 
-    task generateMessages(type: JavaExec) {
-        main = 'uk.co.real_logic.sbe.SbeTool'
+    tasks.register('generateMessages', JavaExec) {
+        mainClass.set('uk.co.real_logic.sbe.SbeTool')
+        jvmArgs('--add-opens', 'java.base/jdk.internal.misc=ALL-UNNAMED')
         classpath = configurations.codecGeneration
         systemProperties('sbe.output.dir': generatedDir,
             'sbe.target.language': 'Java',
             'sbe.validation.stop.on.error': 'true',
             'sbe.validation.xsd': validationXsdPath)
         args = [
-            'src/main/resources/uk/co/real_logic/artio/messages/message-schema.xml',
-            'src/main/resources/uk/co/real_logic/artio/storage/storage-message-schema.xml'
+                'src/main/resources/uk/co/real_logic/artio/messages/message-schema.xml',
+                'src/main/resources/uk/co/real_logic/artio/storage/storage-message-schema.xml'
         ]
     }
 
@@ -279,6 +334,7 @@ project(':artio-codecs') {
     }
 
     sourcesJar {
+        dependsOn 'generateMessages'
         from sourceSets.generated.java
     }
 
@@ -298,27 +354,31 @@ project(':artio-codecs') {
     }
 
     signing {
+        if (signingKey != null) {
+            useInMemoryPgpKeys(signingKey, signingPassword)
+        }
         sign publishing.publications.artioCodecs
     }
 }
 
 project(':artio-ilink3-codecs') {
-    apply plugin: 'com.github.johnrengelman.shadow'
+    apply plugin: 'com.gradleup.shadow'
+    apply plugin: 'maven-publish'
+    apply plugin: 'signing'
 
     configurations {
         codecGeneration
     }
 
     dependencies {
-        api "org.agrona:agrona:${agronaVersion}"
-        codecGeneration "uk.co.real-logic:sbe-tool:${sbeVersion}"
-        api files('build/classes/java/generated')
-        testImplementation files('build/classes/java/generated')
+        api libs.agrona
+        api files("${layout.buildDirectory.get()}/classes/java/generated")
+        codecGeneration libs.sbe
     }
 
     def outputClasses = 'out/production/classes'
     def sbePath = 'src/main/resources/uk/co/real_logic/artio/ilink/ilinkbinary.xml'
-    def generatedDir = file("${buildDir}/generated-src")
+    def generatedDir = file("${layout.buildDirectory.get()}/generated-src")
     sourceSets {
         generated {
             java.srcDir generatedDir
@@ -330,40 +390,44 @@ project(':artio-ilink3-codecs') {
         compileJava.dependsOn 'compileGeneratedJava'
         compileGeneratedJava.dependsOn 'generateMessages', 'copySbeIr'
 
-        task generateMessages(type: JavaExec) {
-            main = 'uk.co.real_logic.sbe.SbeTool'
+        tasks.register('generateMessages', JavaExec) {
+            mainClass.set('uk.co.real_logic.sbe.SbeTool')
+            jvmArgs('--add-opens', 'java.base/jdk.internal.misc=ALL-UNNAMED')
             classpath = configurations.codecGeneration
             systemProperties(
                 'sbe.output.dir': generatedDir,
                 'sbe.target.language': 'Java',
                 'sbe.java.generate.interfaces': 'true',
                 'sbe.generate.ir': 'true')
-            args = [ sbePath ]
+            args = [sbePath]
         }
 
-        task copySbeIr (type: Copy) {
+        tasks.register('copySbeIr', Copy) {
             dependsOn 'generateMessages'
             from generatedDir.absolutePath + "/ilinkbinary.sbeir"
             into outputClasses + '/iLinkBinary'
         }
-    }
 
-    sourcesJar {
-        from sourceSets.generated.java
-    }
+        sourcesJar {
+            dependsOn generateMessages
+            from sourceSets.generated.java
+        }
 
-    javadoc {
-        source += sourceSets.generated.java
-    }
+        javadoc {
+            dependsOn compileGeneratedJava
+            source += sourceSets.generated.java
+        }
 
-    jar {
-        from sourceSets.generated.output
+        jar {
+            from sourceSets.generated.output
 
-        from(outputClasses) {
-            include 'iLinkBinary/ilinkbinary.sbeir'
+            from(outputClasses) {
+                include 'iLinkBinary/ilinkbinary.sbeir'
+            }
         }
     }
 
+    shadowJar.enabled = iLink3Enabled
     checkstyleGenerated.enabled = false
 
     publishing {
@@ -376,27 +440,31 @@ project(':artio-ilink3-codecs') {
     }
 
     signing {
+        if (signingKey != null) {
+            useInMemoryPgpKeys(signingKey, signingPassword)
+        }
         sign publishing.publications.artioILink3Codecs
     }
 }
 
 project(':artio-binary-entrypoint-codecs') {
-    apply plugin: 'com.github.johnrengelman.shadow'
+    apply plugin: 'com.gradleup.shadow'
+    apply plugin: 'maven-publish'
+    apply plugin: 'signing'
 
     configurations {
         codecGeneration
     }
 
     dependencies {
-        api "org.agrona:agrona:${agronaVersion}"
-        codecGeneration "uk.co.real-logic:sbe-tool:${sbeVersion}"
-        api files('build/classes/java/generated')
-        testImplementation files('build/classes/java/generated')
+        api libs.agrona
+        api files("${layout.buildDirectory.get()}/classes/java/generated")
+        codecGeneration libs.sbe
     }
 
     def outputClasses = 'out/production/classes'
     def sbePath = 'src/main/resources/uk/co/real_logic/artio/entrypoint/binary_entrypoint.xml'
-    def generatedDir = file("${buildDir}/generated-src")
+    def generatedDir = file("${layout.buildDirectory.get()}/generated-src")
     sourceSets {
         generated {
             java.srcDir generatedDir
@@ -407,24 +475,26 @@ project(':artio-binary-entrypoint-codecs') {
     compileJava.dependsOn 'compileGeneratedJava'
     compileGeneratedJava.dependsOn 'generateMessages', 'copySbeIr'
 
-    task generateMessages(type: JavaExec) {
-        main = 'uk.co.real_logic.sbe.SbeTool'
+    tasks.register('generateMessages', JavaExec) {
+        mainClass.set('uk.co.real_logic.sbe.SbeTool')
+        jvmArgs('--add-opens', 'java.base/jdk.internal.misc=ALL-UNNAMED')
         classpath = configurations.codecGeneration
         systemProperties(
-                'sbe.output.dir': generatedDir,
-                'sbe.target.language': 'Java',
-                'sbe.java.generate.interfaces': 'true',
-                'sbe.generate.ir': 'true')
-        args = [ sbePath ]
+            'sbe.output.dir': generatedDir,
+            'sbe.target.language': 'Java',
+            'sbe.java.generate.interfaces': 'true',
+            'sbe.generate.ir': 'true')
+        args = [sbePath]
     }
 
-    task copySbeIr (type: Copy) {
+    tasks.register('copySbeIr', Copy) {
         dependsOn 'generateMessages'
         from generatedDir.absolutePath + "/binary_entrypoint.sbeir"
         into outputClasses + '/b3/entrypoint/fixp/sbe/'
     }
 
     sourcesJar {
+        dependsOn 'generateMessages'
         from sourceSets.generated.java
     }
 
@@ -452,12 +522,17 @@ project(':artio-binary-entrypoint-codecs') {
     }
 
     signing {
+        if (signingKey != null) {
+            useInMemoryPgpKeys(signingKey, signingPassword)
+        }
         sign publishing.publications.artioBinaryEntrypointCodecs
     }
 }
 
 project(':artio-binary-entrypoint-impl') {
-    apply plugin: 'com.github.johnrengelman.shadow'
+    apply plugin: 'com.gradleup.shadow'
+    apply plugin: 'maven-publish'
+    apply plugin: 'signing'
 
     dependencies {
         api project(':artio-binary-entrypoint-codecs')
@@ -475,15 +550,23 @@ project(':artio-binary-entrypoint-impl') {
     }
 
     signing {
+        if (signingKey != null) {
+            useInMemoryPgpKeys(signingKey, signingPassword)
+        }
         sign publishing.publications.artioBinaryEntrypointImpl
     }
 }
 
 project(':artio-ilink3-impl') {
-    apply plugin: 'com.github.johnrengelman.shadow'
+    apply plugin: 'com.gradleup.shadow'
+    apply plugin: 'maven-publish'
+    apply plugin: 'signing'
 
     dependencies {
-        api project(':artio-ilink3-codecs')
+        if (iLink3Enabled) {
+            api project(':artio-ilink3-codecs')
+        }
+
         api project(':artio-codecs')
         api project(':artio-core')
     }
@@ -503,22 +586,28 @@ project(':artio-ilink3-impl') {
     }
 
     signing {
+        if (signingKey != null) {
+            useInMemoryPgpKeys(signingKey, signingPassword)
+        }
         sign publishing.publications.artioIlink3Impl
     }
 }
 
 project(':artio-session-codecs') {
+    apply plugin: 'maven-publish'
+    apply plugin: 'signing'
+
     configurations {
         codecGeneration
     }
 
     dependencies {
         api project(':artio-codecs')
+        api files("${layout.buildDirectory.get()}/classes/java/generated")
         codecGeneration project(':artio-codecs')
-        api files('build/classes/java/generated')
     }
 
-    def generatedDir = file("$buildDir/generated-src")
+    def generatedDir = file("${layout.buildDirectory.get()}/generated-src")
     sourceSets {
         generated {
             java.srcDir generatedDir
@@ -529,18 +618,24 @@ project(':artio-session-codecs') {
     compileJava.dependsOn 'compileGeneratedJava'
     compileGeneratedJava.dependsOn 'generateCodecs', 'generateOtherCodecs'
 
-    task generateCodecs(type: JavaExec) {
-        main = 'uk.co.real_logic.artio.dictionary.CodecGenerationTool'
+    tasks.register('generateCodecs', JavaExec) {
+        mainClass.set('uk.co.real_logic.artio.dictionary.CodecGenerationTool')
+        jvmArgs('--add-opens', 'java.base/jdk.internal.misc=ALL-UNNAMED')
         classpath = configurations.codecGeneration
-        args = [generatedDir, 'src/main/resources/session_dictionary.xml']
+        def dictionaryFile = 'src/main/resources/session_dictionary.xml'
+        inputs.file(dictionaryFile)
+        args = [generatedDir, dictionaryFile]
         outputs.dir generatedDir
         systemProperty("fix.codecs.flyweight", "true")
     }
 
-    task generateOtherCodecs(type: JavaExec) {
-        main = 'uk.co.real_logic.artio.dictionary.CodecGenerationTool'
+    tasks.register('generateOtherCodecs', JavaExec) {
+        mainClass.set('uk.co.real_logic.artio.dictionary.CodecGenerationTool')
+        jvmArgs('--add-opens', 'java.base/jdk.internal.misc=ALL-UNNAMED')
         classpath = configurations.codecGeneration
-        args = [generatedDir, 'src/main/resources/other_session_dictionary.xml']
+        def dictionaryFile = 'src/main/resources/other_session_dictionary.xml'
+        inputs.file(dictionaryFile)
+        args = [generatedDir, dictionaryFile]
         outputs.dir generatedDir
         systemProperty("fix.codecs.flyweight", "true")
         systemProperty("fix.codecs.parent_package", "uk.co.real_logic.artio.other")
@@ -551,6 +646,7 @@ project(':artio-session-codecs') {
     }
 
     sourcesJar {
+        dependsOn 'generateCodecs', 'generateOtherCodecs'
         from sourceSets.generated.java
     }
 
@@ -568,24 +664,33 @@ project(':artio-session-codecs') {
     }
 
     signing {
+        if (signingKey != null) {
+            useInMemoryPgpKeys(signingKey, signingPassword)
+        }
         sign publishing.publications.artioSessionCodecs
     }
 }
 
 project(':artio-session-fixt-codecs') {
+    apply plugin: 'maven-publish'
+    apply plugin: 'signing'
+
     configurations {
         codecGeneration
     }
 
     dependencies {
         api project(path: ':artio-codecs')
+        api files("${layout.buildDirectory.get()}/classes/java/generated")
         codecGeneration project(':artio-codecs')
-        api files('build/classes/java/generated')
     }
 
-    def generatedDir = file("$buildDir/generated-src")
+    def generatedDir = file("${layout.buildDirectory.get()}/generated-src")
     sourceSets {
-        generated.java.srcDir generatedDir
+        generated {
+            java.srcDir generatedDir
+            compileClasspath += configurations.codecGeneration
+        }
     }
 
     compileJava.dependsOn 'compileGeneratedJava'
@@ -595,8 +700,9 @@ project(':artio-session-fixt-codecs') {
         classpath += configurations.codecGeneration
     }
 
-    task generateCodecs(type: JavaExec) {
-        main = 'uk.co.real_logic.artio.dictionary.CodecGenerationTool'
+    tasks.register('generateCodecs', JavaExec) {
+        mainClass.set('uk.co.real_logic.artio.dictionary.CodecGenerationTool')
+        jvmArgs('--add-opens', 'java.base/jdk.internal.misc=ALL-UNNAMED')
         classpath = configurations.codecGeneration
         systemProperty("fix.codecs.parent_package", "uk.co.real_logic.artio.fixt")
         args = [generatedDir, 'src/main/resources/FIXT11.xml']
@@ -608,6 +714,7 @@ project(':artio-session-fixt-codecs') {
     }
 
     sourcesJar {
+        dependsOn 'generateCodecs'
         from sourceSets.generated.java
     }
 
@@ -625,21 +732,26 @@ project(':artio-session-fixt-codecs') {
     }
 
     signing {
+        if (signingKey != null) {
+            useInMemoryPgpKeys(signingKey, signingPassword)
+        }
         sign publishing.publications.artioSessionFixtCodecs
     }
 }
 
 project(':artio-core') {
+    apply plugin: 'maven-publish'
+    apply plugin: 'signing'
+
     dependencies {
+        api project(':artio-codecs')
+        api libs.aeron.client
+        api libs.aeron.archive
+        api libs.hdrHistogram // FIXME: Api?
+
         testImplementation project(path: ':artio-codecs', configuration: 'tests')
         testImplementation project(':artio-session-codecs')
         testImplementation project(':artio-session-fixt-codecs')
-        api project(':artio-codecs')
-
-        api "io.aeron:aeron-client:${aeronVersion}"
-        api "io.aeron:aeron-driver:${aeronVersion}"
-        api "io.aeron:aeron-archive:${aeronVersion}"
-        api "org.hdrhistogram:HdrHistogram:${hdrHistogramVersion}"
     }
 
     test {
@@ -657,44 +769,46 @@ project(':artio-core') {
     }
 
     signing {
+        if (signingKey != null) {
+            useInMemoryPgpKeys(signingKey, signingPassword)
+        }
         sign publishing.publications.artioCore
     }
 }
 
 project(':artio-system-tests') {
-    apply plugin: 'com.github.johnrengelman.shadow'
+    apply plugin: 'com.gradleup.shadow'
+    apply plugin: 'maven-publish'
+    apply plugin: 'signing'
 
     sourceSets {
         perf
     }
 
     dependencies {
+        api project(':artio-session-codecs')
+        api project(':artio-session-fixt-codecs')
+        api project(path: ':artio-core')
+
         testImplementation project(path: ':artio-core', configuration: 'tests')
         testImplementation project(path: ':artio-codecs', configuration: 'tests')
 
         testImplementation project(path: ':artio-session-codecs', configuration: 'tests')
         testImplementation project(path: ':artio-session-fixt-codecs', configuration: 'tests')
 
-        api project(':artio-session-codecs')
-        api project(':artio-session-fixt-codecs')
-        api project(path: ':artio-core')
-
-        perfImplementation project
-        perfImplementation "org.openjdk.jmh:jmh-core:${jmhVersion}"
+        perfImplementation project(':artio-system-tests')
+        perfImplementation libs.jmh.core
         // For IDEA:
-        implementation "org.openjdk.jmh:jmh-core:${jmhVersion}"
+        implementation libs.jmh.core
 
-        annotationProcessor "org.openjdk.jmh:jmh-generator-annprocess:${jmhVersion}"
+        annotationProcessor libs.jmh.generator.annprocess
     }
 
     test {
-        systemProperties(
-            'aeron.dir.warn.if.exists': 'false',
-            'aeron.use.windows.high.res.timer': 'true',
-            'aeron.term.buffer.sparse.file': 'true')
     }
 
-    task benchmarks(dependsOn: perfClasses) {
+    tasks.register('benchmarks') {
+        dependsOn perfClasses
         shadowJar {
             archiveClassifier.set("benchmarks")
 
@@ -721,12 +835,17 @@ project(':artio-system-tests') {
     }
 
     signing {
+        if (signingKey != null) {
+            useInMemoryPgpKeys(signingKey, signingPassword)
+        }
         sign publishing.publications.artioSystemTests
     }
 }
 
 project(':artio-ilink-system-tests') {
-    apply plugin: 'com.github.johnrengelman.shadow'
+    apply plugin: 'com.gradleup.shadow'
+    apply plugin: 'maven-publish'
+    apply plugin: 'signing'
 
     dependencies {
         testImplementation project(path: ':artio-core', configuration: 'tests')
@@ -741,13 +860,10 @@ project(':artio-ilink-system-tests') {
     compileJava.enabled = iLink3Enabled
     compileTestJava.enabled = iLink3Enabled
     javadoc.enabled = iLink3Enabled
+    shadowJar.enabled = iLink3Enabled
 
     test {
         onlyIf { iLink3Enabled }
-        systemProperties(
-            'aeron.dir.warn.if.exists': 'false',
-            'aeron.use.windows.high.res.timer': 'true',
-            'aeron.term.buffer.sparse.file': 'true')
     }
 
     publishing {
@@ -760,12 +876,17 @@ project(':artio-ilink-system-tests') {
     }
 
     signing {
+        if (signingKey != null) {
+            useInMemoryPgpKeys(signingKey, signingPassword)
+        }
         sign publishing.publications.artioILink3SystemTests
     }
 }
 
 project(':artio-binary-entrypoint-system-tests') {
-    apply plugin: 'com.github.johnrengelman.shadow'
+    apply plugin: 'com.gradleup.shadow'
+    apply plugin: 'maven-publish'
+    apply plugin: 'signing'
 
     dependencies {
         testImplementation project(path: ':artio-core', configuration: 'tests')
@@ -780,13 +901,6 @@ project(':artio-binary-entrypoint-system-tests') {
         implementation project(':artio-binary-entrypoint-impl')
     }
 
-    test {
-        systemProperties(
-                'aeron.dir.warn.if.exists': 'false',
-                'aeron.use.windows.high.res.timer': 'true',
-                'aeron.term.buffer.sparse.file': 'true')
-    }
-
     publishing {
         publications {
             artioBinaryEntrypointSystemTests(MavenPublication) {
@@ -797,16 +911,23 @@ project(':artio-binary-entrypoint-system-tests') {
     }
 
     signing {
+        if (signingKey != null) {
+            useInMemoryPgpKeys(signingKey, signingPassword)
+        }
         sign publishing.publications.artioBinaryEntrypointSystemTests
     }
 }
 
 project(':artio-samples') {
-    apply plugin: 'com.github.johnrengelman.shadow'
+    apply plugin: 'com.gradleup.shadow'
+    apply plugin: 'maven-publish'
+    apply plugin: 'signing'
 
     dependencies {
         api project(':artio-core')
         api project(':artio-session-codecs')
+        api project(':artio-binary-entrypoint-codecs')
+        api project(':artio-binary-entrypoint-impl')
     }
 
     shadowJar {
@@ -827,6 +948,9 @@ project(':artio-samples') {
     }
 
     signing {
+        if (signingKey != null) {
+            useInMemoryPgpKeys(signingKey, signingPassword)
+        }
         sign publishing.publications.artioSamples
     }
 }
@@ -835,32 +959,50 @@ subprojects {
     publishing {
         repositories {
             maven {
-                name = 'oss'
-                url = !isReleaseVersion ? snapshotUrl : repoUrl
+                url = !isReleaseVersion ? sonatypeCentralPortalSnapshotsRepoUrl : sonatypeCentralPortalReleasesRepoUrl
                 credentials {
-                    username = repoUsername
-                    password = repoPassword
-                }
-            }
-            maven {
-                name = 'private'
-                url = 's3://artio-repository/releases'
-                credentials(AwsCredentials) {
-                    accessKey = awsAccessKeyId
-                    secretKey = awsSecretAccessKey
+                    username = sonatypeCentralPortalUsername
+                    password = sonatypeCentralPortalPassword
                 }
             }
         }
     }
 }
 
-tasks.withType(PublishToMavenRepository) {
-    onlyIf {
-        isReleaseVersion
+tasks.register('copyTestLogs', Copy) {
+    from '.'
+    include '**/build/test-output/**'
+    include '**/*.log'
+    include '**/*.tlog'
+    include '**/build/reports/tests/**'
+    include '**/build/test-results/*/TEST*.xml'
+    include 'LICENSE'
+    exclude 'build'
+    into 'build/test_logs'
+
+    includeEmptyDirs = false
+}
+
+def isNonStable = { String version ->
+    def stableKeyword = ['RELEASE', 'FINAL', 'GA'].any { it -> version.toUpperCase().contains(it) }
+    def regex = /^[0-9,.v-]+(-r)?$/
+    return !stableKeyword && !(version ==~ regex)
+}
+
+tasks.named('dependencyUpdates').configure {
+    // Reject all non stable versions
+    rejectVersionIf {
+        isNonStable(it.candidate.version)
     }
 }
 
+tasks.register('uploadArtifactsToCentralPortal', uk.co.real_logic.artio.build.SonatypeCentralPortalUploadRepositoryTask) {
+    portalUsername.set(sonatypeCentralPortalUsername)
+    portalPassword.set(sonatypeCentralPortalPassword)
+    groupId.set(artioGroup)
+    snapshotRelease.set(!isReleaseVersion)
+}
+
 wrapper {
-    gradleVersion = '6.8.3'
     distributionType = 'ALL'
 }

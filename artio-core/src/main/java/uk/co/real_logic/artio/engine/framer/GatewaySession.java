@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,8 +24,9 @@ abstract class GatewaySession implements AbstractConnectedSessionInfo
 
     protected final ConnectionType connectionType;
     protected final long authenticationTimeoutInMs;
-    private final ReceiverEndPoint receiverEndPoint;
 
+    // null iff session is offline.
+    protected ReceiverEndPoint receiverEndPoint;
     protected long sessionId;
     protected long connectionId;
     protected String address;
@@ -33,6 +34,8 @@ abstract class GatewaySession implements AbstractConnectedSessionInfo
 
     protected boolean hasStartedAuthentication = false;
     protected int libraryId;
+    // Only set when owned by gateway, in case that library reconnects.
+    protected int lastLibraryId;
 
     GatewaySession(
         final long connectionId,
@@ -50,11 +53,13 @@ abstract class GatewaySession implements AbstractConnectedSessionInfo
         this.receiverEndPoint = receiverEndPoint;
     }
 
+    @Override
     public long connectionId()
     {
         return connectionId;
     }
 
+    @Override
     public abstract String address();
 
     public long sessionId()
@@ -82,7 +87,7 @@ abstract class GatewaySession implements AbstractConnectedSessionInfo
 
     boolean hasDisconnected()
     {
-        return receiverEndPoint.hasDisconnected();
+        return receiverEndPoint == null || receiverEndPoint.hasDisconnected();
     }
 
     int checkNoLogonDisconnect(final long timeInMs)
@@ -92,7 +97,7 @@ abstract class GatewaySession implements AbstractConnectedSessionInfo
             return 0;
         }
 
-        if (disconnectTimeInMs <= timeInMs && !receiverEndPoint.hasDisconnected())
+        if (disconnectTimeInMs <= timeInMs && !hasDisconnected())
         {
             if (hasStartedAuthentication)
             {
@@ -106,6 +111,11 @@ abstract class GatewaySession implements AbstractConnectedSessionInfo
         }
 
         return 0;
+    }
+
+    public boolean isOffline()
+    {
+        return receiverEndPoint == null;
     }
 
     ConnectionType connectionType()
@@ -136,4 +146,8 @@ abstract class GatewaySession implements AbstractConnectedSessionInfo
     abstract void onDisconnectReleasedByOwner();
 
     abstract void close();
+
+    public abstract boolean configureThrottle(int throttleWindowInMs, int throttleLimitOfMessages);
+
+    public abstract long startEndOfDay();
 }

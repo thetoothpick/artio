@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,8 +17,9 @@ package uk.co.real_logic.artio.session;
 
 import org.agrona.concurrent.AtomicBuffer;
 import org.agrona.concurrent.UnsafeBuffer;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 import uk.co.real_logic.artio.decoder.HeaderDecoder;
+import uk.co.real_logic.artio.decoder.SessionHeaderDecoder;
 
 import java.util.Set;
 
@@ -26,9 +27,10 @@ import static java.util.stream.Collectors.toSet;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.greaterThan;
 import static org.hamcrest.Matchers.hasSize;
-import static org.junit.Assert.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
+import static uk.co.real_logic.artio.dictionary.SessionConstants.*;
 import static uk.co.real_logic.artio.session.SenderAndTargetSessionIdStrategyTest.IDS;
 import static uk.co.real_logic.artio.session.SessionIdStrategy.INSUFFICIENT_SPACE;
 
@@ -117,5 +119,45 @@ public class SenderTargetAndSubSessionIdStrategyTest
         final int length = strategy.save(key, buffer, 1);
 
         assertEquals(INSUFFICIENT_SPACE, length);
+    }
+
+    @Test
+    public void testValidation()
+    {
+        final CompositeKey localKey = strategy.onInitiateLogon("FOO", "FOO_SUB", null, "BAR", null, null);
+        final SessionHeaderDecoder receivedHeader = mock(SessionHeaderDecoder.class);
+
+        final Object[][] testVector = new Object[][]{
+            { "BAR", "FOO", "FOO_SUB", 0 },
+            { "X", "FOO", "FOO_SUB", SENDER_COMP_ID },
+            { "BAR", "X", "FOO_SUB", TARGET_COMP_ID },
+            { "BAR", "FOO", "X", TARGET_SUB_ID },
+            { "BAR", "FOO", null, TARGET_SUB_ID },
+        };
+
+        for (final Object[] row : testVector)
+        {
+            final String senderCompId = (String)row[0];
+            final String targetCompId = (String)row[1];
+            final String targetSubId = (String)row[2];
+            final Integer expected = (Integer)row[3];
+
+            when(receivedHeader.senderCompID()).thenReturn(senderCompId.toCharArray());
+            when(receivedHeader.senderCompIDLength()).thenReturn(senderCompId.length());
+            when(receivedHeader.targetCompID()).thenReturn(targetCompId.toCharArray());
+            when(receivedHeader.targetCompIDLength()).thenReturn(targetCompId.length());
+            if (targetSubId == null)
+            {
+                when(receivedHeader.hasTargetSubID()).thenReturn(false);
+            }
+            else
+            {
+                when(receivedHeader.hasTargetSubID()).thenReturn(true);
+                when(receivedHeader.targetSubID()).thenReturn(targetSubId.toCharArray());
+                when(receivedHeader.targetSubIDLength()).thenReturn(targetSubId.length());
+            }
+
+            assertEquals(expected.intValue(), strategy.validateCompIds(localKey, receivedHeader));
+        }
     }
 }

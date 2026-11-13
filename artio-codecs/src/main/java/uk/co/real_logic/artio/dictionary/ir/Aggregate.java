@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,12 +21,14 @@ import java.util.function.Predicate;
 import java.util.stream.Stream;
 
 /**
- * A Aggregate is either a group, a message or a component.
+ * An Aggregate is either a group, a message or a component.
  */
 public abstract class Aggregate
 {
     private final String name;
     private final List<Entry> entries;
+
+    private boolean isInParent;
 
     protected Aggregate(final String name)
     {
@@ -64,7 +66,8 @@ public abstract class Aggregate
                 (entry) -> entry.match(
                     (ele, field) -> Stream.of(ele),
                     (ele, group) -> Stream.empty(),
-                    (ele, component) -> component.allFieldsIncludingComponents()
+                    (ele, component) -> component.allFieldsIncludingComponents(),
+                    (ele, anyFields) -> Stream.empty()
                 ));
     }
 
@@ -78,7 +81,8 @@ public abstract class Aggregate
                 (entry) -> entry.match(
                     (ele, field) -> Stream.empty(),
                     (ele, group) -> Stream.of(ele),
-                    (ele, component) -> component.allGroupsIncludingComponents()
+                    (ele, component) -> component.allGroupsIncludingComponents(),
+                    (ele, anyFields) -> Stream.empty()
                 ));
     }
 
@@ -89,7 +93,8 @@ public abstract class Aggregate
                 (entry) -> entry.match(
                     (e, field) -> Stream.empty(),
                     (e, group) -> Stream.empty(),
-                    (e, component) -> Stream.concat(Stream.of(e), component.allComponents())
+                    (e, component) -> Stream.concat(Stream.of(e), component.allComponents()),
+                    (e, anyFields) -> Stream.empty()
                 ));
     }
 
@@ -105,11 +110,13 @@ public abstract class Aggregate
         return this;
     }
 
+    @Override
     public String toString()
     {
         return getClass().getSimpleName() + "{" +
             "name='" + name + '\'' +
             ", entries=" + entries +
+            ", isInParent=" + isInParent +
             '}';
     }
 
@@ -125,8 +132,33 @@ public abstract class Aggregate
                 (entry) -> entry.match(
                     (ele, field) -> false,
                     (ele, group) -> true,
-                    (ele, component) -> component.containsGroup()
+                    (ele, component) -> component.containsGroup(),
+                    (ele, anyFields) -> false
                 ));
     }
 
+    public boolean isInParent()
+    {
+        return isInParent;
+    }
+
+    public void isInParent(final boolean isInParent)
+    {
+        this.isInParent = isInParent;
+    }
+
+    public Stream<Entry> componentEntries()
+    {
+        return entriesWith((element) -> element instanceof Component);
+    }
+
+    public boolean hasComponent(final String componentName)
+    {
+        return componentEntries().anyMatch(e -> componentName.equals(e.name()));
+    }
+
+    public Stream<Entry> anyFieldsEntries()
+    {
+        return entries().stream().filter(Entry::isAnyFields);
+    }
 }

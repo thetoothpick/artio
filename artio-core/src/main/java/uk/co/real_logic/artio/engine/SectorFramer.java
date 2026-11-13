@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -48,6 +48,7 @@ public class SectorFramer
         final int nextSectorStart = nextSectorStart(filePosition);
         checksumOffset = nextSectorStart - CHECKSUM_SIZE;
         final int proposedRecordEnd = filePosition + length;
+
         // If the data would span the end of a sector then
         if (proposedRecordEnd > checksumOffset)
         {

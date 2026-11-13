@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,10 +15,13 @@
  */
 package uk.co.real_logic.artio.system_tests;
 
+import io.aeron.Aeron;
 import org.agrona.IoUtil;
+import org.agrona.collections.IntHashSet;
 import org.agrona.concurrent.EpochNanoClock;
 import org.agrona.concurrent.IdleStrategy;
 import org.agrona.concurrent.YieldingIdleStrategy;
+import org.agrona.concurrent.status.CountersReader;
 import org.hamcrest.Matcher;
 import uk.co.real_logic.artio.CommonConfiguration;
 import uk.co.real_logic.artio.Constants;
@@ -28,18 +31,21 @@ import uk.co.real_logic.artio.builder.AbstractTestRequestEncoder;
 import uk.co.real_logic.artio.dictionary.FixDictionary;
 import uk.co.real_logic.artio.engine.EngineConfiguration;
 import uk.co.real_logic.artio.engine.FixEngine;
+import uk.co.real_logic.artio.engine.FixEngineInternals;
 import uk.co.real_logic.artio.engine.LowResourceEngineScheduler;
+import uk.co.real_logic.artio.engine.framer.EngineStreamInfo;
 import uk.co.real_logic.artio.engine.framer.LibraryInfo;
-import uk.co.real_logic.artio.engine.logger.ReplayIndexExtractor;
-import uk.co.real_logic.artio.library.FixLibrary;
-import uk.co.real_logic.artio.library.LibraryConfiguration;
-import uk.co.real_logic.artio.library.SessionConfiguration;
+import uk.co.real_logic.artio.engine.logger.FixArchiveScanner;
+import uk.co.real_logic.artio.engine.logger.FixMessageConsumer;
+import uk.co.real_logic.artio.fixp.FixPMessageConsumer;
+import uk.co.real_logic.artio.library.*;
 import uk.co.real_logic.artio.messages.SessionReplyStatus;
 import uk.co.real_logic.artio.session.Session;
 import uk.co.real_logic.artio.validation.AuthenticationStrategy;
 import uk.co.real_logic.artio.validation.MessageValidationStrategy;
 
 import java.io.File;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
@@ -48,13 +54,18 @@ import java.util.concurrent.atomic.AtomicLong;
 import static io.aeron.CommonContext.IPC_CHANNEL;
 import static java.util.Collections.singletonList;
 import static org.hamcrest.MatcherAssert.assertThat;
-import static org.hamcrest.Matchers.*;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotNull;
+import static org.hamcrest.Matchers.containsInAnyOrder;
+import static org.hamcrest.Matchers.greaterThan;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static uk.co.real_logic.artio.CommonConfiguration.*;
+import static uk.co.real_logic.artio.GatewayProcess.NO_CONNECTION_ID;
 import static uk.co.real_logic.artio.Reply.State.COMPLETED;
+import static uk.co.real_logic.artio.TestFixtures.aeronArchiveContext;
+import static uk.co.real_logic.artio.TestFixtures.configureAeronArchive;
 import static uk.co.real_logic.artio.Timing.DEFAULT_TIMEOUT_IN_MS;
 import static uk.co.real_logic.artio.Timing.assertEventuallyTrue;
+import static uk.co.real_logic.artio.engine.EngineConfiguration.DEFAULT_ARCHIVE_SCANNER_STREAM;
 import static uk.co.real_logic.artio.engine.FixEngine.ENGINE_LIBRARY_ID;
 import static uk.co.real_logic.artio.library.FixLibrary.NO_MESSAGE_REPLAY;
 import static uk.co.real_logic.artio.messages.SessionState.ACTIVE;
@@ -81,6 +92,8 @@ public final class SystemTestUtil
 
     public static final long TEST_REPLY_TIMEOUT_IN_MS = RUNNING_ON_WINDOWS ? 3_000 : 1_000;
 
+    private static final int TEST_COMPACTION_SIZE = 1024 * 1024;
+
     static
     {
         final File parentDirectory = new File(optimalTmpDirName());
@@ -104,35 +117,33 @@ public final class SystemTestUtil
         final FakeOtfAcceptor receivingHandler)
     {
         final String testReqID = testReqId();
-        final long position = sendTestRequest(sendingSession, testReqID);
+        final long position = sendTestRequest(testSystem, sendingSession, testReqID);
 
         assertReceivedTestRequest(testSystem, receivingHandler, testReqID);
 
         return position;
     }
 
-    public static long sendTestRequest(final Session session, final String testReqID)
+    public static long sendTestRequest(final TestSystem testSystem, final Session session, final String testReqID)
     {
-        return sendTestRequest(session, testReqID, new FixDictionaryImpl());
+        return sendTestRequest(testSystem, session, testReqID, new FixDictionaryImpl());
     }
 
     static long sendTestRequest(
-        final Session session, final String testReqID, final FixDictionary fixDictionary)
+        final TestSystem testSystem, final Session session, final String testReqID, final FixDictionary fixDictionary)
     {
         assertEventuallyTrue("Session not connected", session::isConnected);
 
-        return alwaysSendTestRequest(session, testReqID, fixDictionary);
+        return alwaysSendTestRequest(testSystem, session, testReqID, fixDictionary);
     }
 
     static long alwaysSendTestRequest(
-        final Session session, final String testReqID, final FixDictionary fixDictionary)
+        final TestSystem testSystem, final Session session, final String testReqID, final FixDictionary fixDictionary)
     {
         final AbstractTestRequestEncoder testRequest = fixDictionary.makeTestRequestEncoder();
         testRequest.testReqID(testReqID);
 
-        final long position = session.trySend(testRequest);
-        assertThat(position, greaterThan(0L));
-        return position;
+        return testSystem.awaitSend(() -> session.trySend(testRequest));
     }
 
     static void assertReceivedTestRequest(
@@ -163,12 +174,29 @@ public final class SystemTestUtil
         final String senderCompId,
         final String targetCompId)
     {
+        return initiate(library, port, senderCompId, targetCompId, TEST_REPLY_TIMEOUT_IN_MS);
+    }
+
+    static Reply<Session> initiate(
+        final FixLibrary library, final int port, final String senderCompId, final String targetCompId,
+        final long timeoutInMs)
+    {
+        return initiate(library, port, senderCompId, targetCompId, timeoutInMs, true, null);
+    }
+
+    static Reply<Session> initiate(
+        final FixLibrary library, final int port, final String senderCompId, final String targetCompId,
+        final long timeoutInMs, final boolean disconnectOnFirstMessageNotLogon,
+        final Class<? extends FixDictionary> fixDictionary)
+    {
         final SessionConfiguration config = SessionConfiguration.builder()
             .address("localhost", port)
             .credentials(USERNAME, PASSWORD)
             .senderCompId(senderCompId)
             .targetCompId(targetCompId)
-            .timeoutInMs(TEST_REPLY_TIMEOUT_IN_MS)
+            .timeoutInMs(timeoutInMs)
+            .disconnectOnFirstMessageNotLogon(disconnectOnFirstMessageNotLogon)
+            .fixDictionary(fixDictionary)
             .build();
 
         return library.initiate(config);
@@ -235,6 +263,7 @@ public final class SystemTestUtil
             .replyTimeoutInMs(TEST_REPLY_TIMEOUT_IN_MS);
         configuration.epochNanoClock(nanoClock);
         configuration.agentNamePrefix("init-");
+        configureAeronArchive(configuration.aeronArchiveContext());
 
         return configuration;
     }
@@ -265,6 +294,7 @@ public final class SystemTestUtil
         final EpochNanoClock nanoClock)
     {
         final EngineConfiguration configuration = new EngineConfiguration();
+        configureAeronArchive(configuration.aeronArchiveContext());
         final MessageValidationStrategy validationStrategy = setupCommonConfig(
             acceptorId, initiatorId, nanoClock, configuration);
         final AuthenticationStrategy authenticationStrategy = AuthenticationStrategy.of(validationStrategy);
@@ -273,6 +303,7 @@ public final class SystemTestUtil
         return configuration
             .bindTo("localhost", port)
             .libraryAeronChannel(IPC_CHANNEL)
+            .replayIndexFileRecordCapacity(33554432)
             .monitoringFile(acceptorMonitoringFile("engineCounters"))
             .logFileDir(acceptorLogs)
             .scheduler(new LowResourceEngineScheduler())
@@ -307,7 +338,8 @@ public final class SystemTestUtil
         final CommonConfiguration configuration)
     {
         final MessageValidationStrategy validationStrategy = MessageValidationStrategy.targetCompId(acceptorId)
-            .and(MessageValidationStrategy.senderCompId(Arrays.asList(initiatorId, INITIATOR_ID2, INITIATOR_ID3)));
+            .and(MessageValidationStrategy.senderCompId(Arrays.asList(initiatorId,
+            INITIATOR_ID2, INITIATOR_ID3, "initiator4", "initiator5")));
 
         configuration
             .messageValidationStrategy(validationStrategy)
@@ -405,8 +437,8 @@ public final class SystemTestUtil
 
     static void assertConnected(final Session session)
     {
-        assertNotNull("Session is null", session);
-        assertEquals("Session has failed to connect", ACTIVE, session.state());
+        assertNotNull(session, "Session is null");
+        assertEquals(ACTIVE, session.state(), "Session has failed to connect");
     }
 
     static List<LibraryInfo> libraries(final FixEngine engine)
@@ -428,9 +460,14 @@ public final class SystemTestUtil
 
     public static void awaitLibraryDisconnect(final FixEngine engine, final TestSystem testSystem)
     {
+        awaitLibraryCount(engine, testSystem, 1);
+    }
+
+    public static void awaitLibraryCount(final FixEngine engine, final TestSystem testSystem, final int count)
+    {
         assertEventuallyTrue(
             () -> "libraries haven't disconnected yet",
-            () -> libraries(engine, testSystem).size() == 1,
+            () -> libraries(engine, testSystem).size() == count,
             AWAIT_TIMEOUT_IN_MS,
             () ->
             {
@@ -499,6 +536,20 @@ public final class SystemTestUtil
             });
     }
 
+    static void assertReceivedResendRequest(
+        final TestSystem testSystem, final FakeOtfAcceptor acceptor, final int msgSeqNo)
+    {
+        assertEventuallyTrue("Failed to receive resend request",
+            () ->
+            {
+                testSystem.poll();
+
+                return acceptor
+                    .receivedMessage("2")
+                    .anyMatch((message) -> msgSeqNo == Integer.parseInt(message.get(Constants.MSG_SEQ_NUM)));
+            });
+    }
+
     static LibraryInfo gatewayLibraryInfo(final FixEngine engine)
     {
         return libraries(engine)
@@ -529,8 +580,15 @@ public final class SystemTestUtil
             () ->
             {
                 testSystem.poll();
-                return session.state() == DISCONNECTED;
+                return session.state() == DISCONNECTED && session.connectionId() == NO_CONNECTION_ID;
             });
+    }
+
+    public static long disconnectSession(final Session session)
+    {
+        final long position = session.requestDisconnect();
+        assertThat(position, greaterThan(0L));
+        return position;
     }
 
     public static long logoutSession(final Session session)
@@ -540,30 +598,176 @@ public final class SystemTestUtil
         return position;
     }
 
-    public static void validateReplayIndex(final FixEngine engine, final Session session)
+    public static long logoutSessionWithCustomTextAndDisconnect(final Session session, final String text)
     {
-        if (session == null || engine == null)
-        {
-            return;
-        }
+        final long position = session.logoutAndDisconnect(text == null ? null : text.getBytes());
+        assertThat(position, greaterThan(0L));
+        return position;
+    }
 
-        final EngineConfiguration config = engine.configuration();
-        final long sessionId = session.id();
-        if (config.logInboundMessages())
+    public static long logoutSession(final TestSystem testSystem, final Session session)
+    {
+        return testSystem.awaitSend(session::startLogout);
+    }
+
+    public static void getMessagesFromArchive(
+        final EngineConfiguration configuration,
+        final IntHashSet queryStreamIds,
+        final FixMessageConsumer fixMessageConsumer,
+        final FixPMessageConsumer fixPConsumer,
+        final boolean follow)
+    {
+        final FixArchiveScanner.Configuration context = new FixArchiveScanner.Configuration()
+            .aeronDirectoryName(configuration.aeronContext().aeronDirectoryName())
+            .archiveContext(aeronArchiveContext())
+            .idleStrategy(CommonConfiguration.backoffIdleStrategy())
+            .compactionSize(TEST_COMPACTION_SIZE);
+
+        try (FixArchiveScanner scanner = new FixArchiveScanner(context))
         {
-            validateReplayIndex(config, sessionId, true);
-        }
-        if (config.logOutboundMessages())
-        {
-            validateReplayIndex(config, sessionId, false);
+            scanner.scan(
+                configuration.libraryAeronChannel(),
+                queryStreamIds,
+                fixMessageConsumer,
+                fixPConsumer,
+                follow,
+                DEFAULT_ARCHIVE_SCANNER_STREAM);
         }
     }
 
-    private static void validateReplayIndex(
-        final EngineConfiguration config, final long sessionId, final boolean inbound)
+    static void awaitIndexerCaughtUp(
+        final TestSystem testSystem,
+        final String aeronDirectoryName,
+        final FixEngine engine,
+        final FixLibrary library)
     {
-        final ReplayIndexExtractor.ReplayIndexValidator validator = new ReplayIndexExtractor.ReplayIndexValidator();
-        ReplayIndexExtractor.extract(config, sessionId, inbound, validator);
-        assertThat(validator.errors(), hasSize(0));
+        final EngineStreamInfo engineStreamInfo =
+            testSystem.awaitCompletedReply(FixEngineInternals.engineStreamInfo(engine)).resultIfPresent();
+
+        final LibraryStreamInfo libraryStreamInfo = FixLibraryInternals.libraryStreamInfo(library);
+
+        final Aeron.Context aeronCtx = new Aeron.Context().aeronDirectoryName(aeronDirectoryName);
+        try (Aeron aeron = Aeron.connect(aeronCtx))
+        {
+            final CountersReader countersReader = aeron.countersReader();
+
+            final List<SubPosMatcher> subPosMatchers = new ArrayList<>();
+            subPosMatchers.add(new SubPosMatcher(
+                countersReader,
+                engineStreamInfo.inboundIndexSubscriptionRegistrationId(),
+                engineStreamInfo.inboundPublicationSessionId(),
+                engineStreamInfo.inboundPublicationPosition()));
+            subPosMatchers.add(new SubPosMatcher(
+                countersReader,
+                engineStreamInfo.inboundIndexSubscriptionRegistrationId(),
+                libraryStreamInfo.inboundPublicationSessionId(),
+                libraryStreamInfo.inboundPublicationPosition()));
+            subPosMatchers.add(new SubPosMatcher(
+                countersReader,
+                engineStreamInfo.outboundIndexSubscriptionRegistrationId(),
+                engineStreamInfo.outboundPublicationSessionId(),
+                engineStreamInfo.outboundPublicationPosition()));
+            subPosMatchers.add(new SubPosMatcher(
+                countersReader,
+                engineStreamInfo.outboundIndexSubscriptionRegistrationId(),
+                libraryStreamInfo.outboundPublicationSessionId(),
+                libraryStreamInfo.outboundPublicationPosition()));
+
+            countersReader.forEach((counterId, typeId, keyBuffer, label) ->
+            {
+                for (final SubPosMatcher subPosMatcher : subPosMatchers)
+                {
+                    subPosMatcher.tryMatch(counterId, typeId, keyBuffer);
+                }
+            });
+
+            for (final SubPosMatcher subPosMatcher : subPosMatchers)
+            {
+                if (!subPosMatcher.hasCounterId())
+                {
+                    throw new IllegalStateException("did not match all counters: " + subPosMatchers);
+                }
+            }
+
+            assertEventuallyTrue(
+                () ->
+                {
+                    final StringBuilder builder = new StringBuilder();
+                    builder.append("expected sub-pos counters:\n");
+                    for (final SubPosMatcher subPosMatcher : subPosMatchers)
+                    {
+                        builder.append(subPosMatcher).append('\n');
+                    }
+                    builder.append("\nbut counters were:\n");
+                    countersReader.forEach((value, counterId, label) ->
+                        builder.append(String.format("%d: %d - %s%n", counterId, value, label)));
+                    return builder.toString();
+                },
+                () ->
+                {
+                    testSystem.poll();
+                    for (final SubPosMatcher subPosMatcher : subPosMatchers)
+                    {
+                        if (!subPosMatcher.isCaughtUp())
+                        {
+                            return false;
+                        }
+                    }
+                    return true;
+                },
+                DEFAULT_TIMEOUT_IN_MS,
+                () -> {});
+        }
+    }
+
+    static void assertEngineSubscriptionCaughtUpToLibraryPublication(
+        final TestSystem testSystem,
+        final String aeronDirectoryName,
+        final FixEngine engine,
+        final FixLibrary library)
+    {
+        final EngineStreamInfo engineStreamInfo =
+            testSystem.awaitCompletedReply(FixEngineInternals.engineStreamInfo(engine)).resultIfPresent();
+
+        final LibraryStreamInfo libraryStreamInfo = FixLibraryInternals.libraryStreamInfo(library);
+
+        final Aeron.Context aeronCtx = new Aeron.Context().aeronDirectoryName(aeronDirectoryName);
+        try (Aeron aeron = Aeron.connect(aeronCtx))
+        {
+            final CountersReader countersReader = aeron.countersReader();
+
+            final SubPosMatcher subPosMatcher = new SubPosMatcher(
+                countersReader,
+                engineStreamInfo.librarySubscriptionRegistrationId(),
+                libraryStreamInfo.outboundPublicationSessionId(),
+                libraryStreamInfo.outboundPublicationPosition());
+
+            countersReader.forEach((counterId, typeId, keyBuffer, label) ->
+                subPosMatcher.tryMatch(counterId, typeId, keyBuffer));
+
+            if (!subPosMatcher.hasCounterId())
+            {
+                throw new IllegalStateException("did not match counter: " + subPosMatcher);
+            }
+
+            assertEventuallyTrue(
+                () ->
+                {
+                    final StringBuilder builder = new StringBuilder();
+                    builder.append("expected sub-pos counters:\n");
+                    builder.append(subPosMatcher).append('\n');
+                    builder.append("\nbut counters were:\n");
+                    countersReader.forEach((value, counterId, label) ->
+                        builder.append(String.format("%d: %d - %s%n", counterId, value, label)));
+                    return builder.toString();
+                },
+                () ->
+                {
+                    testSystem.poll();
+                    return subPosMatcher.isCaughtUp();
+                },
+                DEFAULT_TIMEOUT_IN_MS,
+                () -> {});
+        }
     }
 }

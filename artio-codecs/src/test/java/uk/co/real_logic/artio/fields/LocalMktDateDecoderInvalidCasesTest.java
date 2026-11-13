@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,41 +15,37 @@
  */
 package uk.co.real_logic.artio.fields;
 
-import org.junit.Test;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
-import org.junit.runners.Parameterized.Parameters;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 
-import java.util.Arrays;
+import java.util.stream.Stream;
 
 import static java.nio.charset.StandardCharsets.US_ASCII;
+import static org.junit.jupiter.params.provider.Arguments.of;
 
-@RunWith(Parameterized.class)
 public class LocalMktDateDecoderInvalidCasesTest
 {
-    private final String timestamp;
-
-    @Parameters(name = "{0}")
-    public static Iterable<Object> data()
+    public static Stream<Arguments> data()
     {
-        return Arrays.asList(
-            new String[] {"-0010101"},
-            new String[] {"00000001"},
-            new String[] {"00000100"},
-            new String[] {"00001301"},
-            new String[] {"00000132"}
+        return Stream.of(
+            of("-0010101"),
+            of("00000001"),
+            of("00000100"),
+            of("00001301"),
+            of("00000132")
         );
     }
 
-    public LocalMktDateDecoderInvalidCasesTest(final String timestamp)
+    @ParameterizedTest
+    @MethodSource(value = "data")
+    public void cannotParseTimestamp(final String timestamp)
     {
-        this.timestamp = timestamp;
-    }
-
-    @Test(expected = IllegalArgumentException.class)
-    public void cannotParseTimestamp()
-    {
-        final LocalMktDateDecoder decoder = new LocalMktDateDecoder();
-        final int epochDay = decoder.decode(timestamp.getBytes(US_ASCII));
+        Assertions.assertThrows(IllegalArgumentException.class, () ->
+        {
+            final LocalMktDateDecoder decoder = new LocalMktDateDecoder();
+            decoder.decode(timestamp.getBytes(US_ASCII));
+        });
     }
 }

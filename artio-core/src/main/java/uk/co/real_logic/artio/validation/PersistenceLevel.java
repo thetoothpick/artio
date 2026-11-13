@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,15 +30,15 @@ public enum PersistenceLevel
     /**
      * Automatically resets sequence numbers upon connect
      *
-     *  Deprecated and will be removed in future. Renamed to {@link #TRANSIENT_SEQUENCE_NUMBERS}.
+     * Deprecated and will be removed in future. Renamed to {@link #TRANSIENT_SEQUENCE_NUMBERS}.
      */
     @Deprecated
     UNINDEXED,
 
     /**
-     *  Persists sequence numbers over reconnects.
+     * Persists sequence numbers over reconnects.
      *
-     *  Deprecated and will be removed in future. Renamed to {@link #PERSISTENT_SEQUENCE_NUMBERS}.
+     * Deprecated and will be removed in future. Renamed to {@link #PERSISTENT_SEQUENCE_NUMBERS}.
      */
     @Deprecated
     INDEXED

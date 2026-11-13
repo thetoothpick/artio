@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 package uk.co.real_logic.artio.engine.logger;
 
 import org.agrona.BitUtil;
+import org.agrona.IoUtil;
 import org.agrona.collections.LongHashSet;
 import org.agrona.concurrent.AtomicBuffer;
 import org.agrona.concurrent.UnsafeBuffer;
@@ -29,10 +30,13 @@ public final class ReplayIndexDescriptor
 {
     private static final int BEGIN_CHANGE_OFFSET = MessageHeaderEncoder.ENCODED_LENGTH;
     private static final int END_CHANGE_OFFSET = BEGIN_CHANGE_OFFSET + BitUtil.SIZE_OF_LONG;
+    private static final int FOR_NEXT_SESSION_VERSION_OFFSET = END_CHANGE_OFFSET + BitUtil.SIZE_OF_LONG;
+    public static final int HEADER_FILE_SIZE = FOR_NEXT_SESSION_VERSION_OFFSET + BitUtil.SIZE_OF_BYTE;
 
-    public static final int INITIAL_RECORD_OFFSET = END_CHANGE_OFFSET + BitUtil.SIZE_OF_LONG;
+    public static final byte FOR_NEXT_SESSION_VERSION = 1;
+    public static final byte NOT_FOR_NEXT_SESSION_VERSION = 0;
 
-    static final int RECORD_LENGTH = 32;
+    public static final int RECORD_LENGTH = 32;
     static
     {
         // Safety check against making the ReplayIndexRecord big without modifying this
@@ -42,15 +46,24 @@ public final class ReplayIndexDescriptor
         }
     }
 
-    static File replayIndexFile(final String logFileDir, final long fixSessionId, final int streamId)
+    public static final int MAX_FILE_SEGMENT_CAPACITY = Integer.MAX_VALUE / RECORD_LENGTH;
+
+    static File replayIndexHeaderFile(final String logFileDir, final long fixSessionId, final int streamId)
     {
-        return new File(String.format(logFileDir + File.separator + "replay-index-%d-%d", fixSessionId, streamId));
+        return new File(logFileDir + File.separator + "replay-index-" + fixSessionId + "-" + streamId + "-header");
+    }
+
+    static File replayIndexSegmentFile(
+        final String logFileDir, final long fixSessionId, final int streamId, final int segmentIndex)
+    {
+        return new File(
+            logFileDir + File.separator + "replay-index-" + fixSessionId + "-" + streamId + "-" + segmentIndex);
     }
 
     static LongHashSet listReplayIndexSessionIds(final File logFileDir, final int streamId)
     {
         final String prefix = "replay-index-";
-        final String suffix = "-" + streamId;
+        final String suffix = "-" + streamId + "-header";
         final LongHashSet sessionIds = new LongHashSet();
         for (final File file : Objects.requireNonNull(logFileDir.listFiles()))
         {
@@ -67,6 +80,18 @@ public final class ReplayIndexDescriptor
             }
         }
         return sessionIds;
+    }
+
+    static void unmapBuffers(final UnsafeBuffer headerBuffer, final UnsafeBuffer[] segmentBuffers)
+    {
+        IoUtil.unmap(headerBuffer.byteBuffer());
+        for (final UnsafeBuffer segmentBuffer : segmentBuffers)
+        {
+            if (segmentBuffer != null)
+            {
+                IoUtil.unmap(segmentBuffer.byteBuffer());
+            }
+        }
     }
 
     public static UnsafeBuffer replayPositionBuffer(final String logFileDir, final int streamId, final int bufferSize)
@@ -105,30 +130,53 @@ public final class ReplayIndexDescriptor
         return buffer.getLong(BEGIN_CHANGE_OFFSET);
     }
 
-    static int recordCapacity(final int indexFileSize)
+    static boolean forNextSessionVersion(final AtomicBuffer buffer)
     {
-        return indexFileSize - INITIAL_RECORD_OFFSET;
+        return buffer.getByte(FOR_NEXT_SESSION_VERSION_OFFSET) == FOR_NEXT_SESSION_VERSION;
     }
 
-    static int offset(final long changePosition, final int capacity)
+    static void forNextSessionVersion(final AtomicBuffer buffer, final boolean value)
     {
-        return INITIAL_RECORD_OFFSET + ((int)changePosition & (capacity - 1));
+        final byte byteValue = value ? FOR_NEXT_SESSION_VERSION : NOT_FOR_NEXT_SESSION_VERSION;
+        buffer.putByte(FOR_NEXT_SESSION_VERSION_OFFSET, byteValue);
     }
 
-    static void checkIndexFileSize(final int indexFileSize)
+    static int offsetInSegment(final long changePosition, final long capacity)
     {
-        final int recordCapacity = recordCapacity(indexFileSize);
+        // changePosition % capacity = changePosition & (capacity - 1)
+        return (int)(changePosition & (capacity - 1));
+    }
+
+    public static int segmentIndex(final long position, final int segmentSizeBitShift, final long indexFileSize)
+    {
+        // position % indexFileSize
+        final long offsetWithinRing = position & (indexFileSize - 1);
+
+        // floor(offsetWithinRing / segmentSize)
+        return (int)(offsetWithinRing >> segmentSizeBitShift);
+    }
+
+    static void checkIndexRecordCapacity(final int recordCapacity)
+    {
         if (!BitUtil.isPowerOfTwo(recordCapacity))
         {
             throw new IllegalStateException(
-                "IndexFileSize must be a positive power of 2 + INITIAL_RECORD_OFFSET: indexFileSize=" + indexFileSize);
+                "IndexFileSize must be a positive power of 2: recordCapacity=" + recordCapacity);
         }
+    }
 
-        if ((recordCapacity % RECORD_LENGTH) != 0)
-        {
-            throw new IllegalStateException(
-                "IndexFileSize must be a multiple of RECORD_LENGTH + INITIAL_RECORD_OFFSET: indexFileSize=" +
-                indexFileSize);
-        }
+    public static long capacityToBytes(final int indexSegmentCapacity)
+    {
+        return (long)indexSegmentCapacity * (long)RECORD_LENGTH;
+    }
+
+    public static int capacityToBytesInt(final int indexSegmentCapacity)
+    {
+        return indexSegmentCapacity * RECORD_LENGTH;
+    }
+
+    public static int segmentCount(final int indexFileCapacity, final int indexSegmentCapacity)
+    {
+        return indexFileCapacity / indexSegmentCapacity;
     }
 }

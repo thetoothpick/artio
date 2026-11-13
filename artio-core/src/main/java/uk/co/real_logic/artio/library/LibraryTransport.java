@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 package uk.co.real_logic.artio.library;
 
 import io.aeron.Aeron;
+import io.aeron.ChannelUriStringBuilder;
 import io.aeron.ExclusivePublication;
 import io.aeron.Subscription;
 import org.agrona.concurrent.EpochNanoClock;
@@ -30,7 +31,7 @@ import static uk.co.real_logic.artio.LogTag.LIBRARY_CONNECT;
 
 class LibraryTransport
 {
-    private static final String OUTBOUND_PUBLICATION = "outboundPublication";
+    private static final String OUTBOUND_PUBLICATION = "library outboundPublication";
 
     private final LibraryConfiguration configuration;
     private final FixCounters fixCounters;
@@ -79,15 +80,18 @@ class LibraryTransport
             inboundPublication.close();
         }
 
-        inboundSubscription = aeron.addSubscription(aeronChannel, inboundLibraryStream);
-        StreamInformation.print(
-            "library " + configuration.libraryId() + " inboundSubscription", inboundSubscription, configuration);
+        final String name = "library" + configuration.libraryId() + "InboundSubscription";
+        final String channel = new ChannelUriStringBuilder(aeronChannel)
+            .alias(name)
+            .build();
+        inboundSubscription = aeron.addSubscription(channel, inboundLibraryStream);
+        StreamInformation.print(name, inboundSubscription, configuration);
 
         outboundPublication = outboundLibraryStreams.gatewayPublication(
             idleStrategy, outboundDataPublication(aeronChannel));
 
         final ExclusivePublication publication = aeron.addExclusivePublication(aeronChannel, inboundLibraryStream);
-        StreamInformation.print("inboundPublication", publication, printAeronStreamIdentifiers);
+        StreamInformation.print("library inboundPublication", publication, printAeronStreamIdentifiers);
         inboundPublication = new GatewayPublication(
             publication,
             fixCounters.failedInboundPublications(),

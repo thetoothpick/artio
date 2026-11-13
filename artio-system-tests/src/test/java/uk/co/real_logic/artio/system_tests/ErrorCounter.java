@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd., Monotonic Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd., Monotonic Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,19 +19,30 @@ import org.agrona.concurrent.errors.ErrorConsumer;
 
 public class ErrorCounter implements ErrorConsumer
 {
-    private int lastObservationCount;
+    private String containsString;
 
+    private volatile int lastObservationCount;
+
+    @Override
     public void accept(
         final int observationCount,
         final long firstObservationTimestamp,
         final long lastObservationTimestamp,
         final String encodedException)
     {
-        lastObservationCount = observationCount;
+        if (containsString == null || encodedException.contains(containsString))
+        {
+            lastObservationCount = observationCount;
+        }
     }
 
     public int lastObservationCount()
     {
         return lastObservationCount;
+    }
+
+    public void containsString(final String containsString)
+    {
+        this.containsString = containsString;
     }
 }

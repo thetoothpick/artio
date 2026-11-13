@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,21 +16,17 @@
 package uk.co.real_logic.artio.engine.logger;
 
 import io.aeron.Aeron;
-import io.aeron.FragmentAssembler;
-import io.aeron.Image;
-import io.aeron.Subscription;
+import io.aeron.CommonContext;
 import io.aeron.archive.client.AeronArchive;
+import org.agrona.Strings;
 import org.agrona.collections.IntHashSet;
 import org.agrona.concurrent.IdleStrategy;
-import uk.co.real_logic.artio.ilink.ILinkMessageConsumer;
+import uk.co.real_logic.artio.DebugLogger;
+import uk.co.real_logic.artio.engine.EngineConfiguration;
+import uk.co.real_logic.artio.fixp.FixPMessageConsumer;
 
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.List;
-
-import static io.aeron.CommonContext.IPC_CHANNEL;
-import static io.aeron.archive.client.AeronArchive.NULL_POSITION;
-import static uk.co.real_logic.artio.engine.logger.FixMessageLogger.Configuration.DEFAULT_COMPACTION_SIZE;
+import static uk.co.real_logic.artio.LogTag.ARCHIVE_SCAN;
+import static uk.co.real_logic.artio.engine.logger.FixMessageLogger.Configuration.*;
 
 /**
  * Scan the archive for fix messages. Can be combined with predicates to create rich queries.
@@ -41,20 +37,20 @@ import static uk.co.real_logic.artio.engine.logger.FixMessageLogger.Configuratio
  */
 public class FixArchiveScanner implements AutoCloseable
 {
-    private static final int FRAGMENT_LIMIT = 10;
+    public static final int DEFAULT_FRAGMENT_LIMIT = 10000;
 
-    private static final ReversePositionComparator BY_REVERSE_POSITION = new ReversePositionComparator();
-
-    private final Aeron aeron;
-    private final AeronArchive aeronArchive;
-    private final IdleStrategy idleStrategy;
-    private final int compactionSize;
+    static final boolean DEBUG_LOG_ARCHIVE_SCAN = DebugLogger.isEnabled(ARCHIVE_SCAN);
 
     public static class Configuration
     {
+        private int fragmentLimit = DEFAULT_FRAGMENT_LIMIT;
         private String aeronDirectoryName;
         private IdleStrategy idleStrategy;
         private int compactionSize = DEFAULT_COMPACTION_SIZE;
+        public int maximumBufferSize = DEFAULT_MAXIMUM_BUFFER_SIZE;
+        private String logFileDir;
+        private boolean enableIndexScan;
+        private AeronArchive.Context archiveContext;
 
         public Configuration()
         {
@@ -82,8 +78,17 @@ public class FixArchiveScanner implements AutoCloseable
             return idleStrategy;
         }
 
+        /**
+         * See {@link uk.co.real_logic.artio.engine.logger.FixMessageLogger.Configuration#compactionSize(int)}.
+         *
+         * @param compactionSize the compaction size of the buffer in bytes.
+         * @return this
+         * @throws IllegalArgumentException if compaction size is invalid.
+         */
         public Configuration compactionSize(final int compactionSize)
         {
+            validateCompactionSize(compactionSize);
+
             this.compactionSize = compactionSize;
             return this;
         }
@@ -92,16 +97,157 @@ public class FixArchiveScanner implements AutoCloseable
         {
             return compactionSize;
         }
+
+        /**
+         * See {@link uk.co.real_logic.artio.engine.logger.FixMessageLogger.Configuration#maximumBufferSize(int)}.
+         *
+         * @param maximumBufferSize the maximum reorder buffer size in bytes
+         * @return this
+         */
+        public Configuration maximumBufferSize(final int maximumBufferSize)
+        {
+            validateMaximumBufferSize(maximumBufferSize);
+
+            this.maximumBufferSize = maximumBufferSize;
+            return this;
+        }
+
+        public int maximumBufferSize()
+        {
+            return maximumBufferSize;
+        }
+
+        /**
+         * Sets the fragment limit for polling different images when archive scanning.
+         *
+         * @param fragmentLimit the fragment limit
+         * @return this
+         */
+        public Configuration fragmentLimit(final int fragmentLimit)
+        {
+            this.fragmentLimit = fragmentLimit;
+            return this;
+        }
+
+        public int fragmentLimit()
+        {
+            return fragmentLimit;
+        }
+
+        /**
+         * Sets the logFileDir used by your {@link EngineConfiguration}. This configuration option isn't required, it
+         * allows faster FixArchiveScanner operations for predicates where you're searching by time by using the
+         * {@link FixMessagePredicates#to(long)} or {@link FixMessagePredicates#from(long)} predicates.
+         * Setting this configuration option automatically enables index scanning.
+         *
+         * @param logFileDir the logFileDir configured in your {@link EngineConfiguration}.
+         * @return this
+         */
+        public Configuration logFileDir(final String logFileDir)
+        {
+            this.logFileDir = logFileDir;
+            this.enableIndexScan = true;
+            return this;
+        }
+
+        public String logFileDir()
+        {
+            return logFileDir;
+        }
+
+        /**
+         * Enables or disables index scanning. If set to true, a {@link #logFileDir(String)} is required.
+         *
+         * @param enableIndexScan true to enable time based index scanning, false otherwise.
+         * @return this
+         */
+        public Configuration enableIndexScan(final boolean enableIndexScan)
+        {
+            this.enableIndexScan = enableIndexScan;
+            return this;
+        }
+
+        public boolean enableIndexScan()
+        {
+            return enableIndexScan;
+        }
+
+        /**
+         * Sets the context to be used to create the Aeron Archiver that this backs onto.
+         *
+         * NB: this archiver will be given ownership of an Aeron instance, so a custom Aeron instance
+         * shouldn't be set on the archive context.
+         *
+         * @param archiveContext the context to use to create the aeron archiver.
+         * @return this
+         */
+        public Configuration archiveContext(final AeronArchive.Context archiveContext)
+        {
+            this.archiveContext = archiveContext;
+            return this;
+        }
+
+        private void conclude()
+        {
+            if (enableIndexScan && logFileDir == null)
+            {
+                throw new IllegalArgumentException("Please configure a logFileDir if you want to enable index scan");
+            }
+
+            validateMaxAndCompactionSize(maximumBufferSize, compactionSize);
+        }
     }
+
+    private final IdleStrategy idleStrategy;
+    private final FixArchiveScanningAgent agent;
 
     public FixArchiveScanner(final Configuration configuration)
     {
-        this.idleStrategy = configuration.idleStrategy();
-        compactionSize = configuration.compactionSize;
+        configuration.conclude();
 
-        final Aeron.Context aeronContext = new Aeron.Context().aeronDirectoryName(configuration.aeronDirectoryName());
-        aeron = Aeron.connect(aeronContext);
-        aeronArchive = AeronArchive.connect(new AeronArchive.Context().aeron(aeron).ownsAeronClient(true));
+        final Aeron.Context aeronContext = new Aeron.Context()
+            .aeronDirectoryName(configuration.aeronDirectoryName())
+            .clientName("fix-archive-scanner");
+        final Aeron aeron = Aeron.connect(aeronContext);
+
+        AeronArchive.Context archiveContext = configuration.archiveContext;
+        if (archiveContext == null)
+        {
+            archiveContext = new AeronArchive.Context();
+            if (archiveContext.controlRequestChannel() == null)
+            {
+                archiveContext.controlRequestChannel(AeronArchive.Configuration.localControlChannel())
+                    .controlRequestStreamId(AeronArchive.Configuration.localControlStreamId());
+            }
+            if (archiveContext.controlResponseChannel() == null)
+            {
+                archiveContext.controlResponseChannel(CommonContext.IPC_CHANNEL);
+            }
+        }
+
+        if (Strings.isEmpty(archiveContext.clientName()))
+        {
+            archiveContext.clientName("fix-archive-scanner");
+        }
+
+        // Context closes Aeron instance if this fails to connect.
+        final AeronArchive aeronArchive = AeronArchive.connect(archiveContext.aeron(aeron).ownsAeronClient(true));
+
+        String logFileDir = configuration.logFileDir();
+        if (!configuration.enableIndexScan())
+        {
+            logFileDir = null;
+        }
+
+        idleStrategy = configuration.idleStrategy();
+        agent = new FixArchiveScanningAgent(
+            idleStrategy,
+            configuration.compactionSize(),
+            configuration.maximumBufferSize(),
+            configuration.fragmentLimit(),
+            logFileDir,
+            aeron,
+            aeronArchive);
     }
 
     public void scan(
@@ -118,255 +264,40 @@ public class FixArchiveScanner implements AutoCloseable
         final String aeronChannel,
         final int queryStreamId,
         final FixMessageConsumer fixHandler,
-        final ILinkMessageConsumer iLinkHandler,
+        final FixPMessageConsumer fixPHandler,
         final boolean follow,
         final int archiveScannerStreamId)
     {
         final IntHashSet queryStreamIds = new IntHashSet();
         queryStreamIds.add(queryStreamId);
-        scan(aeronChannel, queryStreamIds, fixHandler, iLinkHandler, follow, archiveScannerStreamId);
+        scan(aeronChannel, queryStreamIds, fixHandler, fixPHandler, follow, archiveScannerStreamId);
     }
 
     public void scan(
         final String aeronChannel,
         final IntHashSet queryStreamIds,
         final FixMessageConsumer fixHandler,
-        final ILinkMessageConsumer iLinkHandler,
+        final FixPMessageConsumer fixPHandler,
         final boolean follow,
         final int archiveScannerStreamId)
     {
-        try (Subscription replaySubscription = aeron.addSubscription(IPC_CHANNEL, archiveScannerStreamId))
+        agent.setup(aeronChannel, queryStreamIds, fixHandler, fixPHandler, follow, archiveScannerStreamId);
+
+        while (true)
         {
-            final RecordingPoller[] pollers = queryStreamIds
-                .stream()
-                .map(id -> makePoller(id, replaySubscription, follow, aeronChannel))
-                .toArray(RecordingPoller[]::new);
-
-            final StreamTimestampZipper timestampZipper = new StreamTimestampZipper(
-                fixHandler, iLinkHandler, compactionSize, pollers);
-
-            while (true)
+            if (agent.poll(Integer.MAX_VALUE))
             {
-                final int received = timestampZipper.poll();
-
-                // Don't need to do this check in follow mode as we're just going to keep running and not terminate.
-                if (0 == received && !follow) // lgtm [java/constant-loop-condition]
-                {
-                    if (checkCompletion(pollers))
-                    {
-                        timestampZipper.onClose();
-                        idleStrategy.reset();
-                        return;
-                    }
-                }
-
-                idleStrategy.idle(received);
+                idleStrategy.reset();
+                return;
             }
+
+            idleStrategy.idle();
         }
     }
 
-    private boolean checkCompletion(final RecordingPoller[] pollers)
-    {
-        for (final RecordingPoller poller : pollers)
-        {
-            if (!poller.isComplete())
-            {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    private RecordingPoller makePoller(
-        final int queryStreamId,
-        final Subscription replaySubscription,
-        final boolean follow,
-        final String aeronChannel)
-    {
-        final List<ArchiveLocation> archiveLocations = new ArrayList<>();
-
-        aeronArchive.listRecordingsForUri(
-            0,
-            Integer.MAX_VALUE,
-            aeronChannel,
-            queryStreamId,
-            (controlSessionId,
-            correlationId,
-            recordingId,
-            startTimestamp,
-            stopTimestamp,
-            startPosition,
-            stopPosition,
-            initialTermId,
-            segmentFileLength,
-            termBufferLength,
-            mtuLength,
-            sessionId,
-            streamId,
-            strippedChannel,
-            originalChannel,
-            sourceIdentity) ->
-            {
-                archiveLocations.add(new ArchiveLocation(recordingId, startPosition, stopPosition));
-            });
-
-        if (!follow)
-        {
-            for (final ArchiveLocation location : archiveLocations)
-            {
-                if (location.stopPosition == NULL_POSITION)
-                {
-                    location.stopPosition = aeronArchive.getRecordingPosition(location.recordingId);
-                }
-            }
-        }
-
-        archiveLocations.sort(BY_REVERSE_POSITION);
-
-        return new RecordingPoller(replaySubscription, queryStreamId, archiveLocations);
-    }
-
-    static class ReversePositionComparator implements Comparator<ArchiveLocation>
-    {
-        public int compare(final ArchiveLocation archiveLocation1, final ArchiveLocation archiveLocation2)
-        {
-            return -1 * Long.compare(getStopPosition(archiveLocation1), getStopPosition(archiveLocation2));
-        }
-
-        long getStopPosition(final ArchiveLocation archiveLocation)
-        {
-            final long stopPosition = archiveLocation.stopPosition;
-            return stopPosition == NULL_POSITION ? Long.MAX_VALUE : stopPosition;
-        }
-    }
-
-    static class ArchiveLocation
-    {
-        final long recordingId;
-        final long startPosition;
-
-        long stopPosition;
-
-        ArchiveLocation(
-            final long recordingId, final long startPosition, final long stopPosition)
-        {
-            this.recordingId = recordingId;
-            this.startPosition = startPosition;
-            this.stopPosition = stopPosition;
-        }
-
-        public long stopPosition()
-        {
-            return stopPosition;
-        }
-
-        public long length()
-        {
-            return startPosition == NULL_POSITION ? NULL_POSITION : stopPosition - startPosition;
-        }
-
-        public String toString()
-        {
-            return "ArchiveReplayInfo{" +
-                "recordingId=" + recordingId +
-                ", startPosition=" + startPosition +
-                ", stopPosition=" + stopPosition +
-                '}';
-        }
-    }
-
-    class RecordingPoller implements StreamTimestampZipper.Poller
-    {
-        private final List<ArchiveLocation> archiveLocations;
-        private final Subscription replaySubscription;
-        private final int originalStreamId;
-
-        long stopPosition;
-        Image image;
-
-        RecordingPoller(
-            final Subscription replaySubscription,
-            final int originalStreamId,
-            final List<ArchiveLocation> archiveLocations)
-        {
-            this.replaySubscription = replaySubscription;
-            this.originalStreamId = originalStreamId;
-            this.archiveLocations = archiveLocations;
-        }
-
-        boolean isComplete()
-        {
-            return stopPosition != NULL_POSITION && image == null && archiveLocations.isEmpty();
-        }
-
-        public int poll(final FragmentAssembler fragmentAssembler)
-        {
-            if (image == null)
-            {
-                if (archiveLocations.isEmpty())
-                {
-                    return 0;
-                }
-
-                final ArchiveLocation archiveLocation = archiveLocations.remove(archiveLocations.size() - 1);
-
-                if (archiveLocation.length() != 0)
-                {
-                    final int sessionId = (int)aeronArchive.startReplay(
-                        archiveLocation.recordingId,
-                        archiveLocation.startPosition,
-                        archiveLocation.length(),
-                        IPC_CHANNEL,
-                        replaySubscription.streamId());
-
-                    image = lookupImage(sessionId);
-                    stopPosition = archiveLocation.stopPosition;
-                }
-
-                return 1;
-            }
-            else
-            {
-                if (image.position() >= stopPosition)
-                {
-                    image = null;
-                    return 1;
-                }
-                else
-                {
-                    return image.poll(fragmentAssembler, FRAGMENT_LIMIT);
-                }
-            }
-        }
-
-        public int streamId()
-        {
-            return originalStreamId;
-        }
-
-        private Image lookupImage(final int sessionId)
-        {
-            Image image = null;
-
-            while (image == null)
-            {
-                idleStrategy.idle();
-                image = replaySubscription.imageBySessionId(sessionId);
-            }
-            idleStrategy.reset();
-
-            return image;
-        }
-
-        public void close()
-        {
-            // don't own replay subscription so no need to close it.
-        }
-    }
-
+    @Override
     public void close()
     {
-        aeronArchive.close();
+        agent.close();
     }
 }

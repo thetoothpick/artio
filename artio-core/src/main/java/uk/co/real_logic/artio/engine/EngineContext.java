@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 package uk.co.real_logic.artio.engine;
 
 import io.aeron.Aeron;
+import io.aeron.ChannelUriStringBuilder;
 import io.aeron.ExclusivePublication;
 import io.aeron.Subscription;
 import io.aeron.UnavailableImageHandler;
@@ -39,7 +40,6 @@ import uk.co.real_logic.artio.protocol.Streams;
 import java.util.ArrayList;
 import java.util.List;
 
-import static java.util.Arrays.asList;
 import static uk.co.real_logic.artio.dictionary.generation.Exceptions.suppressingClose;
 import static uk.co.real_logic.artio.engine.SessionInfo.UNK_SESSION;
 
@@ -49,7 +49,8 @@ public class EngineContext implements AutoCloseable
     private final PruneOperation.Formatters pruneOperationFormatters = new PruneOperation.Formatters();
     private final CompletionPosition inboundCompletionPosition = new CompletionPosition();
     private final CompletionPosition outboundLibraryCompletionPosition = new CompletionPosition();
-    private final CompletionPosition outboundClusterCompletionPosition = new CompletionPosition();
+    private final SequenceNumberExtractor sentSequenceNumberExtractor = new SequenceNumberExtractor();
+    private final SequenceNumberExtractor recvSequenceNumberExtractor = new SequenceNumberExtractor();
 
     private final EpochNanoClock clock;
     private final EngineConfiguration configuration;
@@ -64,16 +65,20 @@ public class EngineContext implements AutoCloseable
     private final SequenceNumberIndexWriter sentSequenceNumberIndex;
     private final SequenceNumberIndexWriter receivedSequenceNumberIndex;
 
+    private final ReplayEvictionHandler inboundEvictionHandler;
+    private final ReplayEvictionHandler outboundEvictionHandler;
+
     private Streams inboundLibraryStreams;
     private Streams outboundLibraryStreams;
 
     // Indexers are owned by the indexingAgent
-    private Indexer inboundIndexer;
-    private Indexer outboundIndexer;
+    private ArchivingAgents inboundArchivingAgents;
+    private ArchivingAgents outboundArchivingAgents;
     private Agent indexingAgent;
     private ReplayQuery pruneInboundReplayQuery;
     private ReplayQuery outboundReplayQuery;
     private FramerContext framerContext;
+    private long inboundIndexRegistrationId;
     private long outboundIndexRegistrationId;
 
     EngineContext(
@@ -94,6 +99,8 @@ public class EngineContext implements AutoCloseable
         this.aeronArchive = aeronArchive;
         this.recordingCoordinator = recordingCoordinator;
 
+        inboundEvictionHandler = new ReplayEvictionHandler(errorHandler);
+        outboundEvictionHandler = new ReplayEvictionHandler(errorHandler);
         replayerCommandQueue = new ReplayerCommandQueue(configuration.framerIdleStrategy());
         senderSequenceNumbers = new SenderSequenceNumbers(replayerCommandQueue);
 
@@ -102,7 +109,9 @@ public class EngineContext implements AutoCloseable
             final EpochClock epochClock = new SystemEpochClock();
             final Long2LongHashMap connectionIdToFixPSessionId = new Long2LongHashMap(UNK_SESSION);
             final FixPProtocolType fixPProtocolType = configuration.supportedFixPProtocolType();
+            final boolean indexChecksumEnabled = configuration.indexChecksumEnabled();
             sentSequenceNumberIndex = new SequenceNumberIndexWriter(
+                sentSequenceNumberExtractor,
                 configuration.sentSequenceNumberBuffer(),
                 configuration.sentSequenceNumberIndex(),
                 errorHandler,
@@ -112,8 +121,11 @@ public class EngineContext implements AutoCloseable
                 epochClock,
                 configuration.logFileDir(),
                 connectionIdToFixPSessionId,
-                fixPProtocolType);
+                fixPProtocolType,
+                indexChecksumEnabled,
+                configuration.logOutboundMessages());
             receivedSequenceNumberIndex = new SequenceNumberIndexWriter(
+                recvSequenceNumberExtractor,
                 configuration.receivedSequenceNumberBuffer(),
                 configuration.receivedSequenceNumberIndex(),
                 errorHandler,
@@ -123,7 +135,9 @@ public class EngineContext implements AutoCloseable
                 epochClock,
                 null,
                 connectionIdToFixPSessionId,
-                fixPProtocolType);
+                fixPProtocolType,
+                indexChecksumEnabled,
+                configuration.logInboundMessages());
 
             newStreams();
             newArchivingAgent();
@@ -164,27 +178,31 @@ public class EngineContext implements AutoCloseable
     }
 
     private ReplayIndex newReplayIndex(
-        final int cacheSetSize,
-        final int cacheNumSets,
         final String logFileDir,
         final int streamId,
         final RecordingIdLookup recordingIdLookup,
         final Long2LongHashMap connectionIdToILinkUuid,
-        final SequenceNumberIndexReader reader)
+        final SequenceNumberIndexReader reader,
+        final SequenceNumberExtractor sequenceNumberExtractor,
+        final boolean indexChecksumEnabled,
+        final ReplayEvictionHandler evictionHandler)
     {
         return new ReplayIndex(
+            sequenceNumberExtractor,
             logFileDir,
             streamId,
-            configuration.replayIndexFileSize(),
-            cacheNumSets,
-            cacheSetSize,
+            configuration.replayIndexFileRecordCapacity(),
+            configuration.replayIndexSegmentRecordCapacity(),
             LoggerUtil::map,
             ReplayIndexDescriptor.replayPositionBuffer(logFileDir, streamId, configuration.replayPositionBufferSize()),
             errorHandler,
             recordingIdLookup,
             connectionIdToILinkUuid,
             configuration.supportedFixPProtocolType(),
-            reader);
+            reader,
+            configuration.timeIndexReplayFlushIntervalInNs(),
+            indexChecksumEnabled,
+            evictionHandler);
     }
 
     private ReplayQuery newReplayQuery(final IdleStrategy idleStrategy, final int streamId)
@@ -203,96 +221,15 @@ public class EngineContext implements AutoCloseable
             idleStrategy,
             aeronArchive,
             errorHandler,
-            archiveReplayStream);
+            NoOpReplayQueryListener.INSTANCE,
+            archiveReplayStream,
+            configuration.replayIndexFileRecordCapacity(),
+            configuration.replayIndexSegmentRecordCapacity());
     }
 
-    private Replayer newReplayer(
-        final ExclusivePublication replayPublication, final ReplayQuery replayQuery)
+    public long inboundIndexRegistrationId()
     {
-        final EpochFractionFormat epochFractionFormat = configuration.sessionEpochFractionFormat();
-        return new Replayer(
-            replayQuery,
-            replayPublication,
-            new BufferClaim(),
-            configuration.archiverIdleStrategy(),
-            errorHandler,
-            configuration.outboundMaxClaimAttempts(),
-            inboundLibraryStreams.subscription("replayer"),
-            configuration.agentNamePrefix(),
-            configuration.gapfillOnReplayMessageTypes(),
-            configuration.gapfillOnRetransmitILinkTemplateIds(),
-            configuration.replayHandler(),
-            configuration.fixPRetransmitHandler(),
-            senderSequenceNumbers,
-            new FixSessionCodecsFactory(epochFractionFormat),
-            configuration.senderMaxBytesInBuffer(),
-            replayerCommandQueue,
-            epochFractionFormat,
-            fixCounters.currentReplayCount(),
-            configuration.maxConcurrentSessionReplays(),
-            configuration.epochNanoClock(),
-            configuration.supportedFixPProtocolType(),
-            configuration);
-    }
-
-    private void newIndexers()
-    {
-        ReplayIndex inboundReplayIndex = null;
-        ReplayIndex outboundReplayIndex = null;
-
-        try
-        {
-            final int cacheSetSize = configuration.loggerCacheSetSize();
-            final int cacheNumSets = configuration.loggerCacheNumSets();
-            final String logFileDir = configuration.logFileDir();
-
-            final Long2LongHashMap connectionIdToILinkUuid = new Long2LongHashMap(UNK_SESSION);
-            inboundReplayIndex = newReplayIndex(
-                cacheSetSize,
-                cacheNumSets,
-                logFileDir,
-                configuration.inboundLibraryStream(),
-                recordingCoordinator.indexerInboundRecordingIdLookup(),
-                connectionIdToILinkUuid,
-                receivedSequenceNumberIndex.reader());
-
-            inboundIndexer = new Indexer(
-                asList(inboundReplayIndex, receivedSequenceNumberIndex),
-                inboundLibraryStreams.subscription("inboundIndexer"),
-                configuration.agentNamePrefix(),
-                inboundCompletionPosition,
-                configuration.archiveReplayStream(),
-                configuration.gracefulShutdown());
-
-            final List<Index> outboundIndices = new ArrayList<>();
-            outboundReplayIndex = newReplayIndex(
-                cacheSetSize,
-                cacheNumSets,
-                logFileDir,
-                configuration.outboundLibraryStream(),
-                recordingCoordinator.indexerOutboundRecordingIdLookup(),
-                connectionIdToILinkUuid,
-                sentSequenceNumberIndex.reader());
-            outboundIndices.add(outboundReplayIndex);
-            outboundIndices.add(sentSequenceNumberIndex);
-
-            final Subscription outboundIndexSubscription = outboundLibraryStreams.subscription("outboundIndexer");
-            outboundIndexRegistrationId = outboundIndexSubscription.registrationId();
-
-            this.outboundIndexer = new Indexer(
-                outboundIndices,
-                outboundIndexSubscription,
-                configuration.agentNamePrefix(),
-                outboundLibraryCompletionPosition,
-                configuration.archiveReplayStream(),
-                configuration.gracefulShutdown());
-        }
-        catch (final Exception e)
-        {
-            suppressingClose(inboundReplayIndex, e);
-            suppressingClose(outboundReplayIndex, e);
-            throw e;
-        }
+        return inboundIndexRegistrationId;
     }
 
     public long outboundIndexRegistrationId()
@@ -302,20 +239,118 @@ public class EngineContext implements AutoCloseable
 
     private void newArchivingAgent()
     {
+        ReplayIndex inboundReplayIndex = null;
+        ReplayIndex outboundReplayIndex = null;
+
+        try
+        {
+            final String logFileDir = configuration.logFileDir();
+            final boolean indexChecksumEnabled = configuration.indexChecksumEnabled();
+
+            final Long2LongHashMap connectionIdToILinkUuid = new Long2LongHashMap(UNK_SESSION);
+            final List<Index> inboundIndices = new ArrayList<>();
+            if (configuration.logInboundMessages())
+            {
+                inboundReplayIndex = newReplayIndex(
+                    logFileDir,
+                    configuration.inboundLibraryStream(),
+                    recordingCoordinator.indexerInboundRecordingIdLookup(),
+                    connectionIdToILinkUuid,
+                    receivedSequenceNumberIndex.reader(),
+                    recvSequenceNumberExtractor,
+                    indexChecksumEnabled,
+                    inboundEvictionHandler);
+                inboundIndices.add(inboundReplayIndex);
+            }
+            inboundIndices.add(receivedSequenceNumberIndex);
+
+            final Subscription inboundIndexSubscription = inboundLibraryStreams.subscription("inboundIndexer");
+            inboundIndexRegistrationId = inboundIndexSubscription.registrationId();
+
+            final Indexer inboundIndexer = new Indexer(
+                inboundIndices, configuration.agentNamePrefix(), configuration.archiveReplayStream());
+            inboundArchivingAgents = new ArchivingAgents(
+                inboundIndexer, null, inboundIndexSubscription, inboundCompletionPosition);
+
+            final List<Index> outboundIndices = new ArrayList<>();
+            if (configuration.logOutboundMessages())
+            {
+                outboundReplayIndex = newReplayIndex(
+                    logFileDir,
+                    configuration.outboundLibraryStream(),
+                    recordingCoordinator.indexerOutboundRecordingIdLookup(),
+                    connectionIdToILinkUuid,
+                    sentSequenceNumberIndex.reader(),
+                    sentSequenceNumberExtractor,
+                    indexChecksumEnabled,
+                    outboundEvictionHandler);
+                outboundIndices.add(outboundReplayIndex);
+            }
+            outboundIndices.add(sentSequenceNumberIndex);
+
+            final Subscription outboundIndexSubscription = outboundLibraryStreams.subscription("outboundIndexer");
+            outboundIndexRegistrationId = outboundIndexSubscription.registrationId();
+
+            final Indexer outboundIndexer = new Indexer(
+                outboundIndices, configuration.agentNamePrefix(), configuration.archiveReplayStream());
+            final AbstractReplayer replayer = replayer();
+            outboundArchivingAgents = new ArchivingAgents(
+                outboundIndexer, replayer, outboundIndexSubscription, outboundLibraryCompletionPosition);
+        }
+        catch (final Exception e)
+        {
+            suppressingClose(inboundReplayIndex, e);
+            suppressingClose(outboundReplayIndex, e);
+            throw e;
+        }
+
+        final List<Agent> agents = new ArrayList<>();
+        agents.add(inboundArchivingAgents);
+        agents.add(outboundArchivingAgents);
+
+        indexingAgent = new CompositeAgent(agents);
+    }
+
+    private AbstractReplayer replayer()
+    {
+        final AbstractReplayer replayer;
         if (configuration.logOutboundMessages())
         {
-            newIndexers();
-
             outboundReplayQuery = newReplayQuery(
                 configuration.archiverIdleStrategy(), configuration.outboundLibraryStream());
-            final Replayer replayer = newReplayer(replayPublication, outboundReplayQuery);
-
-            final List<Agent> agents = new ArrayList<>();
-            agents.add(inboundIndexer);
-            agents.add(outboundIndexer);
-            agents.add(replayer);
-
-            indexingAgent = new CompositeAgent(agents);
+            outboundEvictionHandler.replayQuery(outboundReplayQuery);
+            try
+            {
+                final EpochFractionFormat epochFractionFormat = configuration.sessionEpochFractionFormat();
+                replayer = new Replayer(
+                    outboundReplayQuery,
+                    replayPublication,
+                    new BufferClaim(),
+                    configuration.archiverIdleStrategy(),
+                    errorHandler,
+                    configuration.outboundMaxClaimAttempts(),
+                    configuration.agentNamePrefix(),
+                    configuration.gapfillOnReplayMessageTypes(),
+                    configuration.gapfillOnRetransmitILinkTemplateIds(),
+                    configuration.replayHandler(),
+                    configuration.fixPRetransmitHandler(),
+                    senderSequenceNumbers,
+                    new FixSessionCodecsFactory(clock, epochFractionFormat),
+                    configuration.senderMaxBytesInBuffer(),
+                    replayerCommandQueue,
+                    epochFractionFormat,
+                    fixCounters.currentReplayCount(),
+                    configuration.maxConcurrentSessionReplays(),
+                    clock,
+                    configuration.supportedFixPProtocolType(),
+                    configuration,
+                    fixCounters.getIndexerDutyCycleTracker(configuration.indexerCycleThresholdNs()));
+            }
+            catch (final Throwable e)
+            {
+                outboundReplayQuery.close();
+                throw e;
+            }
         }
         else
         {
@@ -326,29 +361,33 @@ public class EngineContext implements AutoCloseable
                 clock,
                 configuration.outboundMaxClaimAttempts());
 
-            indexingAgent = new GapFiller(
-                inboundLibraryStreams.subscription("replayer"),
+            replayer = new GapFiller(
                 replayGatewayPublication,
+                new BufferClaim(),
                 configuration.agentNamePrefix(),
                 senderSequenceNumbers,
                 replayerCommandQueue,
-                new FixSessionCodecsFactory(configuration.sessionEpochFractionFormat()),
-                clock);
+                new FixSessionCodecsFactory(clock, configuration.sessionEpochFractionFormat()),
+                fixCounters.currentReplayCount(),
+                clock,
+                fixCounters.getIndexerDutyCycleTracker(configuration.indexerCycleThresholdNs()));
         }
+
+        return replayer;
     }
 
     public void catchupIndices()
     {
         // when inbound logging disabled
-        if (inboundIndexer != null)
+        if (configuration.logInboundMessages())
         {
-            inboundIndexer.catchIndexUp(aeronArchive, errorHandler);
+            inboundArchivingAgents.catchIndexUp(aeronArchive, errorHandler);
         }
 
         // when outbound logging disabled
-        if (outboundIndexer != null)
+        if (configuration.logOutboundMessages())
         {
-            outboundIndexer.catchIndexUp(aeronArchive, errorHandler);
+            outboundArchivingAgents.catchIndexUp(aeronArchive, errorHandler);
         }
     }
 
@@ -361,8 +400,11 @@ public class EngineContext implements AutoCloseable
     public Subscription outboundLibrarySubscription(
         final String name, final UnavailableImageHandler unavailableImageHandler)
     {
+        final String channel = new ChannelUriStringBuilder(configuration.libraryAeronChannel())
+            .alias(name)
+            .build();
         final Subscription subscription = aeron.addSubscription(
-            configuration.libraryAeronChannel(),
+            channel,
             configuration.outboundLibraryStream(),
             null,
             unavailableImageHandler);
@@ -370,15 +412,24 @@ public class EngineContext implements AutoCloseable
         return subscription;
     }
 
-    public ReplayQuery inboundReplayQuery()
+    public ReplayQuery inboundReplayQuery(final boolean replayerThread)
     {
-        if (!configuration.logInboundMessages())
+        if (!configuration.canReplayInbound())
         {
             return null;
         }
 
-        return newReplayQuery(
+        final ReplayQuery replayQuery = newReplayQuery(
             configuration.framerIdleStrategy(), configuration.inboundLibraryStream());
+        if (replayerThread)
+        {
+            inboundEvictionHandler.replayQuery(replayQuery);
+        }
+        else
+        {
+            inboundEvictionHandler.framerReplayQuery(replayQuery);
+        }
+        return replayQuery;
     }
 
     public GatewayPublication inboundPublication()
@@ -401,7 +452,6 @@ public class EngineContext implements AutoCloseable
     {
         inboundCompletionPosition.completeDuringStartup();
         outboundLibraryCompletionPosition.completeDuringStartup();
-        outboundClusterCompletionPosition.completeDuringStartup();
     }
 
     Agent indexingAgent()
@@ -418,6 +468,8 @@ public class EngineContext implements AutoCloseable
     {
         this.framerContext = framerContext;
         sentSequenceNumberIndex.framerContext(framerContext);
+        inboundEvictionHandler.framerContext(framerContext);
+        outboundEvictionHandler.framerContext(framerContext);
     }
 
     public Reply<Long2LongHashMap> pruneArchive(final Exception exception)
@@ -429,7 +481,7 @@ public class EngineContext implements AutoCloseable
     {
         if (pruneInboundReplayQuery == null)
         {
-            pruneInboundReplayQuery = inboundReplayQuery();
+            pruneInboundReplayQuery = inboundReplayQuery(true);
         }
 
         final PruneOperation operation = new PruneOperation(
@@ -449,12 +501,10 @@ public class EngineContext implements AutoCloseable
         return operation;
     }
 
+    @Override
     public void close()
     {
-        if (configuration.gracefulShutdown())
-        {
-            Exceptions.closeAll(
-                sentSequenceNumberIndex, receivedSequenceNumberIndex, pruneInboundReplayQuery);
-        }
+        Exceptions.closeAll(
+            sentSequenceNumberIndex, receivedSequenceNumberIndex, pruneInboundReplayQuery);
     }
 }

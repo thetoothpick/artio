@@ -29,6 +29,8 @@ public final class GenerationUtil
     public static final int MESSAGE_TYPE_BITSHIFT = 8;
 
     public static final String INDENT = "    ";
+    public static final String GENERATED_ANNOTATION = "@Generated(\"uk.co.real_logic.artio\")\n";
+    public static final String SUPPRESS_THIS_ESCAPE_ANNOTATION = "@SuppressWarnings(\"this-escape\")\n";
 
     private GenerationUtil()
     {
@@ -57,8 +59,7 @@ public final class GenerationUtil
 
     public static String constantName(final String name)
     {
-        final String replacedName = name.replace("ID", "Id")
-            .replace("GroupCounter", "");
+        final String replacedName = name.replace("ID", "Id");
         return toUpperCase(replacedName.charAt(0)) + replacedName
             .substring(1)
             .chars()

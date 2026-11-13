@@ -16,16 +16,19 @@
 package uk.co.real_logic.artio.engine.logger;
 
 import io.aeron.Aeron;
+import io.aeron.CommonContext;
 import io.aeron.FragmentAssembler;
 import io.aeron.Subscription;
 import org.agrona.DirectBuffer;
+import org.agrona.ExpandableArrayBuffer;
 import org.agrona.LangUtil;
+import org.agrona.Strings;
 import org.agrona.Verify;
 import org.agrona.concurrent.Agent;
 import org.agrona.concurrent.AgentRunner;
 import uk.co.real_logic.artio.ArtioLogHeader;
 import uk.co.real_logic.artio.CommonConfiguration;
-import uk.co.real_logic.artio.ilink.ILinkMessageConsumer;
+import uk.co.real_logic.artio.fixp.FixPMessageConsumer;
 import uk.co.real_logic.artio.messages.FixMessageDecoder;
 
 import static io.aeron.CommonContext.IPC_CHANNEL;
@@ -47,7 +50,9 @@ public class FixMessageLogger implements Agent
 {
     public static class Configuration
     {
-        public static final int DEFAULT_COMPACTION_SIZE = 64 * 1024;
+        public static final int DEFAULT_COMPACTION_SIZE = 256 * 1024 * 1024;
+        public static final int MAXIMUM_MAXIMUM_BUFFER_SIZE = ExpandableArrayBuffer.MAX_ARRAY_LENGTH - 1;
+        public static final int DEFAULT_MAXIMUM_BUFFER_SIZE = ExpandableArrayBuffer.MAX_ARRAY_LENGTH / 2;
 
         private FixMessageConsumer fixMessageConsumer;
         private Aeron.Context context;
@@ -58,7 +63,8 @@ public class FixMessageLogger implements Agent
         private int outboundStreamId = DEFAULT_OUTBOUND_LIBRARY_STREAM;
         private int outboundReplayStreamId = DEFAULT_OUTBOUND_REPLAY_STREAM;
         private int compactionSize = DEFAULT_COMPACTION_SIZE;
-        private ILinkMessageConsumer iLinkMessageConsumer;
+        public int maximumBufferSize = DEFAULT_MAXIMUM_BUFFER_SIZE;
+        private FixPMessageConsumer fixPMessageConsumer;
 
         /**
          * Provide a consumer for FIX messages that are logger by the stream.
@@ -72,9 +78,28 @@ public class FixMessageLogger implements Agent
             return this;
         }
 
-        public Configuration iLinkMessageConsumer(final ILinkMessageConsumer iLinkMessageConsumer)
+        /**
+         * Deprecated: please use {@link #fixPMessageConsumer(FixPMessageConsumer)}.
+         *
+         * @param iLinkMessageConsumer the handler to provide to receive ILink messages
+         * @return this
+         */
+        @Deprecated
+        public Configuration iLinkMessageConsumer(
+            final uk.co.real_logic.artio.ilink.ILinkMessageConsumer iLinkMessageConsumer)
         {
-            this.iLinkMessageConsumer = iLinkMessageConsumer;
+            return fixPMessageConsumer(iLinkMessageConsumer);
+        }
+
+        /**
+         * Set the callback handler to receive FIXP messages.
+         *
+         * @param fixPMessageConsumer the handler to provide to receive FIXP messages
+         * @return this
+         */
+        public Configuration fixPMessageConsumer(final FixPMessageConsumer fixPMessageConsumer)
+        {
+            this.fixPMessageConsumer = fixPMessageConsumer;
             return this;
         }
 
@@ -193,12 +218,24 @@ public class FixMessageLogger implements Agent
          */
         public Configuration compactionSize(final int compactionSize)
         {
-            if (compactionSize <= 0)
-            {
-                throw new IllegalArgumentException("Compaction size must be positive, but is: " + compactionSize);
-            }
+            validateCompactionSize(compactionSize);
 
             this.compactionSize = compactionSize;
+            return this;
+        }
+
+        /**
+         * Sets the maximum size that the internal reorder buffer can grow to. If this is exceeded then all the
+         * messages within the reorder buffer are simply dumped out in their current order.
+         *
+         * @param maximumBufferSize the maximum reorder buffer size in bytes
+         * @return this
+         */
+        public Configuration maximumBufferSize(final int maximumBufferSize)
+        {
+            validateMaximumBufferSize(maximumBufferSize);
+
+            this.maximumBufferSize = maximumBufferSize;
             return this;
         }
 
@@ -206,15 +243,77 @@ public class FixMessageLogger implements Agent
         {
             Verify.notNull(fixMessageConsumer, "fixMessageConsumer");
 
+            validateMaxAndCompactionSize(maximumBufferSize, compactionSize);
+
             if (aeron == null)
             {
                 if (context == null)
                 {
                     context(new Aeron.Context());
                 }
+                if (Strings.isEmpty(context.clientName()))
+                {
+                    context.clientName("fix-message-logger");
+                }
 
                 aeron = Aeron.connect(context);
             }
+
+            if (CommonContext.shouldPrintConfigurationOnStart())
+            {
+                System.out.println(this);
+            }
+        }
+
+        public static void validateMaxAndCompactionSize(final int maximumBufferSize, final int compactionSize)
+        {
+            if (maximumBufferSize < compactionSize)
+            {
+                throw new IllegalArgumentException(
+                    "maximumBufferSize (" + maximumBufferSize + ") cannot be less than the compactionSize (" +
+                        compactionSize + ")");
+            }
+        }
+
+        public static void validateMaximumBufferSize(final int maximumBufferSize)
+        {
+            if (maximumBufferSize <= 0)
+            {
+                throw new IllegalArgumentException("maximumBufferSize must be positive, but is: " + maximumBufferSize);
+            }
+
+            if (maximumBufferSize > MAXIMUM_MAXIMUM_BUFFER_SIZE)
+            {
+                throw new IllegalArgumentException("maximumBufferSize must be <= " + MAXIMUM_MAXIMUM_BUFFER_SIZE +
+                    ", but is: " + maximumBufferSize);
+            }
+        }
+
+        public static void validateCompactionSize(final int compactionSize)
+        {
+            if (compactionSize <= 0)
+            {
+                throw new IllegalArgumentException("Compaction size must be positive, but is: " + compactionSize);
+            }
+        }
+
+        @Override
+        public String toString()
+        {
+            return "FixMessageLogger.Configuration" +
+                "\n{" +
+                "\n    fixMessageConsumer=" + fixMessageConsumer +
+                "\n    context=" + context +
+                "\n    ownsAeronClient=" + ownsAeronClient +
+                "\n    aeron=" + aeron +
+                "\n    libraryAeronChannel='" + libraryAeronChannel + '\'' +
+                "\n    inboundStreamId=" + inboundStreamId +
+                "\n    outboundStreamId=" + outboundStreamId +
+                "\n    outboundReplayStreamId=" + outboundReplayStreamId +
+                "\n    compactionSize=" + compactionSize +
+                "\n    maximumBufferSize=" + maximumBufferSize +
+                "\n    fixPMessageConsumer=" + fixPMessageConsumer +
+                "\n}";
         }
     }
 
@@ -303,8 +402,9 @@ public class FixMessageLogger implements Agent
 
         zipper = new StreamTimestampZipper(
             configuration.fixMessageConsumer,
-            configuration.iLinkMessageConsumer,
+            configuration.fixPMessageConsumer,
             configuration.compactionSize,
+            configuration.maximumBufferSize, false,
             pollers);
     }
 
@@ -314,11 +414,13 @@ public class FixMessageLogger implements Agent
         return new SubscriptionPoller(aeron.addSubscription(libraryAeronChannel, streamId));
     }
 
+    @Override
     public int doWork()
     {
-        return zipper.poll();
+        return zipper.poll(Integer.MAX_VALUE);
     }
 
+    @Override
     public void onClose()
     {
         if (!closed)
@@ -327,7 +429,7 @@ public class FixMessageLogger implements Agent
 
             if (zipper != null)
             {
-                zipper.onClose();
+                zipper.close();
             }
 
             if (configuration.ownsAeronClient)
@@ -337,6 +439,7 @@ public class FixMessageLogger implements Agent
         }
     }
 
+    @Override
     public String roleName()
     {
         return "FixMessageLogger";
@@ -361,19 +464,28 @@ public class FixMessageLogger implements Agent
             this.subscription = subscription;
         }
 
-        public int poll(final FragmentAssembler fragmentAssembler)
+        @Override
+        public int poll(final FragmentAssembler fragmentAssembler, final int fragmentLimit)
         {
-            return subscription.poll(fragmentAssembler, 10);
+            return subscription.poll(fragmentAssembler, fragmentLimit);
         }
 
+        @Override
         public int streamId()
         {
             return subscription.streamId();
         }
 
+        @Override
         public void close()
         {
             subscription.close();
+        }
+
+        @Override
+        public boolean isComplete()
+        {
+            return false;
         }
     }
 }

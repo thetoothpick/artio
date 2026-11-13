@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,140 +15,357 @@
  */
 package uk.co.real_logic.artio.engine.logger;
 
-import io.aeron.Subscription;
-import io.aeron.logbuffer.ControlledFragmentHandler;
-import io.aeron.logbuffer.ControlledFragmentHandler.Action;
+import io.aeron.driver.DutyCycleTracker;
+import io.aeron.logbuffer.BufferClaim;
+import io.aeron.logbuffer.Header;
 import org.agrona.DirectBuffer;
-import org.agrona.concurrent.Agent;
+import org.agrona.collections.Long2ObjectHashMap;
 import org.agrona.concurrent.EpochNanoClock;
-import uk.co.real_logic.artio.Pressure;
+import org.agrona.concurrent.status.AtomicCounter;
 import uk.co.real_logic.artio.builder.Encoder;
 import uk.co.real_logic.artio.decoder.AbstractResendRequestDecoder;
 import uk.co.real_logic.artio.decoder.SessionHeaderDecoder;
 import uk.co.real_logic.artio.engine.ReplayerCommandQueue;
+import uk.co.real_logic.artio.engine.SenderSequenceNumber;
 import uk.co.real_logic.artio.engine.SenderSequenceNumbers;
-import uk.co.real_logic.artio.messages.DisconnectReason;
 import uk.co.real_logic.artio.messages.MessageStatus;
+import uk.co.real_logic.artio.messages.ValidResendRequestDecoder;
 import uk.co.real_logic.artio.protocol.GatewayPublication;
-import uk.co.real_logic.artio.protocol.ProtocolHandler;
-import uk.co.real_logic.artio.protocol.ProtocolSubscription;
-import uk.co.real_logic.artio.util.AsciiBuffer;
 import uk.co.real_logic.artio.util.MutableAsciiBuffer;
 
-import static io.aeron.logbuffer.ControlledFragmentHandler.Action.CONTINUE;
-import static uk.co.real_logic.artio.dictionary.SessionConstants.RESEND_REQUEST_MESSAGE_TYPE;
+import java.util.ArrayDeque;
+
+import static io.aeron.protocol.DataHeaderFlyweight.BEGIN_FLAG;
 import static uk.co.real_logic.artio.dictionary.SessionConstants.SEQUENCE_RESET_MESSAGE_TYPE;
+import static uk.co.real_logic.artio.engine.FixEngine.ENGINE_LIBRARY_ID;
+import static uk.co.real_logic.artio.messages.MessageHeaderDecoder.ENCODED_LENGTH;
 
-public class GapFiller implements ProtocolHandler, Agent
+public class GapFiller extends AbstractReplayer
 {
-    private static final int FRAGMENT_LIMIT = 10;
-
-    private final AsciiBuffer decoderBuffer = new MutableAsciiBuffer();
+    private final Long2ObjectHashMap<GapFillerChannel> gapFillerChannels = new Long2ObjectHashMap<>();
     private final ReplayerCommandQueue replayerCommandQueue;
-    private final FixSessionCodecsFactory fixSessionCodecsFactory;
-    private final ControlledFragmentHandler protocolSubscription;
-
-    private final Subscription inboundSubscription;
     private final GatewayPublication publication;
     private final String agentNamePrefix;
-    private final SenderSequenceNumbers senderSequenceNumbers;
     private final ReplayTimestamper timestamper;
+    private final AtomicCounter gapfillerCounter;
 
     public GapFiller(
-        final Subscription inboundSubscription,
         final GatewayPublication publication,
+        final BufferClaim bufferClaim,
         final String agentNamePrefix,
         final SenderSequenceNumbers senderSequenceNumbers,
         final ReplayerCommandQueue replayerCommandQueue,
         final FixSessionCodecsFactory fixSessionCodecsFactory,
-        final EpochNanoClock clock)
+        final AtomicCounter gapfillerCounter,
+        final EpochNanoClock clock,
+        final DutyCycleTracker dutyCycleTracker)
     {
-        this.inboundSubscription = inboundSubscription;
+        super(publication.dataPublication(), fixSessionCodecsFactory, bufferClaim, senderSequenceNumbers,
+            clock, dutyCycleTracker);
         this.publication = publication;
         this.agentNamePrefix = agentNamePrefix;
-        this.senderSequenceNumbers = senderSequenceNumbers;
         this.replayerCommandQueue = replayerCommandQueue;
-        this.fixSessionCodecsFactory = fixSessionCodecsFactory;
-        this.protocolSubscription = ProtocolSubscription.of(this, fixSessionCodecsFactory);
+        this.gapfillerCounter = gapfillerCounter;
 
         timestamper = new ReplayTimestamper(publication.dataPublication(), clock);
     }
 
-    public int doWork()
+    @Override
+    public void onFragment(final DirectBuffer buffer, final int start, final int length, final Header header)
     {
-        timestamper.sendTimestampMessage();
+        // Avoid fragmented messages
+        if ((header.flags() & BEGIN_FLAG) != BEGIN_FLAG)
+        {
+            return;
+        }
 
-        return replayerCommandQueue.poll() + inboundSubscription.controlledPoll(protocolSubscription, FRAGMENT_LIMIT);
+        messageHeader.wrap(buffer, start);
+        final int templateId = messageHeader.templateId();
+        final int offset = start + ENCODED_LENGTH;
+        final int blockLength = messageHeader.blockLength();
+        final int version = messageHeader.version();
+
+        if (templateId == ValidResendRequestDecoder.TEMPLATE_ID)
+        {
+            validResendRequest.wrap(
+                buffer,
+                offset,
+                blockLength,
+                version);
+
+            final long sessionId = validResendRequest.session();
+            final long connectionId = validResendRequest.connection();
+            final int beginSeqNo = (int)validResendRequest.beginSequenceNumber();
+            final int endSeqNo = (int)validResendRequest.endSequenceNumber();
+            final int sequenceIndex = validResendRequest.sequenceIndex();
+            final long correlationId = validResendRequest.correlationId();
+
+            final MutableAsciiBuffer copiedBuffer = new MutableAsciiBuffer(new byte[validResendRequest.bodyLength()]);
+            validResendRequest.getBody(copiedBuffer, 0, validResendRequest.bodyLength());
+
+            onResendRequest(
+                sessionId, connectionId, beginSeqNo, endSeqNo, sequenceIndex, correlationId, copiedBuffer);
+        }
+        else
+        {
+            fixSessionCodecsFactory.onFragment(buffer, start, length, header);
+        }
     }
 
+    void onResendRequest(
+        final long sessionId,
+        final long connectionId,
+        final int beginSeqNo,
+        final int endSeqNo,
+        final int sequenceIndex,
+        final long correlationId,
+        final MutableAsciiBuffer copiedBuffer)
+    {
+        final GapFillerSession gapFillerSession = new GapFillerSession(
+            sessionId, connectionId, beginSeqNo, endSeqNo, sequenceIndex, correlationId, copiedBuffer);
+
+        if (gapFillerChannels.containsKey(connectionId))
+        {
+            final GapFillerChannel gapFillerChannel = gapFillerChannels.get(connectionId);
+            gapFillerChannel.enqueue(gapFillerSession);
+        }
+        else
+        {
+            final GapFillerChannel gapFillerChannel = new GapFillerChannel();
+            gapFillerChannel.currentSession(gapFillerSession);
+            gapFillerChannels.put(connectionId, gapFillerChannel);
+            gapfillerCounter.increment();
+        }
+    }
+
+    @Override
+    public int doWork()
+    {
+        int workCount = 0;
+        final long timeInNs = clock.nanoTime();
+
+        trackDutyCycleTime(timeInNs);
+        timestamper.sendTimestampMessage(timeInNs);
+
+        workCount += replayerCommandQueue.poll();
+        workCount += sendGapfills();
+        return workCount;
+    }
+
+    private int sendGapfills()
+    {
+        int workCount = 0;
+
+        final Long2ObjectHashMap<GapFillerChannel>.EntryIterator gapFillerChannelIterator =
+            gapFillerChannels.entrySet().iterator();
+
+        while (gapFillerChannelIterator.hasNext())
+        {
+            gapFillerChannelIterator.next();
+
+            final long connectionId = gapFillerChannelIterator.getLongKey();
+            final GapFillerChannel gapFillerChannel = gapFillerChannelIterator.getValue();
+
+            if (checkDisconnected(connectionId))
+            {
+                gapFillerChannelIterator.remove();
+                gapfillerCounter.decrement();
+            }
+            else
+            {
+                final GapFillerSession currentSession = gapFillerChannel.currentSession();
+                workCount += currentSession.doWork();
+
+                if (currentSession.isDone())
+                {
+                    final GapFillerSession queuedSession = gapFillerChannel.pollEnqueued();
+                    if (null == queuedSession)
+                    {
+                        gapFillerChannelIterator.remove();
+                        gapfillerCounter.decrement();
+                    }
+                    else
+                    {
+                        gapFillerChannel.currentSession(queuedSession);
+                    }
+                }
+            }
+        }
+
+        return workCount;
+    }
+
+    @Override
     public String roleName()
     {
         return agentNamePrefix + "GapFiller";
     }
 
-    public Action onMessage(
-        final DirectBuffer buffer,
-        final int offset,
-        final int length,
-        final int libraryId,
-        final long connectionId,
-        final long sessionId,
-        final int sequenceIndex,
-        final long messageType,
-        final long timestamp,
-        final MessageStatus status,
-        final int sequenceNumber,
-        final long position,
-        final int metaDataLength)
+    class GapFillerChannel
     {
-        if (messageType == RESEND_REQUEST_MESSAGE_TYPE && status == MessageStatus.OK)
+        private GapFillerSession currentSession;
+        private ArrayDeque<GapFillerSession> enqueued;
+
+        void currentSession(final GapFillerSession currentSession)
         {
-            decoderBuffer.wrap(buffer);
-            final FixReplayerCodecs fixReplayerCodecs = fixSessionCodecsFactory.get(sessionId);
-            final AbstractResendRequestDecoder resendRequest = fixReplayerCodecs.resendRequest();
-            final GapFillEncoder encoder = fixReplayerCodecs.gapFillEncoder();
-
-            resendRequest.decode(decoderBuffer, offset, length);
-
-            final SessionHeaderDecoder reqHeader = resendRequest.header();
-            final int beginSeqNo = resendRequest.beginSeqNo();
-            final int endSeqNo = resendRequest.endSeqNo();
-            final int lastSentSeqNo = newSeqNo(connectionId);
-
-            // If the request was for an infinite replay then reply with the next expected sequence number
-            final int newSeqNo = endSeqNo == 0 ? lastSentSeqNo : endSeqNo;
-            final int gapFillMsgSeqNum = beginSeqNo;
-
-            encoder.setupMessage(reqHeader);
-            final long result = encoder.encode(gapFillMsgSeqNum, newSeqNo);
-            final int encodedLength = Encoder.length(result);
-            final int encodedOffset = Encoder.offset(result);
-            final long sentPosition = publication.saveMessage(
-                encoder.buffer(), encodedOffset, encodedLength,
-                libraryId, SEQUENCE_RESET_MESSAGE_TYPE, sessionId, sequenceIndex, connectionId,
-                MessageStatus.OK, gapFillMsgSeqNum);
-
-            if (Pressure.isBackPressured(sentPosition))
-            {
-                return Action.ABORT;
-            }
+            this.currentSession = currentSession;
         }
 
-        return Action.CONTINUE;
+        GapFillerSession currentSession()
+        {
+            return currentSession;
+        }
+
+        void enqueue(final GapFillerSession enqueuedSession)
+        {
+            if (null == enqueued)
+            {
+                enqueued = new ArrayDeque<>();
+            }
+            enqueued.add(enqueuedSession);
+        }
+
+        GapFillerSession pollEnqueued()
+        {
+            if (null == enqueued)
+            {
+                return null;
+            }
+            return enqueued.poll();
+        }
     }
 
-    public Action onILinkMessage(final long connectionId, final DirectBuffer buffer, final int offset)
+    class GapFillerSession
     {
-        return CONTINUE;
-    }
+        private enum State
+        {
+            INIT,
+            ON_START_REPLAY,
+            ON_GAP_FILL,
+            ON_SEND_COMPLETE,
+            DONE
+        }
 
-    private int newSeqNo(final long connectionId)
-    {
-        return senderSequenceNumbers.lastSentSequenceNumber(connectionId) + 1;
-    }
+        final long sessionId;
+        final long connectionId;
+        final int beginSeqNo;
+        final int endSeqNo;
+        final int sequenceIndex;
+        final long correlationId;
+        final MutableAsciiBuffer copiedBuffer;
+        private State state;
+        private FixReplayerCodecs fixReplayerCodecs;
 
-    public Action onDisconnect(final int libraryId, final long connectionId, final DisconnectReason reason)
-    {
-        return Action.CONTINUE;
+        GapFillerSession(
+            final long sessionId,
+            final long connectionId,
+            final int beginSeqNo,
+            final int endSeqNo,
+            final int sequenceIndex,
+            final long correlationId,
+            final MutableAsciiBuffer copiedBuffer)
+        {
+            this.sessionId = sessionId;
+            this.connectionId = connectionId;
+            this.beginSeqNo = beginSeqNo;
+            this.endSeqNo = endSeqNo;
+            this.sequenceIndex = sequenceIndex;
+            this.correlationId = correlationId;
+            this.copiedBuffer = copiedBuffer;
+            this.state = State.INIT;
+        }
+
+        boolean isDone()
+        {
+            return State.DONE == state;
+        }
+
+        int doWork()
+        {
+            return switch (state)
+            {
+                case INIT:
+                {
+                    final SenderSequenceNumber senderSequenceNumber =
+                        senderSequenceNumbers.senderSequenceNumber(connectionId);
+                    if (null == senderSequenceNumber)
+                    {
+                        yield 0;
+                    }
+
+                    if (senderSequenceNumber.fixP())
+                    {
+                        // It's a FIXP request, we don't support that configuration with no logging enabled yet.
+                        state = State.DONE;
+                        yield 0;
+                    }
+
+                    fixReplayerCodecs = fixSessionCodecsFactory.get(sessionId);
+                    if (null != fixReplayerCodecs)
+                    {
+                        state = State.ON_START_REPLAY;
+                        yield 1;
+                    }
+
+                    yield 0;
+                }
+
+                case ON_START_REPLAY:
+                {
+                    if (trySendStartReplay(sessionId, connectionId, correlationId))
+                    {
+                        state = State.ON_GAP_FILL;
+                        yield 1;
+                    }
+
+                    yield 0;
+                }
+
+                case ON_GAP_FILL:
+                {
+                    final AbstractResendRequestDecoder resendRequest = fixReplayerCodecs.resendRequest();
+                    final GapFillEncoder encoder = fixReplayerCodecs.gapFillEncoder();
+
+                    resendRequest.decode(copiedBuffer, 0, copiedBuffer.capacity());
+
+                    final SessionHeaderDecoder reqHeader = resendRequest.header();
+
+                    // If the request was for an infinite replay then reply with the next expected sequence number
+                    final int gapFillMsgSeqNum = beginSeqNo;
+                    encoder.setupMessage(reqHeader);
+                    final long result = encoder.encode(gapFillMsgSeqNum, endSeqNo + 1);
+                    final int encodedLength = Encoder.length(result);
+                    final int encodedOffset = Encoder.offset(result);
+                    final long sentPosition = publication.saveMessage(
+                        encoder.buffer(), encodedOffset, encodedLength,
+                        ENGINE_LIBRARY_ID, SEQUENCE_RESET_MESSAGE_TYPE, sessionId, sequenceIndex, connectionId,
+                        MessageStatus.OK, gapFillMsgSeqNum);
+
+                    if (0 < sentPosition)
+                    {
+                        state = State.ON_SEND_COMPLETE;
+                        yield 1;
+                    }
+
+                    yield 0;
+                }
+
+                case ON_SEND_COMPLETE:
+                {
+                    if (sendCompleteMessage(connectionId, correlationId))
+                    {
+                        state = State.DONE;
+                        yield 1;
+                    }
+
+                    yield 0;
+                }
+
+                case DONE:
+                {
+                    yield 0;
+                }
+            };
+        }
     }
 }

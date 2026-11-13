@@ -16,13 +16,12 @@
 package uk.co.real_logic.artio.engine.framer;
 
 import uk.co.real_logic.artio.engine.FixPConnectedSessionInfo;
-import uk.co.real_logic.artio.fixp.AbstractFixPParser;
-import uk.co.real_logic.artio.fixp.AbstractFixPProxy;
-import uk.co.real_logic.artio.fixp.FixPContext;
-import uk.co.real_logic.artio.fixp.FixPKey;
+import uk.co.real_logic.artio.fixp.*;
 import uk.co.real_logic.artio.messages.ConnectionType;
 import uk.co.real_logic.artio.messages.FixPProtocolType;
 import uk.co.real_logic.artio.util.MutableAsciiBuffer;
+
+import static uk.co.real_logic.artio.messages.DisconnectReason.ENGINE_SHUTDOWN;
 
 public class FixPGatewaySession extends GatewaySession implements FixPConnectedSessionInfo
 {
@@ -34,7 +33,7 @@ public class FixPGatewaySession extends GatewaySession implements FixPConnectedS
     private final FixPGatewaySessions gatewaySessions;
 
     private byte[] firstMessage;
-    private FixPContext context;
+    private InternalFixPContext context;
 
     FixPGatewaySession(
         final long connectionId,
@@ -58,21 +57,25 @@ public class FixPGatewaySession extends GatewaySession implements FixPConnectedS
         this.gatewaySessions = gatewaySessions;
     }
 
+    @Override
     public String address()
     {
         return address;
     }
 
+    @Override
     int poll(final long timeInMs, final long timeInNs)
     {
         return checkNoLogonDisconnect(timeInMs);
     }
 
+    @Override
     long lastLogonTime()
     {
         return 0;
     }
 
+    @Override
     void acceptorSequenceNumbers(final int lastSentSequenceNumber, final int lastReceivedSequenceNumber)
     {
     }
@@ -96,7 +99,17 @@ public class FixPGatewaySession extends GatewaySession implements FixPConnectedS
 
         return gatewaySessions.authenticate(
             sessionId, buffer, offset, messageSize, this, connectionId, channel, framer, protocolType,
-            context, fixPProxy);
+            context, fixPProxy, receiverEndPoint);
+    }
+
+    void setupOfflineSession(
+        final InternalFixPContext context,
+        final byte[] firstMessage,
+        final int libraryId)
+    {
+        this.context = context;
+        this.firstMessage = firstMessage;
+        libraryId(libraryId);
     }
 
     public FixPProtocolType protocolType()
@@ -121,6 +134,7 @@ public class FixPGatewaySession extends GatewaySession implements FixPConnectedS
         receiverEndPoint.authenticated();
     }
 
+    @Override
     public void onDisconnectReleasedByOwner()
     {
     }
@@ -131,10 +145,12 @@ public class FixPGatewaySession extends GatewaySession implements FixPConnectedS
         gatewaySessions.fixPContexts().updateContext(context);
     }
 
+    @Override
     public void close()
     {
     }
 
+    @Override
     public String toString()
     {
         return "FixPGatewaySession{" +
@@ -147,8 +163,31 @@ public class FixPGatewaySession extends GatewaySession implements FixPConnectedS
             '}';
     }
 
+    @Override
     public FixPKey key()
     {
         return context.key();
+    }
+
+    @Override
+    public boolean configureThrottle(final int throttleWindowInMs, final int throttleLimitOfMessages)
+    {
+        receiverEndPoint.configureThrottle(throttleWindowInMs, throttleLimitOfMessages);
+        return true;
+    }
+
+    @Override
+    public long startEndOfDay()
+    {
+        if (receiverEndPoint != null)
+        {
+            receiverEndPoint.completeDisconnect(ENGINE_SHUTDOWN);
+        }
+        return 1;
+    }
+
+    public boolean hasUnsentMessagesAtNegotiate()
+    {
+        return context.hasUnsentMessagesAtNegotiate();
     }
 }

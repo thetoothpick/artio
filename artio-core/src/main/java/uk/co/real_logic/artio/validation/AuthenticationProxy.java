@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,9 +19,10 @@ import uk.co.real_logic.artio.builder.Encoder;
 import uk.co.real_logic.artio.dictionary.FixDictionary;
 
 /**
- * Interface to notify the gateway whether a Logon should be authenticated or not. Either invoker accept or reject.
+ * Interface to notify the gateway whether a FIX Logon should be authenticated or not.
  *
- * Either only call the <code>accept </code>or the <code>reject()</code> method.
+ * Either only call the <code>accept </code>or the <code>reject()</code> method. See
+ * {@link AbstractAuthenticationProxy} for more options to invoke.
  */
 public interface AuthenticationProxy extends AbstractAuthenticationProxy
 {

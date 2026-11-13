@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -36,7 +36,7 @@ abstract class LibraryReply<T> implements Reply<T>
     boolean requiresResend;
     long correlationId;
 
-    private Exception error;
+    private Throwable error;
     private T result;
     private State state = State.EXECUTING;
 
@@ -62,16 +62,19 @@ abstract class LibraryReply<T> implements Reply<T>
         correlationId = libraryPoller.register(this);
     }
 
-    public Exception error()
+    @Override
+    public Throwable error()
     {
         return error;
     }
 
+    @Override
     public T resultIfPresent()
     {
         return result;
     }
 
+    @Override
     public State state()
     {
         return state;
@@ -83,7 +86,7 @@ abstract class LibraryReply<T> implements Reply<T>
         state = State.COMPLETED;
     }
 
-    void onError(final Exception error)
+    void onError(final Throwable error)
     {
         this.error = error;
         state = State.ERRORED;
@@ -109,6 +112,11 @@ abstract class LibraryReply<T> implements Reply<T>
      */
     boolean poll(final long timeInMs)
     {
+        if (!isExecuting())
+        {
+            return true;
+        }
+
         if (requiresResend)
         {
             sendMessage();
@@ -117,11 +125,6 @@ abstract class LibraryReply<T> implements Reply<T>
         if (timeInMs >= latestReplyArrivalTimeInMs)
         {
             return onTimeout();
-        }
-
-        if (!isExecuting())
-        {
-            return false;
         }
 
         return false;

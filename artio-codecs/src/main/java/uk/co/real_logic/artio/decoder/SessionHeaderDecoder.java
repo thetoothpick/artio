@@ -16,6 +16,8 @@
 package uk.co.real_logic.artio.decoder;
 
 import org.agrona.AsciiSequenceView;
+import uk.co.real_logic.artio.builder.Encoder;
+import uk.co.real_logic.artio.builder.SessionHeaderEncoder;
 import uk.co.real_logic.artio.util.AsciiBuffer;
 
 public interface SessionHeaderDecoder
@@ -26,6 +28,12 @@ public interface SessionHeaderDecoder
      * Resets the result of the decoder.
      */
     void reset();
+
+    StringBuilder appendTo(StringBuilder builder);
+
+    StringBuilder appendTo(StringBuilder builder, int level);
+
+    SessionHeaderEncoder toEncoder(Encoder encoder);
 
     char[] beginString();
 
@@ -41,7 +49,7 @@ public interface SessionHeaderDecoder
 
     String origSendingTimeAsString();
 
-    void origSendingTime(AsciiSequenceView view);
+    AsciiSequenceView origSendingTime(AsciiSequenceView view);
 
     int msgTypeLength();
 
@@ -68,7 +76,7 @@ public interface SessionHeaderDecoder
 
     String sendingTimeAsString();
 
-    void sendingTime(AsciiSequenceView view);
+    AsciiSequenceView sendingTime(AsciiSequenceView view);
 
     char[] senderCompID();
 
@@ -114,15 +122,15 @@ public interface SessionHeaderDecoder
 
     String targetLocationIDAsString();
 
-    void senderCompID(AsciiSequenceView view);
+    AsciiSequenceView senderCompID(AsciiSequenceView view);
 
-    void senderSubID(AsciiSequenceView view);
+    AsciiSequenceView senderSubID(AsciiSequenceView view);
 
-    void senderLocationID(AsciiSequenceView view);
+    AsciiSequenceView senderLocationID(AsciiSequenceView view);
 
-    void targetCompID(AsciiSequenceView view);
+    AsciiSequenceView targetCompID(AsciiSequenceView view);
 
-    void targetSubID(AsciiSequenceView view);
+    AsciiSequenceView targetSubID(AsciiSequenceView view);
 
-    void targetLocationID(AsciiSequenceView view);
+    AsciiSequenceView targetLocationID(AsciiSequenceView view);
 }

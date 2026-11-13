@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,6 +28,10 @@ public final class Dictionary
     private final String specType;
     private final int majorVersion;
     private final int minorVersion;
+
+    private String name;
+    private boolean shared;
+    private Dictionary sharedParent;
 
     public Dictionary(
         final List<Message> messages,
@@ -89,6 +93,42 @@ public final class Dictionary
         return specType;
     }
 
+    public String name()
+    {
+        return name;
+    }
+
+    public void name(final String name)
+    {
+        this.name = name;
+    }
+
+    public Dictionary sharedParent()
+    {
+        return sharedParent;
+    }
+
+    public boolean hasSharedParent()
+    {
+        return sharedParent() != null;
+    }
+
+    public void sharedParent(final Dictionary sharedParent)
+    {
+        this.sharedParent = sharedParent;
+    }
+
+    public boolean shared()
+    {
+        return shared;
+    }
+
+    public void shared(final boolean shared)
+    {
+        this.shared = shared;
+    }
+
+    @Override
     public String toString()
     {
         return "DataDictionary{" +
@@ -98,6 +138,9 @@ public final class Dictionary
                 ", components=" + components +
                 ", header=" + header +
                 ", trailer=" + trailer +
+                ", name=" + name +
+                ", shared=" + shared +
+                ", sharedParent=" + sharedParent +
                 '}';
     }
 

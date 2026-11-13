@@ -1,3 +1,18 @@
+/*
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package uk.co.real_logic.artio.example_buyer;
 
 import io.aeron.logbuffer.ControlledFragmentHandler.Action;
@@ -43,6 +58,7 @@ public class Buyer implements LibraryConnectHandler, SessionHandler, SessionAcqu
     private Reply<Session> initiateReply;
     private Session session;
 
+    @Override
     public void onConnect(final FixLibrary library)
     {
         System.out.println("Library Connected");
@@ -71,6 +87,9 @@ public class Buyer implements LibraryConnectHandler, SessionHandler, SessionAcqu
             case SESSION_CONNECTED:
                 sendOrder();
                 return 1;
+
+            default:
+                break;
         }
 
         return 0;
@@ -89,7 +108,7 @@ public class Buyer implements LibraryConnectHandler, SessionHandler, SessionAcqu
             else
             {
                 System.err.printf("Session connect failed %s%n", initiateReply.state());
-                final Exception error = initiateReply.error();
+                final Throwable error = initiateReply.error();
                 if (error != null)
                 {
                     error.printStackTrace();
@@ -140,6 +159,7 @@ public class Buyer implements LibraryConnectHandler, SessionHandler, SessionAcqu
         }
     }
 
+    @Override
     public Action onMessage(
         final DirectBuffer buffer,
         final int offset,
@@ -167,14 +187,17 @@ public class Buyer implements LibraryConnectHandler, SessionHandler, SessionAcqu
         return CONTINUE;
     }
 
+    @Override
     public void onTimeout(final int libraryId, final Session session)
     {
     }
 
+    @Override
     public void onSlowStatus(final int libraryId, final Session session, final boolean hasBecomeSlow)
     {
     }
 
+    @Override
     public Action onDisconnect(final int libraryId, final Session session, final DisconnectReason reason)
     {
         state = State.LIBRARY_CONNECTED;
@@ -182,13 +205,14 @@ public class Buyer implements LibraryConnectHandler, SessionHandler, SessionAcqu
         return CONTINUE;
     }
 
+    @Override
     public void onSessionStart(final Session session)
     {
     }
 
+    @Override
     public SessionHandler onSessionAcquired(final Session session, final SessionAcquiredInfo isSlow)
     {
         return this;
     }
-
 }

@@ -64,6 +64,7 @@ public class FixAdminSession implements SessionInfo
     /**
      * {@inheritDoc}
      */
+    @Override
     public long sessionId()
     {
         return sessionId;
@@ -72,6 +73,7 @@ public class FixAdminSession implements SessionInfo
     /**
      * {@inheritDoc}
      */
+    @Override
     public CompositeKey sessionKey()
     {
         return sessionKey;
@@ -80,6 +82,7 @@ public class FixAdminSession implements SessionInfo
     /**
      * {@inheritDoc}
      */
+    @Override
     public int sequenceIndex()
     {
         return sequenceIndex;
@@ -167,7 +170,7 @@ public class FixAdminSession implements SessionInfo
      * Gets whether the session is slow or not. If the session is not currently connected then this method will
      * return true.
      *
-     * @see <a href="https://github.com/real-logic/artio/wiki/Performance-and-Fairness#slow-consumer-support">
+     * @see <a href="https://github.com/artiofix/artio/wiki/Performance-and-Fairness#slow-consumer-support">
      *     Slow Consumer Support.</a>
      * @return true if slow, false otherwise.
      */
@@ -176,6 +179,7 @@ public class FixAdminSession implements SessionInfo
         return isSlow;
     }
 
+    @Override
     public String toString()
     {
         return "FixAdminSession{" +

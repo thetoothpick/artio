@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,41 +15,52 @@
  */
 package uk.co.real_logic.artio.fields;
 
-import org.agrona.concurrent.UnsafeBuffer;
-import org.junit.Test;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
-import org.junit.runners.Parameterized.Parameters;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
+
+import java.util.stream.Stream;
 import uk.co.real_logic.artio.util.MutableAsciiBuffer;
 
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static uk.co.real_logic.artio.fields.LocalMktDateDecoderValidCasesTest.toLocalDay;
 import static uk.co.real_logic.artio.util.CustomMatchers.sequenceEqualsAscii;
 
-@RunWith(Parameterized.class)
 public class LocalMktDateEncoderValidCasesTest
 {
-    private final String timestamp;
+    private final MutableAsciiBuffer timestampBytes = new MutableAsciiBuffer(new byte[LocalMktDateEncoder.LENGTH]);
 
-    @Parameters(name = "{0}")
-    public static Iterable<Object> data()
+    private int localDays;
+
+    public static Stream<Arguments> data()
     {
         return LocalMktDateDecoderValidCasesTest.data();
     }
 
-    public LocalMktDateEncoderValidCasesTest(final String timestamp)
+    private void prepare(final String timestamp)
     {
-        this.timestamp = timestamp;
+        localDays = toLocalDay(timestamp);
     }
 
-    @Test
-    public void canParseTimestamp()
+    @ParameterizedTest
+    @MethodSource(value = "data")
+    public void canParseTimestamp(final String timestamp)
     {
-        final int localDays = toLocalDay(timestamp);
-
-        final UnsafeBuffer buffer = new UnsafeBuffer(new byte[LocalMktDateEncoder.LENGTH]);
-        final MutableAsciiBuffer timestampBytes = new MutableAsciiBuffer(buffer);
+        prepare(timestamp);
         LocalMktDateEncoder.encode(localDays, timestampBytes, 0);
+
+        assertThat(timestampBytes, sequenceEqualsAscii(timestamp, 0, LocalMktDateEncoder.LENGTH));
+    }
+
+    @ParameterizedTest
+    @MethodSource(value = "data")
+    public void canParseTimestampFromByteArray(final String timestamp)
+    {
+        prepare(timestamp);
+        final LocalMktDateEncoder encoder = new LocalMktDateEncoder();
+        final int length = encoder.encode(localDays, timestampBytes.byteArray());
+        assertEquals(LocalMktDateEncoder.LENGTH, length);
 
         assertThat(timestampBytes, sequenceEqualsAscii(timestamp, 0, LocalMktDateEncoder.LENGTH));
     }

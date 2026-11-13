@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,58 +15,38 @@
  */
 package uk.co.real_logic.artio.engine.framer;
 
-import org.agrona.LangUtil;
-
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedChannelException;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
-import java.nio.channels.SocketChannel;
 
-public class TcpChannel implements AutoCloseable
+public abstract class TcpChannel implements AutoCloseable
 {
-    private final SocketChannel socketChannel;
-    private final String remoteAddress;
+    public static final int UNKNOWN_SEQ_NUM = -1;
 
-    public TcpChannel(final SocketChannel socketChannel) throws IOException
+    protected final String remoteAddress;
+
+    public TcpChannel(final String remoteAddress) throws IOException
     {
-        this.socketChannel = socketChannel;
-        remoteAddress = socketChannel.getRemoteAddress().toString();
+        this.remoteAddress = remoteAddress;
     }
 
-    public String remoteAddress()
+    public String remoteAddr()
     {
         return remoteAddress;
     }
 
-    public SelectionKey register(final Selector sel, final int ops, final Object att) throws ClosedChannelException
-    {
-        return socketChannel.register(sel, ops, att);
-    }
+    public abstract SelectionKey register(Selector sel, int ops, Object att)
+        throws ClosedChannelException;
 
-    public int write(final ByteBuffer src) throws IOException
-    {
-        return socketChannel.write(src);
-    }
+    // Any subclass should maintain the API that negative numbers of bytes are never returned
+    public abstract int write(ByteBuffer src, int seqNum, boolean replay) throws IOException;
 
-    public int read(final ByteBuffer dst) throws IOException
-    {
-        return socketChannel.read(dst);
-    }
+    public abstract int read(ByteBuffer dst) throws IOException;
 
-    public void close()
-    {
-        if (socketChannel.isOpen())
-        {
-            try
-            {
-                socketChannel.close();
-            }
-            catch (final IOException ex)
-            {
-                LangUtil.rethrowUnchecked(ex);
-            }
-        }
-    }
+    @Override
+    public abstract void close();
+
+    public abstract void onReplayComplete(long correlationId);
 }

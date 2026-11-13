@@ -16,6 +16,9 @@
 package uk.co.real_logic.artio.admin;
 
 import io.aeron.Aeron;
+import io.aeron.CommonContext;
+import org.agrona.Strings;
+import org.agrona.SystemUtil;
 import org.agrona.concurrent.EpochNanoClock;
 import org.agrona.concurrent.IdleStrategy;
 import org.agrona.concurrent.OffsetEpochNanoClock;
@@ -30,7 +33,7 @@ import static uk.co.real_logic.artio.CommonConfiguration.backoffIdleStrategy;
 
 /**
  * Configuration class used to configure an {@link ArtioAdmin} instance.
- *
+ * <p>
  * If you're using the default configuration for your {@link uk.co.real_logic.artio.engine.FixEngine} then it is only
  * necessary to ensure that the {@link #aeronChannel(String)} is configured correctly - the other defaults should
  * work out of the box.
@@ -52,6 +55,11 @@ public final class ArtioAdminConfiguration
      */
     public static final String AERON_CHANNEL_PROP = "fix.admin.aeron_channel";
 
+    /**
+     * Property name for the system property to override the connect timeout.
+     */
+    public static final String CONNECT_TIMEOUT_PROP = "fix.admin.connect_timeout";
+
     public static final int DEFAULT_INBOUND_ADMIN_STREAM_ID = 21;
     public static final int DEFAULT_OUTBOUND_ADMIN_STREAM_ID = 22;
 
@@ -64,6 +72,7 @@ public final class ArtioAdminConfiguration
     private int outboundAdminStream = getInteger(OUTBOUND_STREAM_ID_PROP, DEFAULT_OUTBOUND_ADMIN_STREAM_ID);
     private String aeronChannel = System.getProperty(AERON_CHANNEL_PROP, IPC_CHANNEL);
     private long replyTimeoutInNs = TimeUnit.MILLISECONDS.toNanos(DEFAULT_REPLY_TIMEOUT_IN_MS);
+    private long connectTimeoutNs = SystemUtil.getDurationInNanos(CONNECT_TIMEOUT_PROP, TimeUnit.SECONDS.toNanos(5));
 
     /**
      * Sets the {@link IdleStrategy} used by blocking Admin operations.
@@ -135,6 +144,18 @@ public final class ArtioAdminConfiguration
     }
 
     /**
+     * The timeout to for establishing connection to the {@link uk.co.real_logic.artio.engine.FixEngine}.
+     *
+     * @param connectTimeoutNs for connecting to the Fix Engine.
+     * @return this
+     */
+    public ArtioAdminConfiguration connectTimeoutNs(final long connectTimeoutNs)
+    {
+        this.connectTimeoutNs = connectTimeoutNs;
+        return this;
+    }
+
+    /**
      * Sets the clock used in order to calculate reply timeouts.
      *
      * @param epochNanoClock the clock used in order to calculate reply timeouts.
@@ -181,6 +202,11 @@ public final class ArtioAdminConfiguration
         return replyTimeoutInNs;
     }
 
+    public long connectTimeoutNs()
+    {
+        return connectTimeoutNs;
+    }
+
     void conclude()
     {
         if (isConcluded.compareAndSet(false, true))
@@ -194,11 +220,43 @@ public final class ArtioAdminConfiguration
             {
                 epochNanoClock(new OffsetEpochNanoClock());
             }
+
+            if (connectTimeoutNs < 0)
+            {
+                throw new IllegalArgumentException("connectTimeoutNs cannot be negative: " + connectTimeoutNs);
+            }
+
+            if (Strings.isEmpty(aeronContext.clientName()))
+            {
+                aeronContext.clientName("fix-artio-admin");
+            }
+
+            if (CommonContext.shouldPrintConfigurationOnStart())
+            {
+                System.out.println(this);
+            }
         }
         else
         {
             throw new IllegalStateException(
                 "This configuration has already been concluded, are you trying to re-use it?");
         }
+    }
+
+    @Override
+    public String toString()
+    {
+        return "ArtioAdminConfiguration" +
+            "\n{" +
+            "\n    isConcluded=" + isConcluded +
+            "\n    aeronContext=" + aeronContext +
+            "\n    idleStrategy=" + idleStrategy +
+            "\n    epochNanoClock=" + epochNanoClock +
+            "\n    inboundAdminStream=" + inboundAdminStream +
+            "\n    outboundAdminStream=" + outboundAdminStream +
+            "\n    aeronChannel='" + aeronChannel + '\'' +
+            "\n    replyTimeoutInNs=" + replyTimeoutInNs +
+            "\n    connectTimeoutNs=" + connectTimeoutNs +
+            "\n}";
     }
 }

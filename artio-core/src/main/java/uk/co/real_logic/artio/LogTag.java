@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,7 +30,7 @@ public enum LogTag
      * This logs direct reads and writes of messages from TCP sockets. These lines are labelled "Read" and
      * "Written".
      *
-     * NB: TCP reads may read multiple messages at the same time. This isn't a bug.
+     * NB: TCP reads may read partial messages or multiple messages at the same time. This isn't a bug.
      */
     FIX_MESSAGE_TCP,
     /**
@@ -41,10 +41,21 @@ public enum LogTag
     FIX_CONNECTION,
     FIX_TEST,
     GATEWAY_MESSAGE,
+    /**
+     * This logs the flow of messages when application heartbeat messages are sent.
+     */
     APPLICATION_HEARTBEAT,
+
+    /**
+     * This logs the flow of messages when application heartbeat messages are attempted but not sent. This
+     * could become quite spammy in the case that you have a lot of back-pressure
+     */
+    APPLICATION_HEARTBEAT_ATTEMPT,
+
     POSITION,
     CATCHUP,
     REPLAY,
+    REPLAY_MESSAGE,
     REPLAY_ATTEMPT,
     INDEX,
     LIBRARY_MANAGEMENT,
@@ -94,8 +105,29 @@ public enum LogTag
     /**
      * Prints out the FIXP business layer messages.
      */
-    FIXP_BUSINESS;
+    FIXP_BUSINESS,
 
+    /**
+     * Prints out debug logging when using the {@link uk.co.real_logic.artio.engine.logger.FixArchiveScanner} and
+     * associated {@link uk.co.real_logic.artio.engine.logger.FixArchivePrinter}
+     */
+    ARCHIVE_SCAN,
+
+    /**
+     * Prints out information associated with debugging reproduction runs. See
+     * {@link uk.co.real_logic.artio.engine.EngineConfiguration#reproduceInbound(long, long)}.
+     */
+    REPRODUCTION,
+
+    /**
+     * Used by tests that perform reproduction.
+     */
+    REPRODUCTION_TEST,
+
+    /**
+     * Specifically for logging the cause of slow consumer disconnects.
+     */
+    SLOW_CONSUMER;
 
     private final char[] logStr;
 

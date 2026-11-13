@@ -34,7 +34,10 @@ import uk.co.real_logic.artio.storage.messages.FixPContextWrapperEncoder;
 import java.util.*;
 import java.util.function.Function;
 
+import static uk.co.real_logic.artio.AtomicBuffers.checkAligned;
+import static uk.co.real_logic.artio.GatewayProcess.NO_CONNECTION_ID;
 import static uk.co.real_logic.artio.dictionary.generation.CodecUtil.MISSING_LONG;
+import static uk.co.real_logic.artio.fixp.FixPFirstMessageResponse.*;
 
 
 public class FixPContexts implements SessionContexts
@@ -55,7 +58,7 @@ public class FixPContexts implements SessionContexts
     private final int actingVersion = contextWrapperEncoder.sbeSchemaVersion();
 
     private final Long2LongHashMap authenticatedSessionIdToConnectionId = new Long2LongHashMap(MISSING_LONG);
-    private final Map<FixPKey, FixPContext> keyToContext = new HashMap<>();
+    private final Map<FixPKey, InternalFixPContext> keyToContext = new HashMap<>();
     private final List<FixPSessionInfo> sessionInfos = new ArrayList<>();
 
     private int offset;
@@ -63,7 +66,7 @@ public class FixPContexts implements SessionContexts
     FixPContexts(final MappedFile mappedFile, final ErrorHandler errorHandler, final EpochNanoClock epochNanoClock)
     {
         this.mappedFile = mappedFile;
-        this.buffer = mappedFile.buffer();
+        this.buffer = checkAligned(mappedFile.buffer());
         this.errorHandler = errorHandler;
         this.epochNanoClock = epochNanoClock;
         loadBuffer();
@@ -101,16 +104,16 @@ public class FixPContexts implements SessionContexts
 
             final FixPProtocolType type = FixPProtocolType.get(protocolTypeValue);
             final AbstractFixPStorage storage = lookupStorage(type);
-            final FixPContext context = storage.loadContext(buffer, offset, actingVersion);
+            final InternalFixPContext context = storage.loadContext(buffer, offset, actingVersion);
             addContext(context);
 
             offset += contextLength;
         }
     }
 
-    private void addContext(final FixPContext context)
+    private void addContext(final InternalFixPContext context)
     {
-        final FixPContext oldContext = keyToContext.put(context.key(), context);
+        final InternalFixPContext oldContext = keyToContext.put(context.key(), context);
         sessionInfos.add(new InfoWrapper(context));
         if (oldContext != null)
         {
@@ -128,12 +131,12 @@ public class FixPContexts implements SessionContexts
         return FixPProtocolFactory.make(type, errorHandler).makeStorage(epochNanoClock);
     }
 
-    FixPContext calculateInitiatorContext(
+    InternalFixPContext calculateInitiatorContext(
         final FixPKey key, final boolean reestablishConnection)
     {
         Verify.notNull(key, "key");
 
-        final FixPContext context = keyToContext.get(key);
+        final InternalFixPContext context = keyToContext.get(key);
 
         if (context != null)
         {
@@ -145,24 +148,24 @@ public class FixPContexts implements SessionContexts
         return allocateInitiatorContext(key);
     }
 
-    private FixPContext allocateInitiatorContext(final FixPKey key)
+    private InternalFixPContext allocateInitiatorContext(final FixPKey key)
     {
-        final FixPContext context = newInitiatorContext(key);
+        final InternalFixPContext context = newInitiatorContext(key);
         addContext(context);
         return context;
     }
 
-    private FixPContext newInitiatorContext(final FixPKey key)
+    private InternalFixPContext newInitiatorContext(final FixPKey key)
     {
         return lookupStorage(key.protocolType()).newInitiatorContext(key, offset + WRAPPER_LENGTH);
     }
 
-    public void updateContext(final FixPContext context)
+    public void updateContext(final InternalFixPContext context)
     {
         lookupStorage(context.protocolType()).updateContext(context, buffer);
     }
 
-    public void saveNewContext(final FixPContext context)
+    public void saveNewContext(final InternalFixPContext context)
     {
         final FixPProtocolType type = context.protocolType();
         final AbstractFixPStorage storage = lookupStorage(type);
@@ -189,16 +192,17 @@ public class FixPContexts implements SessionContexts
     }
 
     public FixPFirstMessageResponse onAcceptorLogon(
-        final long sessionId, final FixPContext context, final long connectionId)
+        final long sessionId, final InternalFixPContext context, final long connectionId,
+        final boolean ignoreFromNegotiate)
     {
         final long duplicateConnection = authenticatedSessionIdToConnectionId.get(sessionId);
-        if (duplicateConnection == MISSING_LONG)
+        final FixPKey key = context.key();
+        final FixPContext oldContext = keyToContext.get(key);
+        if (duplicateConnection == MISSING_LONG || duplicateConnection == NO_CONNECTION_ID)
         {
             authenticatedSessionIdToConnectionId.put(sessionId, connectionId);
 
-            final FixPKey key = context.key();
-            final FixPContext oldContext = keyToContext.get(key);
-            final FixPFirstMessageResponse rejectReason = context.checkAccept(oldContext);
+            final FixPFirstMessageResponse rejectReason = context.checkAccept(oldContext, ignoreFromNegotiate);
             if (rejectReason == FixPFirstMessageResponse.OK)
             {
                 if (oldContext == null)
@@ -215,7 +219,13 @@ public class FixPContexts implements SessionContexts
         }
         else
         {
-            return FixPFirstMessageResponse.NEGOTIATE_DUPLICATE_ID;
+            if (context.fromNegotiate())
+            {
+                return context.compareVersion(oldContext) == 0 ?
+                    NEGOTIATE_DUPLICATE_ID : NEGOTIATE_DUPLICATE_ID_BAD_VER;
+            }
+
+            return ESTABLISH_DUPLICATE_ID;
         }
     }
 
@@ -238,27 +248,34 @@ public class FixPContexts implements SessionContexts
         return sessionInfos;
     }
 
+    @Override
     public void sequenceReset(final long sessionId, final long resetTimeInNs)
     {
-        final FixPContext context = lookupContext(sessionId);
+        final InternalFixPContext context = lookupContext(sessionId);
         if (context != null)
         {
             context.onEndSequence();
             updateContext(context);
         }
+        else
+        {
+            errorHandler.onError(new IllegalArgumentException(
+                "Unable to reset sequence number for " + sessionId + " unknown session"));
+        }
     }
 
+    @Override
     public boolean isKnownSessionId(final long sessionId)
     {
         return lookupContext(sessionId) != null;
     }
 
-    private FixPContext lookupContext(final long sessionId)
+    InternalFixPContext lookupContext(final long sessionId)
     {
-        final Iterator<Map.Entry<FixPKey, FixPContext>> it = keyToContext.entrySet().iterator();
+        final Iterator<Map.Entry<FixPKey, InternalFixPContext>> it = keyToContext.entrySet().iterator();
         while (it.hasNext())
         {
-            final Map.Entry<FixPKey, FixPContext> entry = it.next();
+            final Map.Entry<FixPKey, InternalFixPContext> entry = it.next();
             if (entry.getKey().sessionIdIfExists() == sessionId)
             {
                 return entry.getValue();
@@ -267,6 +284,7 @@ public class FixPContexts implements SessionContexts
         return null;
     }
 
+    @Override
     public boolean isAuthenticated(final long sessionId)
     {
         return authenticatedSessionIdToConnectionId.containsKey(sessionId);
@@ -281,11 +299,13 @@ public class FixPContexts implements SessionContexts
             this.context = context;
         }
 
+        @Override
         public FixPKey key()
         {
             return context.key();
         }
 
+        @Override
         public String toString()
         {
             return "InfoWrapper{" +

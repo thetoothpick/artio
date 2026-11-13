@@ -18,9 +18,10 @@ package uk.co.real_logic.artio.engine.framer;
 import org.agrona.concurrent.EpochNanoClock;
 import uk.co.real_logic.artio.fixp.FixPFirstMessageResponse;
 import uk.co.real_logic.artio.fixp.FixPContext;
+import uk.co.real_logic.artio.fixp.InternalFixPContext;
 import uk.co.real_logic.artio.messages.FixPProtocolType;
 
-public final class ILink3Context implements FixPContext
+public final class ILink3Context implements InternalFixPContext
 {
     private final int offset;
 
@@ -111,18 +112,25 @@ public final class ILink3Context implements FixPContext
         return offset;
     }
 
-    public void confirmUuid(final FixPContexts fixPContexts)
+    @Override
+    public boolean onInitiatorNegotiateResponse()
     {
         uuid = connectUuid;
         lastUuid = connectLastUuid;
 
-        if (lastUuid == 0)
+        return lastUuid == 0;
+    }
+
+    @Override
+    public void onInitiatorDisconnect()
+    {
+        if (backupConnected)
         {
-            fixPContexts.saveNewContext(this);
+            backupConnected(false);
         }
         else
         {
-            fixPContexts.updateContext(this);
+            primaryConnected(false);
         }
     }
 
@@ -146,11 +154,25 @@ public final class ILink3Context implements FixPContext
         return connectUuid;
     }
 
-    public FixPFirstMessageResponse checkAccept(final FixPContext context)
+    @Override
+    public FixPFirstMessageResponse checkAccept(final FixPContext context, final boolean ignoreFromNegotiate)
     {
         throw new UnsupportedOperationException();
     }
 
+    @Override
+    public int compareVersion(final FixPContext oldContext)
+    {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public boolean fromNegotiate()
+    {
+        return newlyAllocated;
+    }
+
+    @Override
     public void initiatorReconnect(final boolean reestablishConnection)
     {
         final long connectLastUuid = uuid();
@@ -173,21 +195,25 @@ public final class ILink3Context implements FixPContext
         }
     }
 
+    @Override
     public FixPProtocolType protocolType()
     {
         return FixPProtocolType.ILINK_3;
     }
 
+    @Override
     public void onEndSequence()
     {
         // Never happens in iLink3 as it doesn't support the FinishedSending and FinishedReceiving abstractions.
     }
 
+    @Override
     public ILink3Key key()
     {
         return key;
     }
 
+    @Override
     public String toString()
     {
         return "ILink3Context{connectLastUuid=" + connectLastUuid +
@@ -198,5 +224,22 @@ public final class ILink3Context implements FixPContext
             ", primaryConnected=" + primaryConnected +
             ", backupConnected=" + backupConnected +
             '}';
+    }
+
+    @Override
+    public long surrogateSessionId()
+    {
+        return connectUuid;
+    }
+
+    @Override
+    public boolean hasUnsentMessagesAtNegotiate()
+    {
+        return false;
+    }
+
+    @Override
+    public void validate(final Enum<?> rejectCode)
+    {
     }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@ import static uk.co.real_logic.artio.fields.CalendricalUtil.*;
 import static uk.co.real_logic.artio.fields.UtcDateOnlyDecoder.LENGTH;
 
 /**
- * Parser for Fix's UTC timestamps - see http://fixwiki.org/fixwiki/UTCTimestampDataType for details
+ * Parser for Fix's UTC timestamps.
  * <p>
  * Equivalent to a Java format string of "yyyyMMdd-HH:mm:ss[.SSS]". The builtin parsers could cope with
  * this situation, but allocate and perform poorly.
@@ -98,6 +98,7 @@ public final class UtcTimestampDecoder
      * @param length the length of the FIX encoded value in bytes / ASCII characters
      * @param strict if length of FIX encoded value has to be checked to match FIX specification
      * @return the number of milliseconds since the Unix Epoch that represents this timestamp
+     * @throws NumberFormatException if the value in the buffer isn't a valid timestamp.
      */
     public static long decode(final AsciiBuffer timestamp, final int offset, final int length, final boolean strict)
     {
@@ -113,6 +114,7 @@ public final class UtcTimestampDecoder
      * @param length the length of the FIX encoded value in bytes / ASCII characters
      * @param strict if length of FIX encoded value has to be checked to match FIX specification
      * @return the number of microseconds since the Unix Epoch that represents this timestamp
+     * @throws NumberFormatException if the value in the buffer isn't a valid timestamp.
      */
     public static long decodeMicros(final AsciiBuffer timestamp, final int offset, final int length,
         final boolean strict)
@@ -129,6 +131,7 @@ public final class UtcTimestampDecoder
      * @param length the length of the FIX encoded value in bytes / ASCII characters
      * @param strict if length of FIX encoded value has to be checked to match FIX specification
      * @return the number of nanoseconds since the Unix Epoch that represents this timestamp
+     * @throws NumberFormatException if the value in the buffer isn't a valid timestamp.
      */
     public static long decodeNanos(final AsciiBuffer timestamp, final int offset, final int length,
         final boolean strict)

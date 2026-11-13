@@ -1,5 +1,5 @@
 /*
- * Copyright 2020 Adaptive Financial Consulting Ltd.
+ * Copyright 2020-2021 Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,12 +15,14 @@
  */
 package uk.co.real_logic.artio.dictionary.generation;
 
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileNotFoundException;
-import java.io.InputStream;
+import org.agrona.generation.OutputManager;
+import org.agrona.generation.PackageOutputManager;
 
-public class CodecConfiguration
+import java.io.InputStream;
+import java.util.function.BiFunction;
+
+
+public final class CodecConfiguration
 {
     /**
      * Boolean system property to turn on or off duplicated fields validation. Defaults to false.
@@ -43,31 +45,86 @@ public class CodecConfiguration
      * </pre>
      */
     public static final String FIX_CODECS_ALLOW_DUPLICATE_FIELDS_PROPERTY = "fix.codecs.allow_duplicate_fields";
+
+    /**
+     * Boolean system property to avoid throwing when an optional string field is unset.
+     * <p>
+     * This is useful to call getters accepting an {@link org.agrona.AsciiSequenceView}
+     * without checking whether the field is set.
+     */
+    public static final String WRAP_EMPTY_BUFFER = "fix.codecs.wrap_empty_buffer";
+    public static final String ALLOW_EMPTY_TAGS = "fix.codecs.allow_empty_tags";
     public static final String PARENT_PACKAGE_PROPERTY = "fix.codecs.parent_package";
     public static final String FLYWEIGHTS_ENABLED_PROPERTY = "fix.codecs.flyweight";
     public static final String REJECT_UNKNOWN_ENUM_VALUE_PROPERTY = "reject.unknown.enum.value";
+    public static final String FLOAT_OVERFLOW_HANDLER_PROPERTY = "fix.codecs.float_overflow_handler";
+    public static final String FIX_TAGS_IN_JAVADOC = "fix.codecs.tags_in_javadoc";
 
     public static final String DEFAULT_PARENT_PACKAGE = "uk.co.real_logic.artio";
+    public static final String DEFAULT_FIX_TAGS_IN_JAVADOC = "true";
 
     private String parentPackage = System.getProperty(PARENT_PACKAGE_PROPERTY, DEFAULT_PARENT_PACKAGE);
     private boolean flyweightsEnabled = Boolean.getBoolean(FLYWEIGHTS_ENABLED_PROPERTY);
-    private boolean allowDuplicateFields = Boolean.getBoolean(FIX_CODECS_ALLOW_DUPLICATE_FIELDS_PROPERTY);
+    private boolean wrapEmptyBuffer = Boolean.getBoolean(WRAP_EMPTY_BUFFER);
+    private boolean allowEmptyTags = Boolean.getBoolean(ALLOW_EMPTY_TAGS);
+    private boolean fixTagsInJavadoc = Boolean.parseBoolean(System.getProperty(
+        FIX_TAGS_IN_JAVADOC, DEFAULT_FIX_TAGS_IN_JAVADOC));
+    private SharedCodecConfiguration sharedCodecConfiguration;
 
     private String codecRejectUnknownEnumValueEnabled;
     private String outputPath;
-    private String[] fileNames;
-    private InputStream[] fileStreams;
+
+    private BiFunction<String, String, OutputManager> outputManagerFactory = PackageOutputManager::new;
+    private final GeneratorDictionaryConfiguration nonSharedDictionary =
+        new GeneratorDictionaryConfiguration(null, null, null,
+        Boolean.getBoolean(FIX_CODECS_ALLOW_DUPLICATE_FIELDS_PROPERTY));
+    private String decimalFloatOverflowHandler = null;
 
     public CodecConfiguration()
     {
     }
 
+    /**
+     * Sets the output path where codecs are generated. This should be a valid path on your local filesystem where the
+     * codec generator has the ability to write files. Required.
+     *
+     * If this doesn't already exist it will be created.
+     *
+     * @param outputPath the output path where codecs are generated
+     * @return this
+     */
     public CodecConfiguration outputPath(final String outputPath)
     {
         this.outputPath = outputPath;
         return this;
     }
 
+    /**
+     * Sets the full qualified class name of a <code>{@link uk.co.real_logic.artio.util.float_parsing.DecimalFloatOverflowHandler}</code> implementation.
+     * If not set, the default behaviour is executed when there's an overflow.
+     * @param decimalFloatOverflowHandler full qualified class name of a DecimalFloat overflow handler
+     * @return this
+     */
+    public CodecConfiguration decimalFloatOverflowHandler(
+        final String decimalFloatOverflowHandler)
+    {
+        this.decimalFloatOverflowHandler = decimalFloatOverflowHandler;
+        return this;
+    }
+
+    public String getDecimalFloatOverflowHandler()
+    {
+        return decimalFloatOverflowHandler;
+    }
+
+    /**
+     * Sets the parent package where classes are generated. Optional, defaults to {@link #DEFAULT_PARENT_PACKAGE}.
+     * Different parent packages can be used to use multiple different fix dictionary versions, see the
+     * <a href="https://github.com/artiofix/artio/wiki/Multiple-FIX-Versions">wiki</a> for details.
+     *
+     * @param parentPackage the parent package where classes are generated.
+     * @return this
+     */
     public CodecConfiguration parentPackage(final String parentPackage)
     {
         this.parentPackage = parentPackage;
@@ -80,21 +137,92 @@ public class CodecConfiguration
         return this;
     }
 
+    /**
+     * Suppresses checks for the presence of optional string fields (i.e. no exception is
+     * thrown when unset, instead the AsciiSequenceView wraps an empty buffer).
+     *
+     * Defaults to the value of {@link #WRAP_EMPTY_BUFFER} system property.
+     *
+     * @param wrapEmptyBuffer true to suppress check of optional strings, false to keep checking (default)
+     * @return this
+     */
+    public CodecConfiguration wrapEmptyBuffer(final boolean wrapEmptyBuffer)
+    {
+        this.wrapEmptyBuffer = wrapEmptyBuffer;
+        return this;
+    }
+
+    /**
+     * Suppresses checks for empty tags, eg |1234=|
+     * instead of rejecting when tag is empty, treat the tag as absent
+     *
+     * Defaults to the value of {@link #ALLOW_EMPTY_TAGS} system property.
+     *
+     * @param allowEmptyTags true to suppress check of empty tags, false to keep checking (default)
+     * @return this
+     */
+    public CodecConfiguration allowEmptyTags(final boolean allowEmptyTags)
+    {
+        this.allowEmptyTags = allowEmptyTags;
+        return this;
+    }
+
+    /**
+     * Allow duplicate fields. Executable documentation can be found in the test "DuplicateFieldsTest".
+     *
+     * Defaults to the value of {@link #FIX_CODECS_ALLOW_DUPLICATE_FIELDS_PROPERTY} if set.
+     *
+     * Can be overridden for individual dictionaries in shared codec mode using
+     * {@link SharedCodecConfiguration#withDictionary(String, boolean, String...)} and
+     * {@link SharedCodecConfiguration#withDictionary(String, boolean, InputStream...)}. If not overridden
+     * then shared codecs default to this value.
+     *
+     * @param allowDuplicateFields true to enable, false to disable
+     * @return this
+     */
     public CodecConfiguration allowDuplicateFields(final boolean allowDuplicateFields)
     {
-        this.allowDuplicateFields = allowDuplicateFields;
+        nonSharedDictionary.allowDuplicateFields(allowDuplicateFields);
         return this;
     }
 
+    /**
+     * Provide the XML file, or files, that are used to generate the Dictionaries. Multiple dictionary files can be
+     * used to provide split data and transport XML files as used by FIX 5.0 / FIXT. If you want to generate a shared
+     * dictionary then please use {@link SharedCodecConfiguration#withDictionary(String, boolean, String...)} method and not
+     * this one. {@link #fileStreams(InputStream...)} is an alternative configuration option that lets you provide
+     * inputstreams as the source of your XML files.
+     *
+     * @param fileNames the file names to use as sources of XML documents
+     * @return this
+     */
     public CodecConfiguration fileNames(final String... fileNames)
     {
-        this.fileNames = fileNames;
+        nonSharedDictionary.fileNames(fileNames);
         return this;
     }
 
+    /**
+     * Provide the XML document, or documents, that are used to generate the Dictionaries as instance of
+     * {@link InputStream}. Multiple dictionary files can be
+     * used to provide split data and transport XML files as used by FIX 5.0 / FIXT. If you want to generate a shared
+     * dictionary then please use {@link SharedCodecConfiguration#withDictionary(String, boolean, InputStream...)} method and not
+     * this one. {@link #fileNames(String...)} is an alternative configuration option that lets you provide
+     * file names as the source of your XML files.
+     *
+     * @param fileStreams the file streams to use as sources of XML documents
+     * @return this
+     */
     public CodecConfiguration fileStreams(final InputStream... fileStreams)
     {
-        this.fileStreams = fileStreams;
+        nonSharedDictionary.fileStreams(fileStreams);
+        return this;
+    }
+
+    CodecConfiguration outputManagerFactory(
+        final BiFunction<String, String, OutputManager> outputManagerFactory)
+    {
+        this.outputManagerFactory = outputManagerFactory;
         return this;
     }
 
@@ -114,37 +242,81 @@ public class CodecConfiguration
         return this;
     }
 
-    public InputStream[] fileStreams()
+    /**
+     * Enable the generation of shared codecs. This returns an object upon which configuration options can be set.
+     *
+     * @return the shared codec configuration object
+     */
+    public SharedCodecConfiguration sharedCodecsEnabled()
     {
-        return fileStreams;
+        sharedCodecConfiguration = new SharedCodecConfiguration(nonSharedDictionary().allowDuplicateFields());
+        return sharedCodecConfiguration;
     }
 
-    public String outputPath()
+    /**
+     * Sets whether to generate javadoc tags with the FIX tags in. Defaults to true. Can be configured via properties
+     * using <code>-Dfix.codecs.tags_in_javadoc=false</code>.
+     *
+     * @param fixTagsInJavadoc true to generate javadoc tags with the FIX tags in.
+     * @return this
+     */
+    public CodecConfiguration fixTagsInJavadoc(final boolean fixTagsInJavadoc)
+    {
+        this.fixTagsInJavadoc = fixTagsInJavadoc;
+        return this;
+    }
+
+    String outputPath()
     {
         return outputPath;
     }
 
-    public String parentPackage()
+    String parentPackage()
     {
         return parentPackage;
     }
 
-    public boolean flyweightsEnabled()
+    boolean flyweightsEnabled()
     {
         return flyweightsEnabled;
     }
 
-    public boolean allowDuplicateFields()
+    boolean wrapEmptyBuffer()
     {
-        return allowDuplicateFields;
+        return wrapEmptyBuffer;
     }
 
-    public String codecRejectUnknownEnumValueEnabled()
+    public boolean allowEmptyTags()
+    {
+        return allowEmptyTags;
+    }
+
+    String codecRejectUnknownEnumValueEnabled()
     {
         return codecRejectUnknownEnumValueEnabled;
     }
 
-    void conclude() throws FileNotFoundException
+    SharedCodecConfiguration sharedCodecConfiguration()
+    {
+        return sharedCodecConfiguration;
+    }
+
+    public GeneratorDictionaryConfiguration nonSharedDictionary()
+    {
+        return nonSharedDictionary;
+    }
+
+    BiFunction<String, String, OutputManager> outputManagerFactory()
+    {
+        return outputManagerFactory;
+    }
+
+    public boolean fixTagsInJavadoc()
+    {
+        return fixTagsInJavadoc;
+    }
+
+    void conclude()
     {
         if (outputPath() == null)
         {
@@ -158,35 +330,28 @@ public class CodecConfiguration
                 rejectUnknownEnumPropertyValue : Generator.RUNTIME_REJECT_UNKNOWN_ENUM_VALUE_PROPERTY;
         }
 
-        // Create input streams from names if not provided.
-        if (fileStreams == null)
+        if (sharedCodecConfiguration != null)
         {
-            if (fileNames == null)
+            if (nonSharedDictionary.hasStreams())
             {
                 throw new IllegalArgumentException(
-                    "You must provide either the fileNames or fileStream configuration options");
+                    "Cannot mix shared codec configuration with providing file streams or names via the non-shared " +
+                        "configuration option. If you want to provide dictionaries for sharing then use " +
+                        "SharedCodecConfiguration.withDictionary().");
             }
-
-            final int n = fileNames.length;
-            fileStreams = new InputStream[n];
-            for (int i = 0; i < n; i++)
+        }
+        else
+        {
+            if (!nonSharedDictionary.hasStreams())
             {
-                final File xmlFile = new File(fileNames[i]);
-                if (!xmlFile.exists())
-                {
-                    throw new IllegalArgumentException("xmlFile does not exist: " + xmlFile.getAbsolutePath());
-                }
-
-                if (!xmlFile.isFile())
-                {
-                    throw new IllegalArgumentException(String.format(
-                        "xmlFile [%s] isn't a file, are the arguments the correct way around?",
-                        xmlFile));
-                }
-
-                // Closed by CodecGenerator
-                fileStreams[i] = new FileInputStream(xmlFile); // lgtm [java/input-resource-leak]
+                throw new IllegalArgumentException(
+                    "Please provide a path to the XML files either through the fileNames() or fileStreams() option.");
             }
+        }
+        if (decimalFloatOverflowHandler == null)
+        {
+
+            decimalFloatOverflowHandler = System.getProperty(FLOAT_OVERFLOW_HANDLER_PROPERTY);
         }
     }
 }

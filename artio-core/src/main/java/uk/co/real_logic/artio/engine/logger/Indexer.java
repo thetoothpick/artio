@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,7 +24,6 @@ import io.aeron.logbuffer.FragmentHandler;
 import io.aeron.logbuffer.Header;
 import org.agrona.DirectBuffer;
 import org.agrona.ErrorHandler;
-import org.agrona.collections.CollectionUtil;
 import org.agrona.concurrent.Agent;
 import org.agrona.concurrent.AgentInvoker;
 import org.agrona.concurrent.IdleStrategy;
@@ -32,13 +31,13 @@ import uk.co.real_logic.artio.CommonConfiguration;
 import uk.co.real_logic.artio.DebugLogger;
 import uk.co.real_logic.artio.LogTag;
 import uk.co.real_logic.artio.dictionary.generation.Exceptions;
-import uk.co.real_logic.artio.engine.CompletionPosition;
 import uk.co.real_logic.artio.util.CharFormatter;
 
 import java.util.List;
 
 import static io.aeron.CommonContext.IPC_CHANNEL;
 import static io.aeron.logbuffer.ControlledFragmentHandler.Action.CONTINUE;
+import static uk.co.real_logic.artio.engine.logger.ArchivingAgents.LIMIT;
 
 /**
  * Incrementally builds indexes by polling a subscription.
@@ -46,39 +45,44 @@ import static io.aeron.logbuffer.ControlledFragmentHandler.Action.CONTINUE;
 @SuppressWarnings("ForLoopReplaceableByForEach")
 public class Indexer implements Agent, ControlledFragmentHandler
 {
-    private static final int LIMIT = 20;
-
     private final CharFormatter indexingFormatter = new CharFormatter(
         "Indexing @ %s from [%s, %s]");
     private final CharFormatter catchupFormatter = new CharFormatter(
         "Catchup [%s]: recordingId = %s, recordingStopped @ %s, indexStopped @ %s");
 
     private final List<Index> indices;
-    private final Subscription subscription;
     private final String agentNamePrefix;
-    private final CompletionPosition completionPosition;
     private final int archiveReplayStream;
-    private final boolean gracefulShutdown;
 
     public Indexer(
         final List<Index> indices,
-        final Subscription subscription,
         final String agentNamePrefix,
-        final CompletionPosition completionPosition,
-        final int archiveReplayStream,
-        final boolean gracefulShutdown)
+        final int archiveReplayStream)
     {
         this.indices = indices;
-        this.subscription = subscription;
         this.agentNamePrefix = agentNamePrefix;
-        this.completionPosition = completionPosition;
         this.archiveReplayStream = archiveReplayStream;
-        this.gracefulShutdown = gracefulShutdown;
     }
 
+    @Override
     public int doWork()
     {
-        return subscription.controlledPoll(this, LIMIT) + CollectionUtil.sum(indices, Index::doWork);
+        return pollIndexes();
+    }
+
+    private int pollIndexes()
+    {
+        int total = 0;
+
+        final List<Index> indices = this.indices;
+        final int size = indices.size();
+        for (int i = 0; i < size; i++)
+        {
+            final Index value = indices.get(i);
+            total += value.doWork();
+        }
+
+        return total;
     }
 
     public void catchIndexUp(final AeronArchive aeronArchive, final ErrorHandler errorHandler)
@@ -150,6 +154,7 @@ public class Indexer implements Agent, ControlledFragmentHandler
         idleStrategy.idle(totalWork);
     }
 
+    @Override
     public Action onFragment(final DirectBuffer buffer, final int offset, final int length, final Header header)
     {
         final int streamId = header.streamId();
@@ -171,47 +176,13 @@ public class Indexer implements Agent, ControlledFragmentHandler
         return CONTINUE;
     }
 
+    @Override
     public void onClose()
     {
-        if (gracefulShutdown)
-        {
-            quiesce();
-
-            Exceptions.closeAll(() -> Exceptions.closeAll(indices), subscription);
-        }
+        Exceptions.closeAll(indices);
     }
 
-    private void quiesce()
-    {
-        while (!completionPosition.hasCompleted())
-        {
-            Thread.yield();
-        }
-
-        if (completionPosition.wasStartupComplete())
-        {
-            return;
-        }
-
-        // We know that any remaining data to quiesce at this point must be in the subscription.
-        subscription.controlledPoll(this::quiesceFragment, Integer.MAX_VALUE);
-    }
-
-    private Action quiesceFragment(final DirectBuffer buffer, final int offset, final int length, final Header header)
-    {
-        if (completedPosition(header.sessionId()) <= header.position())
-        {
-            return onFragment(buffer, offset, length, header);
-        }
-
-        return CONTINUE;
-    }
-
-    private long completedPosition(final int aeronSessionId)
-    {
-        return completionPosition.positions().get(aeronSessionId);
-    }
-
+    @Override
     public String roleName()
     {
         return agentNamePrefix + "Indexer";

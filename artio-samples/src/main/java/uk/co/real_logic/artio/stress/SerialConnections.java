@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -33,6 +33,7 @@ import static java.util.Collections.singletonList;
 import static org.agrona.SystemUtil.loadPropertiesFiles;
 import static uk.co.real_logic.artio.messages.SessionState.DISCONNECTED;
 import static uk.co.real_logic.artio.stress.StressConfiguration.*;
+import static uk.co.real_logic.artio.validation.SessionPersistenceStrategy.alwaysPersistent;
 
 public final class SerialConnections
 {
@@ -50,7 +51,11 @@ public final class SerialConnections
         final EngineConfiguration engineConfiguration = new EngineConfiguration()
             .libraryAeronChannel(aeronChannel)
             .logFileDir("stress-client-logs")
-            .bindTo("localhost", 10001);
+            .sessionPersistenceStrategy(alwaysPersistent());
+
+        engineConfiguration.aeronArchiveContext()
+            .controlRequestChannel(StressConfiguration.CONTROL_REQUEST_CHANNEL)
+            .controlResponseChannel(StressConfiguration.CLIENT_CONTROL_RESPONSE_CHANNEL);
 
         System.out.println("Client Logs at " + engineConfiguration.logFileDir());
 
@@ -73,6 +78,7 @@ public final class SerialConnections
                     .address("localhost", StressConfiguration.PORT)
                     .targetCompId(ACCEPTOR_ID)
                     .senderCompId(INITIATOR_ID)
+                    .sequenceNumbersPersistent(true)
                     .build();
 
                 final LibraryConfiguration libraryConfiguration = new LibraryConfiguration()
@@ -102,7 +108,7 @@ public final class SerialConnections
                     }
 
                     final Session session = reply.resultIfPresent();
-                    while (!session.canSendMessage())
+                    while (!session.isActive())
                     {
                         idleStrategy.idle(library.poll(1));
                     }

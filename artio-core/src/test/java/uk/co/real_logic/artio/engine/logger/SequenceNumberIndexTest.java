@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,12 +16,14 @@
 package uk.co.real_logic.artio.engine.logger;
 
 import io.aeron.Aeron;
+import io.aeron.ChannelUriStringBuilder;
 import io.aeron.ExclusivePublication;
 import io.aeron.Image;
 import io.aeron.Subscription;
 import io.aeron.archive.ArchivingMediaDriver;
 import io.aeron.archive.client.AeronArchive;
 import io.aeron.archive.codecs.SourceLocation;
+import org.agrona.BufferUtil;
 import org.agrona.CloseHelper;
 import org.agrona.ErrorHandler;
 import org.agrona.IoUtil;
@@ -32,24 +34,30 @@ import org.agrona.concurrent.UnsafeBuffer;
 import org.agrona.concurrent.YieldingIdleStrategy;
 import org.agrona.concurrent.status.AtomicCounter;
 import org.hamcrest.Matchers;
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterEach;
+
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 import uk.co.real_logic.artio.FileSystemCorruptionException;
 import uk.co.real_logic.artio.dictionary.SessionConstants;
 import uk.co.real_logic.artio.engine.MappedFile;
+import uk.co.real_logic.artio.engine.SequenceNumberExtractor;
 import uk.co.real_logic.artio.engine.framer.FakeEpochClock;
+import uk.co.real_logic.artio.messages.ApplicationHeartbeatEncoder;
 import uk.co.real_logic.artio.messages.FixPProtocolType;
+import uk.co.real_logic.artio.messages.MessageHeaderEncoder;
 import uk.co.real_logic.artio.protocol.GatewayPublication;
 
 import java.io.File;
 
 import static io.aeron.CommonContext.IPC_CHANNEL;
+import static io.aeron.CommonContext.IPC_MEDIA;
 import static org.agrona.IoUtil.deleteIfExists;
 import static org.hamcrest.MatcherAssert.assertThat;
-import static org.junit.Assert.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -57,6 +65,7 @@ import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static uk.co.real_logic.artio.TestFixtures.*;
+import static uk.co.real_logic.artio.engine.EngineConfiguration.DEFAULT_INDEX_CHECKSUM_ENABLED;
 import static uk.co.real_logic.artio.engine.EngineConfiguration.DEFAULT_INDEX_FILE_STATE_FLUSH_TIMEOUT_IN_MS;
 import static uk.co.real_logic.artio.engine.SectorFramer.SECTOR_SIZE;
 import static uk.co.real_logic.artio.engine.SessionInfo.UNK_SESSION;
@@ -66,6 +75,7 @@ import static uk.co.real_logic.artio.engine.logger.SequenceNumberIndexWriter.SEQ
 
 public class SequenceNumberIndexTest extends AbstractLogTest
 {
+    private static final int EXAMPLE_MESSAGES_IN_TERM = 18724;
     private static final int BUFFER_SIZE = 16 * 1024;
     private static final String INDEX_FILE_PATH = IoUtil.tmpDirName() + "/SequenceNumberIndex";
 
@@ -84,11 +94,11 @@ public class SequenceNumberIndexTest extends AbstractLogTest
     private Subscription subscription;
     private RecordingIdLookup recordingIdLookup;
 
-    @Before
+    @BeforeEach
     public void setUp()
     {
         mediaDriver = launchMediaDriver();
-        aeronArchive = AeronArchive.connect();
+        aeronArchive = AeronArchive.connect(aeronArchiveContext());
         aeron = aeronArchive.context().aeron();
 
         aeronArchive.startRecording(IPC_CHANNEL, STREAM_ID, SourceLocation.LOCAL);
@@ -106,12 +116,13 @@ public class SequenceNumberIndexTest extends AbstractLogTest
 
         deleteFiles();
 
-        recordingIdLookup = new RecordingIdLookup(YieldingIdleStrategy.INSTANCE, aeron.countersReader());
+        recordingIdLookup =
+            new RecordingIdLookup(aeronArchive.archiveId(), YieldingIdleStrategy.INSTANCE, aeron.countersReader());
         writer = newWriter(inMemoryBuffer);
         reader = new SequenceNumberIndexReader(inMemoryBuffer, errorHandler, recordingIdLookup, null);
     }
 
-    @After
+    @AfterEach
     public void tearDown()
     {
         CloseHelper.close(writer);
@@ -245,6 +256,16 @@ public class SequenceNumberIndexTest extends AbstractLogTest
     }
 
     @Test
+    public void shouldRedactSequenceNumberWhenFixMessageProcessedAfterRedactButNotBefore()
+    {
+        bufferContainsExampleMessage(false, SESSION_ID, SEQUENCE_NUMBER + 100, SEQUENCE_INDEX);
+        final long messagePosition = writeBuffer();
+        indexRedactSequenceMessage(messagePosition);
+        indexToPosition(publication.sessionId(), messagePosition);
+        assertLastKnownSequenceNumberIs(SESSION_ID, SEQUENCE_NUMBER);
+    }
+
+    @Test
     public void shouldValidateBufferItReadsFrom()
     {
         final AtomicBuffer tableBuffer = newBuffer();
@@ -361,7 +382,7 @@ public class SequenceNumberIndexTest extends AbstractLogTest
     @Test
     public void shouldSaveIndexUponRotate()
     {
-        final int requiredMessagesToRoll = 18724;
+        final int requiredMessagesToRoll = EXAMPLE_MESSAGES_IN_TERM;
         for (int i = 0; i <= requiredMessagesToRoll; i++)
         {
             bufferContainsExampleMessage(true, SESSION_ID, SEQUENCE_NUMBER + i, SEQUENCE_INDEX);
@@ -434,6 +455,63 @@ public class SequenceNumberIndexTest extends AbstractLogTest
         assertLastKnownSequenceNumberIs(SESSION_ID_2, 0);
     }
 
+    @Test
+    public void shouldHandleMultipleImages()
+    {
+        indexApplicationHeartbeat();
+
+        final ExclusivePublication lowPositionPublication = publication;
+        final String channel = new ChannelUriStringBuilder()
+            .media(IPC_MEDIA)
+            .initialPosition(1024L * 1024 * 1024, 42, lowPositionPublication.termBufferLength())
+            .build();
+        publication = aeron.addExclusivePublication(channel, STREAM_ID);
+
+        int seqNum = SEQUENCE_NUMBER;
+        for (int i = 0; i < EXAMPLE_MESSAGES_IN_TERM; i++)
+        {
+            bufferContainsExampleMessage(true, SESSION_ID, seqNum++, SEQUENCE_INDEX);
+            indexRecord();
+        }
+
+        assertEquals(0, writer.fileUpdateCount());
+
+        bufferContainsExampleMessage(true, SESSION_ID, seqNum++, SEQUENCE_INDEX);
+        indexRecord();
+
+        assertEquals(1, writer.fileUpdateCount());
+
+        publication = lowPositionPublication;
+
+        for (int i = 0; i < EXAMPLE_MESSAGES_IN_TERM; i++)
+        {
+            bufferContainsExampleMessage(true, SESSION_ID, seqNum++, SEQUENCE_INDEX);
+            indexRecord();
+        }
+
+        assertEquals(1, writer.fileUpdateCount());
+
+        bufferContainsExampleMessage(true, SESSION_ID, seqNum++, SEQUENCE_INDEX);
+        indexRecord();
+
+        assertEquals(2, writer.fileUpdateCount());
+    }
+
+    private void indexApplicationHeartbeat()
+    {
+        offset = START;
+
+        final MessageHeaderEncoder headerEncoder = new MessageHeaderEncoder();
+        final ApplicationHeartbeatEncoder encoder = new ApplicationHeartbeatEncoder();
+        encoder.wrapAndApplyHeader(buffer, offset, headerEncoder)
+            .libraryId(0)
+            .timestampInNs(1234);
+
+        offset += headerEncoder.encodedLength() + encoder.encodedLength();
+
+        indexRecord();
+    }
+
     private void resetSequenceNumber(final long sessionId)
     {
         final long position = gatewayPublication.saveResetSequenceNumber(sessionId);
@@ -450,10 +528,11 @@ public class SequenceNumberIndexTest extends AbstractLogTest
     private SequenceNumberIndexWriter newWriter(final AtomicBuffer inMemoryBuffer)
     {
         final MappedFile indexFile = newIndexFile();
-        return new SequenceNumberIndexWriter(inMemoryBuffer, indexFile, errorHandler, STREAM_ID, recordingIdLookup,
+        return new SequenceNumberIndexWriter(new SequenceNumberExtractor(),
+            inMemoryBuffer, indexFile, errorHandler, STREAM_ID, recordingIdLookup,
             DEFAULT_INDEX_FILE_STATE_FLUSH_TIMEOUT_IN_MS, clock, null,
             new Long2LongHashMap(UNK_SESSION),
-            FixPProtocolType.ILINK_3);
+            FixPProtocolType.ILINK_3, DEFAULT_INDEX_CHECKSUM_ENABLED, true);
     }
 
     private MappedFile newIndexFile()
@@ -463,7 +542,7 @@ public class SequenceNumberIndexTest extends AbstractLogTest
 
     private UnsafeBuffer newBuffer()
     {
-        return new UnsafeBuffer(new byte[BUFFER_SIZE]);
+        return new UnsafeBuffer(BufferUtil.allocateDirectAligned(BUFFER_SIZE, AtomicBuffer.ALIGNMENT));
     }
 
     private void assertUnknownSession()

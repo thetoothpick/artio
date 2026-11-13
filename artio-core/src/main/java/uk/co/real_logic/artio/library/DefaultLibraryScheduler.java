@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,12 +23,16 @@ import org.agrona.concurrent.AgentRunner;
 import org.agrona.concurrent.CompositeAgent;
 import uk.co.real_logic.artio.engine.EngineScheduler;
 
+import java.util.ArrayList;
+import java.util.List;
+
 import static org.agrona.concurrent.AgentRunner.startOnThread;
 
 public class DefaultLibraryScheduler implements LibraryScheduler
 {
     private AgentRunner monitoringRunner;
 
+    @Override
     public void launch(
         final LibraryConfiguration configuration,
         final ErrorHandler errorHandler,
@@ -40,29 +44,36 @@ public class DefaultLibraryScheduler implements LibraryScheduler
             EngineScheduler.fail();
         }
 
-        if (monitoringAgent != null)
+        final List<Agent> agents = new ArrayList<>();
+        agents.add(conductorAgent);
+        if (null != monitoringAgent)
         {
-            monitoringRunner = new AgentRunner(
-                configuration.monitoringThreadIdleStrategy(),
-                errorHandler,
-                null,
-                new CompositeAgent(monitoringAgent, conductorAgent)
-                {
-                    public void onStart()
-                    {
-                        FixLibrary.setClientConductorThread();
-                        super.onStart();
-                    }
-                });
-            startOnThread(monitoringRunner, configuration.threadFactory());
+            agents.add(monitoringAgent);
         }
+
+        monitoringRunner = new AgentRunner(
+            configuration.monitoringThreadIdleStrategy(),
+            errorHandler,
+            null,
+            new CompositeAgent(agents)
+            {
+                @Override
+                public void onStart()
+                {
+                    FixLibrary.setClientConductorThread();
+                    super.onStart();
+                }
+            });
+        startOnThread(monitoringRunner, configuration.threadFactory());
     }
 
+    @Override
     public void configure(final Aeron.Context aeronContext)
     {
         aeronContext.useConductorAgentInvoker(true);
     }
 
+    @Override
     public void close(final int libraryId)
     {
         EngineScheduler.awaitRunnerStart(monitoringRunner);

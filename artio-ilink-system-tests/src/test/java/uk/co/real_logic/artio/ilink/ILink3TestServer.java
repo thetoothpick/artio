@@ -38,7 +38,7 @@ import java.nio.channels.SocketChannel;
 import static iLinkBinary.NegotiationResponse501Encoder.credentialsHeaderLength;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.greaterThanOrEqualTo;
-import static org.junit.Assert.*;
+import static org.junit.jupiter.api.Assertions.*;
 import static uk.co.real_logic.artio.LogTag.FIX_TEST;
 import static uk.co.real_logic.artio.LogTag.FIXP_SESSION;
 import static uk.co.real_logic.artio.ilink.ILink3Proxy.ILINK_HEADER_LENGTH;
@@ -60,7 +60,7 @@ public class ILink3TestServer
     public static final int RETRANSMIT_REJECT_ERROR_CODES = 1;
 
     private final EpochNanoClock epochNanoClock = new SystemEpochNanoClock();
-    private final JsonPrinter jsonPrinter = new JsonPrinter(ILink3Offsets.loadSbeIr());
+    private final JsonPrinter jsonPrinter = new JsonPrinter(Ilink3Protocol.loadSbeIr());
     private final ByteBuffer writeBuffer = ByteBuffer.allocateDirect(BUFFER_SIZE);
     private final UnsafeBuffer unsafeWriteBuffer = new UnsafeBuffer(writeBuffer);
     private final ByteBuffer readBuffer = ByteBuffer.allocateDirect(BUFFER_SIZE);
@@ -295,7 +295,7 @@ public class ILink3TestServer
         // TradingSystemInfo
 
         final long uuid = establish.uUID();
-        assertEquals("Incorrect establish uuid", this.uuid, uuid);
+        assertEquals(this.uuid, uuid, "Incorrect establish uuid");
 
         establishRequestTimestamp = establish.requestTimestamp();
         assertThat(establishRequestTimestamp, greaterThanOrEqualTo(negotiateRequestTimestamp));
@@ -437,12 +437,18 @@ public class ILink3TestServer
 
     public void readSequence(final long nextSeqNo, final KeepAliveLapsed keepAliveIntervalLapsed)
     {
+        final Sequence506Decoder sequence = readSequence(nextSeqNo);
+        assertEquals(keepAliveIntervalLapsed, sequence.keepAliveIntervalLapsed());
+    }
+
+    public Sequence506Decoder readSequence(final long nextSeqNo)
+    {
         final Sequence506Decoder sequence = read(new Sequence506Decoder(), 0);
 
         assertEquals(uuid, sequence.uUID());
         assertEquals(nextSeqNo, sequence.nextSeqNo());
         assertEquals(FTI.Primary, sequence.faultToleranceIndicator());
-        assertEquals(keepAliveIntervalLapsed, sequence.keepAliveIntervalLapsed());
+        return sequence;
     }
 
     public void writeSequence(final int nextSeqNo, final KeepAliveLapsed keepAliveLapsed)
@@ -616,11 +622,11 @@ public class ILink3TestServer
     public long readRetransmitRequest(final long fromSeqNo, final int msgCount, final long lastUUID)
     {
         final RetransmitRequest508Decoder retransmitRequest = read(new RetransmitRequest508Decoder(), 0);
-        assertEquals("uuid", uuid, retransmitRequest.uUID());
-        assertEquals("lastUUID", lastUUID, retransmitRequest.lastUUID());
+        assertEquals(uuid, retransmitRequest.uUID(), "uuid");
+        assertEquals(lastUUID, retransmitRequest.lastUUID(), "lastUUID");
         final long requestTimestamp = retransmitRequest.requestTimestamp();
-        assertEquals("fromSeqNo", fromSeqNo, retransmitRequest.fromSeqNo());
-        assertEquals("msgCount", msgCount, retransmitRequest.msgCount());
+        assertEquals(fromSeqNo, retransmitRequest.fromSeqNo(), "fromSeqNo");
+        assertEquals(msgCount, retransmitRequest.msgCount(), "msgCount");
 
         return requestTimestamp;
     }

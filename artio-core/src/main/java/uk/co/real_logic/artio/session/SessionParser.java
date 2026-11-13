@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,7 +19,6 @@ import io.aeron.logbuffer.ControlledFragmentHandler.Action;
 import org.agrona.AsciiNumberFormatException;
 import org.agrona.DirectBuffer;
 import org.agrona.ErrorHandler;
-import uk.co.real_logic.artio.messages.CancelOnDisconnectOption;
 import uk.co.real_logic.artio.FixGatewayException;
 import uk.co.real_logic.artio.builder.Decoder;
 import uk.co.real_logic.artio.decoder.*;
@@ -28,6 +27,7 @@ import uk.co.real_logic.artio.dictionary.SessionConstants;
 import uk.co.real_logic.artio.fields.RejectReason;
 import uk.co.real_logic.artio.fields.UtcTimestampDecoder;
 import uk.co.real_logic.artio.library.OnMessageInfo;
+import uk.co.real_logic.artio.messages.CancelOnDisconnectOption;
 import uk.co.real_logic.artio.messages.SessionState;
 import uk.co.real_logic.artio.util.AsciiBuffer;
 import uk.co.real_logic.artio.util.MutableAsciiBuffer;
@@ -35,7 +35,6 @@ import uk.co.real_logic.artio.validation.MessageValidationStrategy;
 
 import static io.aeron.logbuffer.ControlledFragmentHandler.Action.ABORT;
 import static io.aeron.logbuffer.ControlledFragmentHandler.Action.CONTINUE;
-import static uk.co.real_logic.artio.messages.CancelOnDisconnectOption.DO_NOT_CANCEL_ON_DISCONNECT_OR_LOGOUT;
 import static uk.co.real_logic.artio.builder.Validation.CODEC_VALIDATION_ENABLED;
 import static uk.co.real_logic.artio.builder.Validation.isValidMsgType;
 import static uk.co.real_logic.artio.dictionary.SessionConstants.*;
@@ -108,16 +107,29 @@ public class SessionParser
         return logon.supportsPassword() ? logon.passwordAsString() : null;
     }
 
-    public static CancelOnDisconnectOption cancelOnDisconnectType(final AbstractLogonDecoder logon)
+    public static CancelOnDisconnectOption cancelOnDisconnectType(
+        final AbstractLogonDecoder logon,
+        final CancelOnDisconnectOption defaultCancelOnDisconnectOption)
     {
         return logon.supportsCancelOnDisconnectType() && logon.hasCancelOnDisconnectType() ?
-            CancelOnDisconnectOption.get(logon.cancelOnDisconnectType()) : DO_NOT_CANCEL_ON_DISCONNECT_OR_LOGOUT;
+            CancelOnDisconnectOption.get(logon.cancelOnDisconnectType()) : defaultCancelOnDisconnectOption;
     }
 
-    public static int cancelOnDisconnectTimeoutWindow(final AbstractLogonDecoder logon)
+    public static int cancelOnDisconnectTimeoutWindow(final AbstractLogonDecoder logon,
+        final int defaultCancelOnDisconnectTimeoutWindow)
     {
-        return logon.supportsCODTimeoutWindow() && logon.hasCODTimeoutWindow() ?
-            logon.cODTimeoutWindow() : 0;
+        if (logon.supportsCODTimeoutWindow() && logon.hasCODTimeoutWindow())
+        {
+            return logon.cODTimeoutWindow();
+        }
+        else if (defaultCancelOnDisconnectTimeoutWindow != MISSING_INT)
+        {
+            return defaultCancelOnDisconnectTimeoutWindow;
+        }
+        else
+        {
+            return 0;
+        }
     }
 
     public Action onMessage(
@@ -196,14 +208,23 @@ public class SessionParser
     private Action rejectAndHandleExceptionalMessage(final Exception e, final long messageType, final int refTagId,
         final long position)
     {
-        final Action action = rejectExceptionalMessage(messageType, refTagId, position);
-
-        if (action == CONTINUE)
+        try
         {
-            onError(e);
-        }
+            final Action action = rejectExceptionalMessage(messageType, refTagId, position);
+            if (action == CONTINUE)
+            {
+                onError(e);
+            }
 
-        return action;
+            return action;
+        }
+        catch (final Exception secondEx)
+        {
+            // Case that sending the reject has also failed
+            secondEx.addSuppressed(e);
+            onError(secondEx);
+            return CONTINUE;
+        }
     }
 
     private Action rejectExceptionalMessage(final long messageType, final int refTagId, final long position)
@@ -391,7 +412,8 @@ public class SessionParser
                 position,
                 asciiBuffer,
                 offset,
-                length);
+                length,
+                resendRequest);
         }
     }
 
@@ -518,8 +540,10 @@ public class SessionParser
             final long origSendingTime = origSendingTimeInMs(header);
             final String username = username(logon);
             final String password = password(logon);
-            final CancelOnDisconnectOption cancelOnDisconnectOption = cancelOnDisconnectType(logon);
-            final int cancelOnDisconnectTimeoutWindow = cancelOnDisconnectTimeoutWindow(logon);
+            final CancelOnDisconnectOption cancelOnDisconnectOption = cancelOnDisconnectType(logon,
+                session.cancelOnDisconnectOption());
+            final int cancelOnDisconnectTimeoutWindowInMs = cancelOnDisconnectTimeoutWindow(logon,
+                session.getCancelOnDisconnectTimeoutWindowInMs());
             final boolean possDup = isPossDup(header);
 
             return session.onLogon(
@@ -534,7 +558,7 @@ public class SessionParser
                 possDup,
                 position,
                 cancelOnDisconnectOption,
-                cancelOnDisconnectTimeoutWindow);
+                cancelOnDisconnectTimeoutWindowInMs);
         }
     }
 

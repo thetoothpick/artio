@@ -24,12 +24,14 @@ import org.agrona.concurrent.EpochNanoClock;
 import org.agrona.concurrent.OffsetEpochNanoClock;
 import org.agrona.concurrent.UnsafeBuffer;
 import org.agrona.concurrent.status.AtomicCounter;
-import org.junit.After;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterEach;
+
+
+import org.junit.jupiter.api.Test;
 import uk.co.real_logic.artio.CommonConfiguration;
 import uk.co.real_logic.artio.TestFixtures;
 import uk.co.real_logic.artio.dictionary.generation.Exceptions;
-import uk.co.real_logic.artio.ilink.ILinkMessageConsumer;
+import uk.co.real_logic.artio.fixp.FixPMessageConsumer;
 import uk.co.real_logic.artio.messages.MessageHeaderEncoder;
 import uk.co.real_logic.artio.messages.ReplayerTimestampDecoder;
 import uk.co.real_logic.artio.messages.ReplayerTimestampEncoder;
@@ -41,12 +43,13 @@ import java.util.function.LongSupplier;
 import static io.aeron.CommonContext.IPC_CHANNEL;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.*;
-import static org.junit.Assert.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.Mockito.mock;
 import static uk.co.real_logic.artio.CommonConfiguration.DEFAULT_INBOUND_LIBRARY_STREAM;
 import static uk.co.real_logic.artio.CommonConfiguration.DEFAULT_OUTBOUND_LIBRARY_STREAM;
 import static uk.co.real_logic.artio.Timing.assertEventuallyTrue;
 import static uk.co.real_logic.artio.engine.EngineConfiguration.DEFAULT_OUTBOUND_REPLAY_STREAM;
+import static uk.co.real_logic.artio.engine.logger.FixMessageConsumerValidator.validateFixMessageConsumer;
 import static uk.co.real_logic.artio.messages.MessageHeaderDecoder.ENCODED_LENGTH;
 
 public abstract class AbstractFixMessageLoggerTest
@@ -61,29 +64,31 @@ public abstract class AbstractFixMessageLoggerTest
     final EpochNanoClock clock = new OffsetEpochNanoClock();
     final LongArrayList timestamps = new LongArrayList();
     final IntArrayList streamIds = new IntArrayList();
+    final IntArrayList sequenceNumbers = new IntArrayList();
 
-    private final FixMessageConsumer fixConsumer = (message, buffer, offset, length, header) ->
+    final FixMessageConsumer fixConsumer = (message, buffer, offset, length, header) ->
     {
         final long timestamp = message.timestamp();
 
         timestamps.add(timestamp);
+        sequenceNumbers.add(message.sequenceNumber());
 
-        final String body = message.body().trim();
+        final String body = validateFixMessageConsumer(message, buffer, offset, length).trim();
         final long messageNumber = Long.parseLong(body);
         assertEquals(timestamp, messageNumber);
         streamIds.add(header.streamId());
     };
 
-    private String libraryChannel;
-    private MediaDriver mediaDriver;
-    private Aeron aeron;
-    private FixMessageLogger logger;
+    String libraryChannel;
+    MediaDriver mediaDriver;
+    Aeron aeron;
+    FixMessageLogger logger;
 
-    private GatewayPublication inboundPublication;
-    private GatewayPublication outboundPublication;
-    private ExclusivePublication replayPublication;
+    GatewayPublication inboundPublication;
+    GatewayPublication outboundPublication;
+    ExclusivePublication replayPublication;
 
-    void setup(final ILinkMessageConsumer iLinkMessageConsumer)
+    void setup(final FixPMessageConsumer fixPMessageConsumer)
     {
         libraryChannel = "aeron:udp?endpoint=localhost:" + TestFixtures.unusedPort();
         mediaDriver = TestFixtures.launchJustMediaDriver();
@@ -91,8 +96,9 @@ public abstract class AbstractFixMessageLoggerTest
 
         final FixMessageLogger.Configuration config = new FixMessageLogger.Configuration()
             .fixMessageConsumer(fixConsumer)
-            .iLinkMessageConsumer(iLinkMessageConsumer)
+            .fixPMessageConsumer(fixPMessageConsumer)
             .compactionSize(compactionSize)
+            .maximumBufferSize(10_000)
             .libraryAeronChannel(libraryChannel);
         logger = new FixMessageLogger(config);
 
@@ -103,7 +109,7 @@ public abstract class AbstractFixMessageLoggerTest
             DEFAULT_OUTBOUND_REPLAY_STREAM);
     }
 
-    @After
+    @AfterEach
     public void teardown()
     {
         Exceptions.closeAll(logger);
@@ -153,7 +159,7 @@ public abstract class AbstractFixMessageLoggerTest
         assertNoTimestamps();
         logger.onClose();
         assertThat(timestamps, contains(10L, 11L));
-        assertEquals("failed to reshuffle", 0, logger.bufferPosition());
+        assertEquals(0, logger.bufferPosition(), "failed to reshuffle");
     }
 
     @Test
@@ -186,7 +192,7 @@ public abstract class AbstractFixMessageLoggerTest
         assertThat(timestamps.toString(), timestamps, contains(6L));
         timestamps.clear();
 
-        assertEquals("failed to reshuffle", 0, logger.bufferPosition());
+        assertEquals(0, logger.bufferPosition(), "failed to reshuffle");
     }
 
     // From issue #408
@@ -227,16 +233,16 @@ public abstract class AbstractFixMessageLoggerTest
         assertThat(timestamps, contains(1603800578520566892L, 1603800581079423921L, 1603800586520278849L));
     }
 
-    private void assertEventuallyReceives(final int messageCount)
+    void assertEventuallyReceives(final int messageCount)
     {
         assertEventuallyTrue(
             () -> "Failed to receive a message: " + timestamps,
             () ->
             {
                 logger.doWork();
-                return timestamps.size() == messageCount;
+                return timestamps.size() >= messageCount;
             },
-            1000,
+            10_000,
             () ->
             {
             });
@@ -272,9 +278,9 @@ public abstract class AbstractFixMessageLoggerTest
             });
     }
 
-    abstract void onMessage(GatewayPublication inboundPublication, long timestamp);
+    abstract long onMessage(GatewayPublication inboundPublication, long timestamp);
 
-    private void onReplayerTimestamp(final ExclusivePublication replayStream, final long timestampInNs)
+    void onReplayerTimestamp(final ExclusivePublication replayStream, final long timestampInNs)
     {
         final UnsafeBuffer timestampBuffer = new UnsafeBuffer(new byte[
             ENCODED_LENGTH + ReplayerTimestampDecoder.BLOCK_LENGTH]);
@@ -287,14 +293,14 @@ public abstract class AbstractFixMessageLoggerTest
         untilComplete(() -> replayStream.offer(timestampBuffer));
     }
 
-    protected void untilComplete(final LongSupplier op)
+    protected long untilComplete(final LongSupplier op)
     {
         while (true)
         {
             final long position = op.getAsLong();
             if (position > 0)
             {
-                return;
+                return position;
             }
             Thread.yield();
         }

@@ -1,3 +1,18 @@
+/*
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package uk.co.real_logic.artio.example_buyer;
 
 import org.agrona.CloseHelper;
@@ -7,15 +22,18 @@ import uk.co.real_logic.artio.engine.FixEngine;
 import uk.co.real_logic.artio.library.FixLibrary;
 import uk.co.real_logic.artio.library.LibraryConfiguration;
 
+import java.io.File;
+
 import static io.aeron.CommonContext.IPC_CHANNEL;
 import static java.util.Collections.singletonList;
+import static uk.co.real_logic.artio.CommonConfiguration.optimalTmpDirName;
 import static uk.co.real_logic.artio.example_buyer.BuyerApplication.AERON_DIRECTORY_NAME;
 import static uk.co.real_logic.artio.example_buyer.BuyerApplication.RECORDING_EVENTS_CHANNEL;
 import static uk.co.real_logic.artio.example_exchange.ExchangeApplication.cleanupOldLogFileDir;
 
 public class BuyerAgent implements Agent
 {
-    private FixEngine gateway;
+    private FixEngine engine;
     private FixLibrary library;
     private final Buyer buyer = new Buyer();
 
@@ -23,7 +41,9 @@ public class BuyerAgent implements Agent
     public void onStart()
     {
         final EngineConfiguration engineConfiguration = new EngineConfiguration()
-            .libraryAeronChannel(IPC_CHANNEL);
+            .libraryAeronChannel(IPC_CHANNEL)
+            .monitoringFile(optimalTmpDirName() + File.separator + "fix-buyer" + File.separator + "engineCounters")
+            .logFileDir("buyer-logs");
 
         engineConfiguration
             .aeronContext()
@@ -36,7 +56,7 @@ public class BuyerAgent implements Agent
 
         cleanupOldLogFileDir(engineConfiguration);
 
-        gateway = FixEngine.launch(engineConfiguration);
+        engine = FixEngine.launch(engineConfiguration);
 
         final LibraryConfiguration libraryConfiguration = new LibraryConfiguration()
             .libraryAeronChannels(singletonList(IPC_CHANNEL))
@@ -60,7 +80,7 @@ public class BuyerAgent implements Agent
     @Override
     public void onClose()
     {
-        CloseHelper.close(gateway);
+        CloseHelper.close(engine);
     }
 
     @Override

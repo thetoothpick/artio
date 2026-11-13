@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,12 +15,13 @@
  */
 package uk.co.real_logic.artio.util;
 
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 
 import static java.nio.charset.StandardCharsets.US_ASCII;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static uk.co.real_logic.artio.util.AsciiBuffer.UNKNOWN_INDEX;
 
 public class AsciiBufferTest
@@ -32,7 +33,7 @@ public class AsciiBufferTest
 
     private int value;
 
-    @Before
+    @BeforeEach
     public void setUp()
     {
         buffer.putBytes(OFFSET, BYTES);
@@ -46,10 +47,10 @@ public class AsciiBufferTest
         assertEquals(value, 8);
     }
 
-    @Test(expected = IllegalArgumentException.class)
+    @Test
     public void shouldValidateDigits()
     {
-        buffer.getDigit(OFFSET + 1);
+        assertThrows(IllegalArgumentException.class, () -> buffer.getDigit(OFFSET + 1));
     }
 
     @Test

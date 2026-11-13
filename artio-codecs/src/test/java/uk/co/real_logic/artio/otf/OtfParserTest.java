@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,29 +15,24 @@
  */
 package uk.co.real_logic.artio.otf;
 
-import org.junit.experimental.theories.DataPoint;
-import org.junit.experimental.theories.Theories;
-import org.junit.experimental.theories.Theory;
-import org.junit.runner.RunWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.InOrder;
 import uk.co.real_logic.artio.dictionary.LongDictionary;
 import uk.co.real_logic.artio.fields.AsciiFieldFlyweight;
 import uk.co.real_logic.artio.util.MutableAsciiBuffer;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.fail;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.fail;
 import static org.mockito.Mockito.*;
 import static uk.co.real_logic.artio.ValidationError.INVALID_CHECKSUM;
 import static uk.co.real_logic.artio.ValidationError.PARSE_ERROR;
 import static uk.co.real_logic.artio.util.TestMessages.*;
 
-@RunWith(Theories.class)
 public class OtfParserTest
 {
-    @DataPoint
     public static final int NO_OFFSET = 0;
 
-    @DataPoint
     public static final int OFFSET = 1;
 
     public static final int LENGTH = 16 * 1024;
@@ -49,7 +44,8 @@ public class OtfParserTest
 
     private final InOrder inOrder = inOrder(mockAcceptor);
 
-    @Theory
+    @ParameterizedTest()
+    @ValueSource(ints = {NO_OFFSET, OFFSET})
     public void notifiesAcceptorOfMessageStart(final int offset)
     {
         putMessage(offset);
@@ -57,9 +53,11 @@ public class OtfParserTest
         parser.onMessage(buffer, offset, MSG_LEN);
 
         verify(mockAcceptor).onNext();
+        verify(mockAcceptor, never()).onError(any(), anyLong(), anyInt(), any());
     }
 
-    @Theory
+    @ParameterizedTest()
+    @ValueSource(ints = {NO_OFFSET, OFFSET})
     public void doesNotSwallowExceptionsFromCallbacks(final int offset)
     {
         final String errorMessage = "err";
@@ -74,13 +72,15 @@ public class OtfParserTest
         catch (final IllegalArgumentException ex)
         {
             assertEquals(errorMessage, ex.getMessage());
+            verify(mockAcceptor, never()).onError(any(), anyLong(), anyInt(), any());
             return;
         }
 
         fail("expected IllegalArgumentException");
     }
 
-    @Theory
+    @ParameterizedTest()
+    @ValueSource(ints = {NO_OFFSET, OFFSET})
     public void notifiesAcceptorOfValidMessageFields(final int offset)
     {
         putMessage(offset);
@@ -97,9 +97,11 @@ public class OtfParserTest
         inOrder.verify(mockAcceptor).onField(eq(34), any(), eq(offset + 24), eq(1));
 
         inOrder.verify(mockAcceptor, times(15)).onField(anyInt(), any(), anyInt(), anyInt());
+        verify(mockAcceptor, never()).onError(any(), anyLong(), anyInt(), any());
     }
 
-    @Theory
+    @ParameterizedTest()
+    @ValueSource(ints = {NO_OFFSET, OFFSET})
     public void stopsParsingWhenToldTo(final int offset)
     {
         putMessage(offset);
@@ -118,9 +120,11 @@ public class OtfParserTest
         inOrder.verify(mockAcceptor).onField(eq(34), any(), eq(offset + 24), eq(1));
 
         inOrder.verifyNoMoreInteractions();
+        verify(mockAcceptor, never()).onError(any(), anyLong(), anyInt(), any());
     }
 
-    @Theory
+    @ParameterizedTest()
+    @ValueSource(ints = {NO_OFFSET, OFFSET})
     public void notifiesAcceptorOfValidMessageEnd(final int offset)
     {
         putMessage(offset);
@@ -128,9 +132,11 @@ public class OtfParserTest
         parser.onMessage(buffer, offset, MSG_LEN);
 
         verify(mockAcceptor).onComplete();
+        verify(mockAcceptor, never()).onError(any(), anyLong(), anyInt(), any());
     }
 
-    @Theory
+    @ParameterizedTest()
+    @ValueSource(ints = {NO_OFFSET, OFFSET})
     public void notifiesAcceptorOfInvalidChecksum(final int offset)
     {
         buffer.putBytes(offset, INVALID_CHECKSUM_MSG);
@@ -140,7 +146,8 @@ public class OtfParserTest
         verify(mockAcceptor).onError(eq(INVALID_CHECKSUM), eq((long)'D'), eq(10), any(AsciiFieldFlyweight.class));
     }
 
-    @Theory
+    @ParameterizedTest()
+    @ValueSource(ints = {NO_OFFSET, OFFSET})
     public void notifiesAcceptorOfInvalidMessage(final int offset)
     {
         buffer.putBytes(offset, INVALID_MESSAGE);
@@ -150,7 +157,8 @@ public class OtfParserTest
         verify(mockAcceptor).onError(eq(PARSE_ERROR), eq((long)'D'), eq(11), any(AsciiFieldFlyweight.class));
     }
 
-    @Theory
+    @ParameterizedTest()
+    @ValueSource(ints = {NO_OFFSET, OFFSET})
     public void notifiesAcceptorOfRepeatingGroup(final int offset)
     {
         understandsContraBrokersGroup();
@@ -166,9 +174,12 @@ public class OtfParserTest
         verifyInOrderField(437);
         verifyInOrderField(438);
         verifyGroupEnd(382, 1, 0);
+
+        verify(mockAcceptor, never()).onError(any(), anyLong(), anyInt(), any());
     }
 
-    @Theory
+    @ParameterizedTest()
+    @ValueSource(ints = {NO_OFFSET, OFFSET})
     public void notifiesAcceptorOfOnlyHeaderForEmptyGroup(final int offset)
     {
         understandsContraBrokersGroup();
@@ -179,9 +190,12 @@ public class OtfParserTest
         verifyGroupHeader(382, 0);
         inOrder.verify(mockAcceptor, never()).onGroupBegin(anyInt(), anyInt(), anyInt());
         inOrder.verify(mockAcceptor, never()).onGroupEnd(anyInt(), anyInt(), anyInt());
+
+        verify(mockAcceptor, never()).onError(any(), anyLong(), anyInt(), any());
     }
 
-    @Theory
+    @ParameterizedTest()
+    @ValueSource(ints = {NO_OFFSET, OFFSET})
     public void notifiesAcceptorOfMultiElementRepeatingGroup(final int offset)
     {
         understandsNoOrdersGroup();
@@ -193,9 +207,12 @@ public class OtfParserTest
         verifyGroupHeader(NO_ORDERS, 2);
         verifyNoOrdersGroup(0);
         verifyNoOrdersGroup(1);
+
+        verify(mockAcceptor, never()).onError(any(), anyLong(), anyInt(), any());
     }
 
-    @Theory
+    @ParameterizedTest()
+    @ValueSource(ints = {NO_OFFSET, OFFSET})
     public void notifiesAcceptorOfNestedRepeatingGroup(final int offset)
     {
         understandsNoOrdersGroup();
@@ -208,16 +225,19 @@ public class OtfParserTest
         verifyGroupHeader(NO_ORDERS, 2);
         verifyNestedNoAllocsGroup(0);
         verifyNoOrdersGroup(1);
+
+        verify(mockAcceptor, never()).onError(any(), anyLong(), anyInt(), any());
     }
 
-    @Theory
+    @ParameterizedTest()
+    @ValueSource(ints = {NO_OFFSET, OFFSET})
     public void parsesZeroChecksumMessages(final int offset)
     {
         buffer.putBytes(offset, ZERO_CHECKSUM_MESSAGE);
 
         parser.onMessage(buffer, offset, ZERO_CHECKSUM_MESSAGE.length);
 
-        verify(mockAcceptor, never()).onError(any(), anyInt(), anyInt(), any());
+        verify(mockAcceptor, never()).onError(any(), anyLong(), anyInt(), any());
     }
 
     private void verifyGroupHeader(final int groupNumber, final int numberOfElements)

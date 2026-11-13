@@ -15,30 +15,32 @@
  */
 package uk.co.real_logic.artio.binary_entrypoint;
 
-import b3.entrypoint.fixp.sbe.MessageHeaderDecoder;
-import b3.entrypoint.fixp.sbe.NegotiateResponseDecoder;
-import b3.entrypoint.fixp.sbe.SequenceDecoder;
-import b3.entrypoint.fixp.sbe.SimpleNewOrderDecoder;
+import b3.entrypoint.fixp.sbe.*;
 import org.agrona.DirectBuffer;
 import org.agrona.collections.Long2ObjectHashMap;
+import org.agrona.concurrent.UnsafeBuffer;
 import uk.co.real_logic.artio.engine.logger.FixPSequenceNumberHandler;
 import uk.co.real_logic.artio.engine.logger.SequenceNumberIndexReader;
 import uk.co.real_logic.artio.fixp.AbstractFixPSequenceExtractor;
 import uk.co.real_logic.artio.messages.FixPMessageDecoder;
+import uk.co.real_logic.artio.messages.FollowerSessionRequestDecoder;
 
 import java.util.function.LongFunction;
 
 import static uk.co.real_logic.artio.engine.SessionInfo.UNK_SESSION;
+import static uk.co.real_logic.artio.fixp.SimpleOpenFramingHeader.SOFH_LENGTH;
 
 class BinaryEntryPointSequenceExtractor extends AbstractFixPSequenceExtractor
 {
-    private static final int LOWEST_APP_TEMPLATE_ID = SimpleNewOrderDecoder.TEMPLATE_ID;
+    static final int LOWEST_APP_TEMPLATE_ID = SimpleNewOrderDecoder.TEMPLATE_ID;
 
     private final Long2ObjectHashMap<Info> sessionIdToInfo = new Long2ObjectHashMap<>();
     private final LongFunction<Info> onNewConnectionFunc = this::onNewConnection;
     private final MessageHeaderDecoder beHeader = new MessageHeaderDecoder();
     private final SequenceNumberIndexReader sequenceNumberReader;
     private final SequenceDecoder sequence = new SequenceDecoder();
+    private final UnsafeBuffer followerRequestBuffer = new UnsafeBuffer();
+    private final NegotiateDecoder negotiateDecoder = new NegotiateDecoder();
 
     BinaryEntryPointSequenceExtractor(
         final FixPSequenceNumberHandler handler,
@@ -48,13 +50,15 @@ class BinaryEntryPointSequenceExtractor extends AbstractFixPSequenceExtractor
         this.sequenceNumberReader = sequenceNumberReader;
     }
 
+    @Override
     public void onMessage(
         final FixPMessageDecoder fixPMessage,
         final DirectBuffer buffer,
         final int headerOffset,
         final int totalLength,
         final long endPosition,
-        final int aeronSessionId)
+        final int aeronSessionId,
+        final long timestamp)
     {
         final int templateId = beHeader.wrap(buffer, headerOffset).templateId();
         final int msgOffset = headerOffset + MessageHeaderDecoder.ENCODED_LENGTH;
@@ -62,10 +66,7 @@ class BinaryEntryPointSequenceExtractor extends AbstractFixPSequenceExtractor
 
         if (templateId == NegotiateResponseDecoder.TEMPLATE_ID)
         {
-            // Success sequence number reset
-            final Info info = lookupInfo(sessionId);
-            info.lastSequenceNumber = 0;
-            onSequenceNumber(totalLength, endPosition, aeronSessionId, info);
+            onSequenceReset(totalLength, endPosition, aeronSessionId, sessionId, timestamp, false);
         }
         else if (templateId == SequenceDecoder.TEMPLATE_ID)
         {
@@ -77,14 +78,45 @@ class BinaryEntryPointSequenceExtractor extends AbstractFixPSequenceExtractor
         {
             final Info info = lookupInfo(sessionId);
             info.lastSequenceNumber++;
-            onSequenceNumber(totalLength, endPosition, aeronSessionId, info);
+            onSequenceNumber(totalLength, endPosition, aeronSessionId, info, timestamp);
         }
     }
 
+    private void onSequenceReset(
+        final int totalLength, final long endPosition, final int aeronSessionId, final long sessionId,
+        final long timestamp, final boolean forNextSession)
+    {
+        final Info info = lookupInfo(sessionId);
+        info.forNextSession = forNextSession;
+        info.lastSequenceNumber = 0;
+        onSequenceNumber(totalLength, endPosition, aeronSessionId, info, timestamp);
+    }
+
+    @Override
     public void onRedactSequenceUpdate(final long sessionId, final int newSequenceNumber)
     {
         final Info info = lookupInfo(sessionId);
         info.lastSequenceNumber = newSequenceNumber;
+    }
+
+    @Override
+    public void onFollowerSessionRequest(
+        final FollowerSessionRequestDecoder followerSessionRequest,
+        final long endPosition,
+        final int totalLength,
+        final int aeronSessionId)
+    {
+        followerSessionRequest.wrapHeader(followerRequestBuffer);
+        beHeader.wrap(followerRequestBuffer, SOFH_LENGTH);
+        if (beHeader.templateId() == NegotiateDecoder.TEMPLATE_ID)
+        {
+            negotiateDecoder.wrapAndApplyHeader(followerRequestBuffer, SOFH_LENGTH, beHeader);
+            if (negotiateDecoder.sessionVerID() == NEXT_SESSION_VERSION_ID)
+            {
+                final long sessionId = negotiateDecoder.sessionID();
+                onSequenceReset(totalLength, endPosition, aeronSessionId, sessionId, 0, true);
+            }
+        }
     }
 
     private Info lookupInfo(final long sessionId)
@@ -93,10 +125,11 @@ class BinaryEntryPointSequenceExtractor extends AbstractFixPSequenceExtractor
     }
 
     private void onSequenceNumber(
-        final int totalLength, final long endPosition, final int aeronSessionId, final Info info)
+        final int totalLength, final long endPosition, final int aeronSessionId, final Info info, final long timestamp)
     {
         handler.onSequenceNumber(
-            info.lastSequenceNumber, info.sessionId, totalLength, endPosition, aeronSessionId, false);
+            info.lastSequenceNumber, info.sessionId, totalLength, endPosition, aeronSessionId, false,
+            timestamp, info.forNextSession);
     }
 
     private Info onNewConnection(final long sessionId)
@@ -113,6 +146,7 @@ class BinaryEntryPointSequenceExtractor extends AbstractFixPSequenceExtractor
     {
         private final long sessionId;
 
+        public boolean forNextSession;
         private int lastSequenceNumber;
 
         Info(final long sessionId, final int lastSequenceNumber)

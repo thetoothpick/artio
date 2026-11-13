@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ import uk.co.real_logic.artio.engine.SectorFramer;
 import uk.co.real_logic.artio.messages.MessageHeaderDecoder;
 import uk.co.real_logic.artio.storage.messages.IndexedPositionDecoder;
 
+import static uk.co.real_logic.artio.AtomicBuffers.checkAligned;
 import static uk.co.real_logic.artio.engine.SectorFramer.OUT_OF_SPACE;
 import static uk.co.real_logic.artio.engine.logger.IndexedPositionWriter.*;
 
@@ -39,7 +40,7 @@ class IndexedPositionReader
 
     IndexedPositionReader(final AtomicBuffer buffer)
     {
-        this.buffer = buffer;
+        this.buffer = checkAligned(buffer);
         final MessageHeaderDecoder messageHeader = new MessageHeaderDecoder();
         messageHeader.wrap(buffer, 0);
         actingBlockLength = messageHeader.blockLength();

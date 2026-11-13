@@ -17,14 +17,16 @@ package uk.co.real_logic.artio.engine.framer;
 
 import org.agrona.ErrorHandler;
 import org.agrona.concurrent.OffsetEpochNanoClock;
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterEach;
+
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 import uk.co.real_logic.artio.engine.MappedFile;
 
 import java.io.File;
 
-import static org.junit.Assert.*;
+import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.mock;
 import static uk.co.real_logic.artio.engine.EngineConfiguration.DEFAULT_FIXP_ID_FILE;
 import static uk.co.real_logic.artio.engine.EngineConfiguration.DEFAULT_SESSION_ID_BUFFER_SIZE;
@@ -39,7 +41,7 @@ public class ILink3ContextsTest
     private File file;
     private FixPContexts contexts;
 
-    @Before
+    @BeforeEach
     public void setup()
     {
         file = new File(DEFAULT_FIXP_ID_FILE).getAbsoluteFile();
@@ -64,7 +66,7 @@ public class ILink3ContextsTest
         final long firstUuid = oldUuid.connectUuid();
         assertEquals(0, oldUuid.connectLastUuid());
         assertTrue(oldUuid.newlyAllocated());
-        oldUuid.confirmUuid(contexts);
+        onInitiatorNegotiateResponse(oldUuid, contexts);
 
         final int offset = contexts.offset();
 
@@ -72,7 +74,7 @@ public class ILink3ContextsTest
         assertFalse(secondUuid.newlyAllocated());
         assertEquals(firstUuid, secondUuid.connectLastUuid());
         assertEquals(firstUuid, secondUuid.connectUuid());
-        secondUuid.confirmUuid(contexts);
+        onInitiatorNegotiateResponse(secondUuid, contexts);
 
         assertOffset(offset);
 
@@ -94,7 +96,7 @@ public class ILink3ContextsTest
         final long firstUuid = oldUuid.connectUuid();
         assertEquals(0, oldUuid.connectLastUuid());
         assertTrue(oldUuid.newlyAllocated());
-        oldUuid.confirmUuid(contexts);
+        onInitiatorNegotiateResponse(oldUuid, contexts);
 
         final int offset = contexts.offset();
 
@@ -102,7 +104,7 @@ public class ILink3ContextsTest
         assertTrue(secondUuid.newlyAllocated());
         assertEquals(firstUuid, secondUuid.connectLastUuid());
         assertNotEquals(firstUuid, secondUuid.connectUuid());
-        secondUuid.confirmUuid(contexts);
+        onInitiatorNegotiateResponse(secondUuid, contexts);
 
         assertOffset(offset);
     }
@@ -114,7 +116,7 @@ public class ILink3ContextsTest
         final long firstUuid = oldUuid.connectUuid();
         assertEquals(0, oldUuid.connectLastUuid());
         assertTrue(oldUuid.newlyAllocated());
-        oldUuid.confirmUuid(contexts);
+        onInitiatorNegotiateResponse(oldUuid, contexts);
 
         final int offset = contexts.offset();
 
@@ -122,7 +124,7 @@ public class ILink3ContextsTest
         assertFalse(secondUuid.newlyAllocated());
         assertEquals(firstUuid, secondUuid.connectLastUuid());
         assertEquals(firstUuid, secondUuid.connectUuid());
-        secondUuid.confirmUuid(contexts);
+        onInitiatorNegotiateResponse(secondUuid, contexts);
 
         assertOffset(offset);
 
@@ -134,7 +136,7 @@ public class ILink3ContextsTest
         assertTrue(reloadedUuid.newlyAllocated());
         assertEquals(firstUuid, reloadedUuid.connectLastUuid());
         assertNotEquals(firstUuid, secondUuidValue);
-        reloadedUuid.confirmUuid(contexts);
+        onInitiatorNegotiateResponse(reloadedUuid, contexts);
 
         assertOffset(offset);
 
@@ -142,7 +144,7 @@ public class ILink3ContextsTest
         assertFalse(reloadedUuid2.newlyAllocated());
         assertEquals(secondUuidValue, reloadedUuid2.connectLastUuid());
         assertEquals(secondUuidValue, reloadedUuid2.connectUuid());
-        reloadedUuid2.confirmUuid(contexts);
+        onInitiatorNegotiateResponse(reloadedUuid2, contexts);
 
         assertOffset(offset);
     }
@@ -152,14 +154,14 @@ public class ILink3ContextsTest
     {
         final ILink3Context firstContext = calculateUuid(false);
         final long firstUuid = firstContext.connectUuid();
-        firstContext.confirmUuid(contexts);
+        onInitiatorNegotiateResponse(firstContext, contexts);
 
         final ILink3Context secondContext = calculateUuid(false);
         final long secondUuid = secondContext.connectUuid();
         assertEquals(firstUuid, secondContext.connectLastUuid());
         assertTrue(secondContext.newlyAllocated());
         assertNotEquals(firstUuid, secondUuid);
-        secondContext.confirmUuid(contexts);
+        onInitiatorNegotiateResponse(secondContext, contexts);
 
         final int offset = contexts.offset();
 
@@ -170,9 +172,21 @@ public class ILink3ContextsTest
         assertFalse(thirdContext.newlyAllocated());
         assertEquals(secondUuid, thirdContext.connectLastUuid());
         assertEquals(secondUuid, thirdContext.connectUuid());
-        thirdContext.confirmUuid(contexts);
+        onInitiatorNegotiateResponse(thirdContext, contexts);
 
         assertOffset(offset);
+    }
+
+    private void onInitiatorNegotiateResponse(final ILink3Context context, final FixPContexts contexts)
+    {
+        if (context.onInitiatorNegotiateResponse())
+        {
+            contexts.saveNewContext(context);
+        }
+        else
+        {
+            contexts.updateContext(context);
+        }
     }
 
     // Assert that we're not repeatedly growing the file with many reconnects with new offsets.
@@ -187,7 +201,7 @@ public class ILink3ContextsTest
         return (ILink3Context)contexts.calculateInitiatorContext(key, reestablishConnection);
     }
 
-    @After
+    @AfterEach
     public void close()
     {
         contexts.close();

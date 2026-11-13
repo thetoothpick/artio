@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,9 +30,9 @@ import static uk.co.real_logic.artio.util.CustomMatchers.hasResult;
  */
 public class FixMessage extends Int2ObjectHashMap<String>
 {
-
     private Session session;
     private int sequenceIndex;
+    private long messageType;
     private MessageStatus status;
     private boolean valid;
 
@@ -95,6 +95,16 @@ public class FixMessage extends Int2ObjectHashMap<String>
         return sequenceIndex;
     }
 
+    public void messageType(final long messageType)
+    {
+        this.messageType = messageType;
+    }
+
+    public long messageType()
+    {
+        return messageType;
+    }
+
     public void status(final MessageStatus status)
     {
         this.status = status;
@@ -125,11 +135,13 @@ public class FixMessage extends Int2ObjectHashMap<String>
         return getInt(Constants.CANCEL_ON_DISCONNECT_TYPE);
     }
 
+    @Override
     public FixMessage clone()
     {
         final FixMessage theClone = new FixMessage();
         theClone.session(session);
         theClone.sequenceIndex(sequenceIndex);
+        theClone.messageType(messageType);
         theClone.status(status);
         theClone.putAll(this);
         return theClone;
@@ -144,11 +156,11 @@ public class FixMessage extends Int2ObjectHashMap<String>
         put(Constants.SENDER_COMP_ID, oldTargetCompId);
     }
 
+    @Override
     public String toString()
     {
-        return "FixMessage{" +
-            "session=" + session +
-            ", sequenceIndex=" + sequenceIndex +
+        return "FixMessage{sequenceIndex=" + sequenceIndex +
+            ", messageType=" + messageType +
             ", status=" + status +
             ", valid=" + valid +
             ", " + super.toString() +

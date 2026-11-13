@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ package uk.co.real_logic.artio.dictionary.generation;
 
 import org.agrona.generation.OutputManager;
 import uk.co.real_logic.artio.builder.Printer;
+import uk.co.real_logic.artio.dictionary.Generated;
 import uk.co.real_logic.artio.dictionary.ir.Aggregate;
 import uk.co.real_logic.artio.dictionary.ir.Dictionary;
 import uk.co.real_logic.artio.dictionary.ir.Message;
@@ -28,6 +29,7 @@ import java.util.stream.Stream;
 
 import static java.util.stream.Collectors.joining;
 import static uk.co.real_logic.artio.dictionary.generation.DecoderGenerator.decoderClassName;
+import static uk.co.real_logic.artio.dictionary.generation.GenerationUtil.GENERATED_ANNOTATION;
 import static uk.co.real_logic.artio.dictionary.generation.GenerationUtil.fileHeader;
 import static uk.co.real_logic.artio.dictionary.generation.GenerationUtil.importFor;
 
@@ -37,7 +39,10 @@ class PrinterGenerator
     private static final String CLASS_DECLARATION =
         importFor(Printer.class) +
         importFor(AsciiBuffer.class) +
-        "\npublic class PrinterImpl implements Printer\n" +
+        importFor(Generated.class) +
+        "\n" +
+        GENERATED_ANNOTATION +
+        "public class PrinterImpl implements Printer\n" +
         "{\n\n";
 
     private final Dictionary dictionary;
@@ -53,6 +58,11 @@ class PrinterGenerator
 
     public void generate()
     {
+        if (dictionary.shared())
+        {
+            return;
+        }
+
         outputManager.withOutput(CLASS_NAME,
             (out) ->
             {

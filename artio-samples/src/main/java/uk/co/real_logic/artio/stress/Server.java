@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -51,11 +51,13 @@ public class Server implements Agent
             .bindTo("localhost", StressConfiguration.PORT)
             .logFileDir("stress-server-logs")
             .libraryAeronChannel(aeronChannel)
-            .sessionPersistenceStrategy(alwaysPersistent());
-
-        configuration
+            .sessionPersistenceStrategy(alwaysPersistent())
             .authenticationStrategy(authenticationStrategy)
             .agentNamePrefix("server-");
+
+        configuration.aeronArchiveContext()
+            .controlRequestChannel(StressConfiguration.CONTROL_REQUEST_CHANNEL)
+            .controlResponseChannel(StressConfiguration.SERVER_CONTROL_RESPONSE_CHANNEL);
 
         System.out.println("Server Logs at " + configuration.logFileDir());
 
@@ -67,6 +69,8 @@ public class Server implements Agent
 
         final Archive.Context archiveContext = new Archive.Context()
             .threadingMode(ArchiveThreadingMode.SHARED)
+            .controlChannel(StressConfiguration.CONTROL_REQUEST_CHANNEL)
+            .replicationChannel(StressConfiguration.REPLICATION_CHANNEL)
             .deleteArchiveOnStart(true);
 
         mediaDriver = ArchivingMediaDriver.launch(context, archiveContext);
@@ -87,16 +91,19 @@ public class Server implements Agent
         return new AgentRunner(idleStrategy, errorHandler, null, new Server());
     }
 
+    @Override
     public int doWork()
     {
         return fixLibrary.poll(1);
     }
 
+    @Override
     public String roleName()
     {
         return "stress server";
     }
 
+    @Override
     public void onClose()
     {
         fixLibrary.close();

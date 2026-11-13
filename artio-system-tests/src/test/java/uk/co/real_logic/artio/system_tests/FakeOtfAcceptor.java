@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,6 +28,7 @@ import uk.co.real_logic.artio.util.CharFormatter;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.function.Predicate;
 import java.util.stream.Stream;
 
@@ -51,6 +52,7 @@ public class FakeOtfAcceptor implements OtfMessageAcceptor
     private String senderCompId;
     private FixMessage message;
 
+    @Override
     public MessageControl onNext()
     {
         senderCompId = null;
@@ -60,6 +62,7 @@ public class FakeOtfAcceptor implements OtfMessageAcceptor
         return MessageControl.CONTINUE;
     }
 
+    @Override
     public MessageControl onComplete()
     {
         isCompleted = true;
@@ -68,6 +71,7 @@ public class FakeOtfAcceptor implements OtfMessageAcceptor
         return MessageControl.CONTINUE;
     }
 
+    @Override
     public synchronized MessageControl onField(
         final int tag, final AsciiBuffer buffer, final int offset, final int length)
     {
@@ -81,21 +85,25 @@ public class FakeOtfAcceptor implements OtfMessageAcceptor
         return MessageControl.CONTINUE;
     }
 
+    @Override
     public MessageControl onGroupHeader(final int tag, final int numInGroup)
     {
         return MessageControl.CONTINUE;
     }
 
+    @Override
     public MessageControl onGroupBegin(final int tag, final int numInGroup, final int index)
     {
         return MessageControl.CONTINUE;
     }
 
+    @Override
     public MessageControl onGroupEnd(final int tag, final int numInGroup, final int index)
     {
         return MessageControl.CONTINUE;
     }
 
+    @Override
     public boolean onError(
         final ValidationError error,
         final long messageType,
@@ -159,7 +167,7 @@ public class FakeOtfAcceptor implements OtfMessageAcceptor
     {
         return messages()
             .stream()
-            .filter((fixMessage) -> fixMessage.get(MSG_TYPE).equals(messageType));
+            .filter((fixMessage) -> Objects.equals(fixMessage.get(MSG_TYPE), messageType));
     }
 
     public Stream<FixMessage> receivedReplay(final String messageType, final int sequenceNumber)
@@ -181,9 +189,9 @@ public class FakeOtfAcceptor implements OtfMessageAcceptor
         messages(hasSequenceIndex(sequenceIndex), (msg) -> true);
     }
 
-    void logonMessagesHaveSequenceNumbers(final int sequenceIndex)
+    void logonMessagesHaveSequenceNumbers(final int sequenceNumber)
     {
-        messages(hasMessageSequenceNumber(sequenceIndex), FixMessage::isLogon);
+        messages(hasMessageSequenceNumber(sequenceNumber), FixMessage::isLogon);
     }
 
     private void messages(final Matcher<FixMessage> matcher, final Predicate<? super FixMessage> predicate)

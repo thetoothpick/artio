@@ -15,7 +15,7 @@
  */
 package uk.co.real_logic.artio.dictionary.generation;
 
-import org.agrona.LangUtil;
+import org.agrona.CloseHelper;
 import org.agrona.concurrent.Agent;
 
 import java.io.ByteArrayOutputStream;
@@ -23,7 +23,6 @@ import java.io.PrintStream;
 import java.lang.management.ManagementFactory;
 import java.lang.management.ThreadInfo;
 import java.lang.management.ThreadMXBean;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
@@ -43,38 +42,12 @@ public final class Exceptions
      */
     public static void closeAll(final List<? extends AutoCloseable> closeables)
     {
-        if (closeables == null)
-        {
-            return;
-        }
-
-        final List<Exception> exceptions = new ArrayList<>();
-        for (final AutoCloseable closeable : closeables)
-        {
-            if (closeable != null)
-            {
-                try
-                {
-                    closeable.close();
-                }
-                catch (final Exception ex)
-                {
-                    exceptions.add(ex);
-                }
-            }
-        }
-
-        if (!exceptions.isEmpty())
-        {
-            final Exception exception = exceptions.remove(0);
-            exceptions.forEach(exception::addSuppressed);
-            LangUtil.rethrowUnchecked(exception);
-        }
+        CloseHelper.closeAll(closeables);
     }
 
     public static void closeAll(final AutoCloseable... closeables)
     {
-        closeAll(Arrays.asList(closeables));
+        CloseHelper.closeAll(closeables);
     }
 
     public static void closeAll(final Agent... agents)
@@ -124,7 +97,7 @@ public final class Exceptions
     public static boolean isJustDisconnect(final Exception ex)
     {
         final String msg = ex.getMessage();
-        return msg != null && (msg.contains("Connection reset by peer") ||
+        return msg != null && (msg.contains("Connection reset") ||
                msg.contains("An established connection was aborted"));
     }
 

@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,33 +15,46 @@
  */
 package uk.co.real_logic.artio.fields;
 
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static uk.co.real_logic.artio.fields.EpochFractionFormat.MICROSECONDS;
 
 public class UtcTimestampEncoderInvalidCasesTest
 {
-    @Test(expected = IllegalArgumentException.class)
+    @Test
     public void cannotParseTimestampTooLow()
     {
-        new UtcTimestampEncoder().encode(UtcTimestampEncoder.MIN_EPOCH_MILLIS - 1);
+        assertThrows(IllegalArgumentException.class, () ->
+        {
+            new UtcTimestampEncoder().encode(UtcTimestampEncoder.MIN_EPOCH_MILLIS - 1);
+        });
     }
 
-    @Test(expected = IllegalArgumentException.class)
+    @Test
     public void cannotParseTimestampTooHigh()
     {
-        new UtcTimestampEncoder().encode(UtcTimestampEncoder.MAX_EPOCH_MILLIS + 1);
+        assertThrows(IllegalArgumentException.class, () ->
+        {
+            new UtcTimestampEncoder().encode(UtcTimestampEncoder.MAX_EPOCH_MILLIS + 1);
+        });
     }
 
-    @Test(expected = IllegalArgumentException.class)
+    @Test
     public void cannotParseTimestampTooLowMicros()
     {
-        new UtcTimestampEncoder(MICROSECONDS).encode(UtcTimestampEncoder.MIN_EPOCH_MICROS - 1);
+        assertThrows(IllegalArgumentException.class, () ->
+        {
+            new UtcTimestampEncoder(MICROSECONDS).encode(UtcTimestampEncoder.MIN_EPOCH_MICROS - 1);
+        });
     }
 
-    @Test(expected = IllegalArgumentException.class)
+    @Test
     public void cannotParseTimestampTooHighMicros()
     {
-        new UtcTimestampEncoder(MICROSECONDS).encode(UtcTimestampEncoder.MAX_EPOCH_MICROS + 1);
+        assertThrows(IllegalArgumentException.class, () ->
+        {
+            new UtcTimestampEncoder(MICROSECONDS).encode(UtcTimestampEncoder.MAX_EPOCH_MICROS + 1);
+        });
     }
 }

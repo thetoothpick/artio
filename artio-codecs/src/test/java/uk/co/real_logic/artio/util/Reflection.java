@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,6 +21,7 @@ import uk.co.real_logic.artio.builder.Encoder;
 import uk.co.real_logic.artio.fields.DecimalFloat;
 
 import org.agrona.AsciiSequenceView;
+import uk.co.real_logic.artio.fields.ReadOnlyDecimalFloat;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
@@ -38,6 +39,18 @@ public final class Reflection
         set(object, setter, int.class, value);
     }
 
+    public static void setLong(final Object object, final String setter, final long value)
+        throws Exception
+    {
+        set(object, setter, long.class, value);
+    }
+
+    public static void setChar(final Object object, final String setter, final char value)
+        throws Exception
+    {
+        set(object, setter, char.class, value);
+    }
+
     @SuppressWarnings({"unchecked", "rawtypes"})
     public static void setEnum(final Object object, final String setter, final String enumClassName, final String value)
         throws Exception
@@ -50,7 +63,7 @@ public final class Reflection
     public static void setFloat(final Object object, final String setter, final DecimalFloat value)
         throws Exception
     {
-        set(object, setter, DecimalFloat.class, value);
+        set(object, setter, ReadOnlyDecimalFloat.class, value);
     }
 
     public static void setFloat(final Object object, final String setter, final long value, final int scale)
@@ -75,6 +88,27 @@ public final class Reflection
         throws Exception
     {
         set(object, setter, byte[].class, value);
+    }
+
+    public static void setByteArrayAsCopy(
+        final Object object,
+        final String setter,
+        final byte[] value,
+        final int offset,
+        final int length
+    )
+        throws Exception
+    {
+        try
+        {
+            object.getClass()
+                    .getMethod(setter + "AsCopy", byte[].class, int.class, int.class)
+                    .invoke(object, value, offset, length);
+        }
+        catch (final InvocationTargetException e)
+        {
+            LangUtil.rethrowUnchecked(e.getCause());
+        }
     }
 
     private static void set(
@@ -215,12 +249,22 @@ public final class Reflection
         return (char[])get(decoder, field);
     }
 
-    public static int getInt(final Decoder decoder, final String field) throws Exception
+    public static char getChar(final Object object, final String field) throws Exception
     {
-        return (int)get(decoder, field);
+        return (char)get(object, field);
     }
 
-    public static String getString(final Decoder decoder, final String field) throws Exception
+    public static int getInt(final Object object, final String field) throws Exception
+    {
+        return (int)get(object, field);
+    }
+
+    public static boolean getBoolean(final Object object, final String field) throws Exception
+    {
+        return (boolean)get(object, field);
+    }
+
+    public static String getString(final Object decoder, final String field) throws Exception
     {
         return (String)get(decoder, field);
     }
@@ -228,9 +272,8 @@ public final class Reflection
     public static AsciiSequenceView getAsciiSequenceView(final Object value, final String name) throws Exception
     {
         final AsciiSequenceView view = new AsciiSequenceView();
-        value.getClass()
+        return (AsciiSequenceView)value.getClass()
                 .getMethod(name, AsciiSequenceView.class)
                 .invoke(value, view);
-        return view;
     }
 }

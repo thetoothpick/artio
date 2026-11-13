@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,6 +31,7 @@ import java.nio.channels.ClosedByInterruptException;
 import java.util.ArrayList;
 import java.util.List;
 
+import static io.aeron.Aeron.NULL_VALUE;
 import static uk.co.real_logic.artio.CommonConfiguration.TIME_MESSAGES;
 import static uk.co.real_logic.artio.dictionary.generation.Exceptions.closeAll;
 
@@ -46,13 +47,15 @@ public abstract class GatewayProcess implements AutoCloseable
     protected FixCounters fixCounters;
     protected ErrorHandler errorHandler;
     protected Aeron aeron;
-    protected Agent monitoringAgent;
+    protected MonitoringAgent monitoringAgent;
+    protected Agent monitoringCompositeAgent;
+    protected long gatewayId = NULL_VALUE;
 
-    protected void init(final CommonConfiguration configuration)
+    protected void init(final CommonConfiguration configuration, final int libraryId)
     {
         this.configuration = configuration;
         initMonitoring(configuration);
-        initAeron(configuration);
+        initAeron(configuration, libraryId);
     }
 
     protected abstract boolean shouldRethrowExceptionInErrorHandler();
@@ -71,42 +74,18 @@ public abstract class GatewayProcess implements AutoCloseable
             return null;
         }
 
-        final Agent invokerAgent = invoker.agent();
-        if (configuration.gracefulShutdown())
-        {
-            return invokerAgent;
-        }
-
-        return new Agent()
-        {
-            public void onStart()
-            {
-                invokerAgent.onStart();
-            }
-
-            public int doWork() throws Exception
-            {
-                return invokerAgent.doWork();
-            }
-
-            public String roleName()
-            {
-                return invokerAgent.roleName();
-            }
-
-            public void onClose()
-            {
-                // Deliberately blank to stop the agent from gracefully closing
-            }
-        };
+        return invoker.agent();
     }
 
-    protected void initAeron(final CommonConfiguration configuration)
+    protected void initAeron(final CommonConfiguration configuration, final int libraryId)
     {
         final Aeron.Context context = configureAeronContext(configuration);
         aeron = Aeron.connect(context);
+
+        gatewayId = configuration.gatewayId();
+
         CloseChecker.onOpen(context.aeronDirectoryName(), aeron);
-        fixCounters = new FixCounters(aeron, this instanceof FixEngine);
+        fixCounters = new FixCounters(aeron, this instanceof FixEngine, libraryId, gatewayId);
     }
 
     protected Aeron.Context configureAeronContext(final CommonConfiguration configuration)
@@ -151,10 +130,11 @@ public abstract class GatewayProcess implements AutoCloseable
         final MonitoringAgentFactory monitoringAgentFactory = configuration.monitoringAgentFactory();
         if (monitoringAgentFactory != null)
         {
-            agents.add(monitoringAgentFactory.make(
+            monitoringAgent = monitoringAgentFactory.make(
                 monitoringFile.errorBuffer(),
                 configuration.agentNamePrefix(),
-                aeronArchive));
+                aeronArchive);
+            agents.add(monitoringAgent);
         }
 
         if (agent != null)
@@ -164,29 +144,21 @@ public abstract class GatewayProcess implements AutoCloseable
 
         if (!agents.isEmpty())
         {
-            this.monitoringAgent = new CompositeAgent(agents);
+            this.monitoringCompositeAgent = new CompositeAgent(agents);
         }
     }
 
+    @Override
     public void close()
     {
-        if (configuration.gracefulShutdown())
-        {
-            closeAll(
-                fixCounters,
-                () ->
-                {
-                    aeron.close();
-                    // Only record this as closed if the aeron.close() succeeded.
-                    CloseChecker.onClose(configuration.aeronContext().aeronDirectoryName(), aeron);
-                },
-                monitoringFile);
-        }
-        else
-        {
-            aeron.close();
-            CloseChecker.onClose(configuration.aeronContext().aeronDirectoryName(), aeron);
-            closeAll(monitoringFile);
-        }
+        closeAll(
+            fixCounters,
+            () ->
+            {
+                aeron.close();
+                // Only record this as closed if the aeron.close() succeeded.
+                CloseChecker.onClose(configuration.aeronContext().aeronDirectoryName(), aeron);
+            },
+            monitoringFile);
     }
 }

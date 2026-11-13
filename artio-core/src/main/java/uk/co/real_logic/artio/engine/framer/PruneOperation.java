@@ -35,12 +35,15 @@ import static uk.co.real_logic.artio.LogTag.STATE_CLEANUP;
 
 /**
  * PruneOperation is sent to the replayer in order to find the outbound replay query positions.
- * Then it get's sent to the Framer to query the inbound replay positions, then it delegates to
+ * Then it gets sent to the Framer to query the inbound replay positions, then it delegates to
  * aeron archiver to prune the archive
  */
 public class PruneOperation
     implements ReplayerCommand, Reply<Long2LongHashMap>, RecordingDescriptorConsumer, AdminCommand
 {
+
+    public static final boolean STATE_CLEANUP_ENABLED = DebugLogger.isEnabled(STATE_CLEANUP);
+
     public static class Formatters
     {
         private final CharFormatter findingPositionsFormatter = new CharFormatter(
@@ -48,7 +51,10 @@ public class PruneOperation
         private final CharFormatter foundPositionsFormatter = new CharFormatter(
             "PruneOperation: complete recordingIdToNewStartPosition=%s");
         private final CharFormatter filteredRecordingFormatter = new CharFormatter(
-            "PruneOperation: filtered recordingId=%s,segmentStartPosition=%s,lowerBoundPrunePosition=%s");
+            "PruneOperation: filtered recordingId=%s,segmentStartPosition=%s,lowerBoundPrunePosition=%s" +
+            ",segmentFileLength=%s,requestedNewStartPosition=%s,startPosition=%s");
+        private final CharFormatter purgedSegmentsFormatter = new CharFormatter(
+            "PruneOperation: purged recordingId=%s,oldStartPosition=%s,newStartPosition=%s,durationNs=%s");
     }
 
     private final Formatters formatters;
@@ -69,6 +75,8 @@ public class PruneOperation
     private long requestedNewStartPosition;
     private long segmentStartPosition;
     private long lowerBoundPrunePosition;
+    private int stashedSegmentFileLength;
+    private long stashedStartPosition;
 
     public PruneOperation(final Formatters formatters, final Exception error)
     {
@@ -97,33 +105,45 @@ public class PruneOperation
         replyState = State.EXECUTING;
     }
 
+    @Override
     public Exception error()
     {
         return error;
     }
 
+    @Override
     public Long2LongHashMap resultIfPresent()
     {
         return result;
     }
 
+    @Override
     public State state()
     {
         return replyState;
     }
 
     // On Framer thread
+    @Override
     public void execute(final Framer framer)
     {
-        recordingCoordinator.forEachRecording(allRecordingIds::add);
+        DebugLogger.log(STATE_CLEANUP, "PruneOperation: starting on Framer Thread");
+
+        recordingCoordinator.forEachRecording((libraryId, recordingId) -> allRecordingIds.add(recordingId));
 
         // move over to the replayer thread
-        framer.schedule(() -> replayerCommandQueue.offer(this) ? Continuation.COMPLETE : BACK_PRESSURED);
+        if (!replayerCommandQueue.offer(this))
+        {
+            framer.schedule(() -> replayerCommandQueue.offer(this) ? Continuation.COMPLETE : BACK_PRESSURED);
+        }
     }
 
     // On Replayer Thread
+    @Override
     public void execute()
     {
+        DebugLogger.log(STATE_CLEANUP, "PruneOperation: starting on Replayer Thread");
+
         inboundReplayQuery.queryStartPositions(recordingIdToNewStartPosition);
         outboundReplayQuery.queryStartPositions(recordingIdToNewStartPosition);
 
@@ -134,7 +154,7 @@ public class PruneOperation
 
     private void findAllRecordingPositions()
     {
-        if (DebugLogger.isEnabled(STATE_CLEANUP))
+        if (STATE_CLEANUP_ENABLED)
         {
             final CharFormatter formatter = formatters.findingPositionsFormatter
                 .clear()
@@ -169,7 +189,7 @@ public class PruneOperation
             }
         }
 
-        if (DebugLogger.isEnabled(STATE_CLEANUP))
+        if (STATE_CLEANUP_ENABLED)
         {
             final CharFormatter formatter = formatters.foundPositionsFormatter
                 .clear()
@@ -205,13 +225,36 @@ public class PruneOperation
                 // Don't prune if you're < a segment away from the start of the stream.
                 if (segmentStartPosition < lowerBoundPrunePosition)
                 {
-                    DebugLogger.log(STATE_CLEANUP, formatters.filteredRecordingFormatter,
-                        recordingId, segmentStartPosition, lowerBoundPrunePosition);
+                    if (STATE_CLEANUP_ENABLED)
+                    {
+                        formatters.filteredRecordingFormatter
+                            .clear()
+                            .with(recordingId)
+                            .with(segmentStartPosition)
+                            .with(lowerBoundPrunePosition)
+                            .with(stashedSegmentFileLength)
+                            .with(requestedNewStartPosition)
+                            .with(stashedStartPosition);
+                        DebugLogger.log(STATE_CLEANUP, formatters.filteredRecordingFormatter);
+                    }
+
                     it.remove();
                 }
                 else
                 {
+                    final long start = System.nanoTime();
                     aeronArchive.purgeSegments(recordingId, segmentStartPosition);
+                    if (STATE_CLEANUP_ENABLED)
+                    {
+                        final long durationNs = System.nanoTime() - start;
+                        formatters.purgedSegmentsFormatter
+                            .clear()
+                            .with(recordingId)
+                            .with(stashedStartPosition)
+                            .with(segmentStartPosition)
+                            .with(durationNs);
+                        DebugLogger.log(STATE_CLEANUP, formatters.purgedSegmentsFormatter);
+                    }
                     recordingIdToNewStartPosition.put(recordingId, segmentStartPosition);
                 }
             }
@@ -235,6 +278,7 @@ public class PruneOperation
         }
     }
 
+    @Override
     public void onRecordingDescriptor(
         final long controlSessionId, final long correlationId, final long recordingId, final long startTimestamp,
         final long stopTimestamp, final long startPosition, final long stopPosition, final int initialTermId,
@@ -245,6 +289,8 @@ public class PruneOperation
             startPosition, requestedNewStartPosition, termBufferLength, segmentFileLength);
         lowerBoundPrunePosition = segmentFileBasePosition(
             startPosition, startPosition, termBufferLength, segmentFileLength) + segmentFileLength;
+        stashedSegmentFileLength = segmentFileLength;
+        stashedStartPosition = startPosition;
     }
 
     private void onPruneError(final Exception e, final Long2LongHashMap.EntryIterator it)
@@ -261,6 +307,7 @@ public class PruneOperation
         replyState = State.ERRORED;
     }
 
+    @Override
     public String toString()
     {
         return "PruneOperation{" +

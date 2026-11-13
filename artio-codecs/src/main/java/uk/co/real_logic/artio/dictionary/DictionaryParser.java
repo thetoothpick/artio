@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -33,6 +33,8 @@ import javax.xml.xpath.XPathFactory;
 import java.io.InputStream;
 import java.util.*;
 import java.util.function.Consumer;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 import static java.util.stream.Collectors.toMap;
 import static javax.xml.xpath.XPathConstants.NODESET;
@@ -49,6 +51,10 @@ public final class DictionaryParser
     private static final String COMPONENT_EXPR = "/fix/components/component";
     private static final String HEADER_EXPR = "/fix/header/field";
     private static final String TRAILER_EXPR = "/fix/trailer/field";
+
+    public static final String HEADER = "Header";
+    public static final String TRAILER = "Trailer";
+    public static final String DEFAULT_SPEC_TYPE = "FIX";
 
     private final DocumentBuilder documentBuilder;
     private final XPathExpression findField;
@@ -91,6 +97,7 @@ public final class DictionaryParser
         sanitizeDictionary(fields, messages);
         validateDataFields(messages);
         validateDataFields(components.values());
+        validateAnyFields(messages);
 
         if (fixtDictionary != null)
         {
@@ -112,14 +119,14 @@ public final class DictionaryParser
             final int minorVersion = getInt(fixAttributes, "minor");
 
             final Component header = extractComponent(
-                document, fields, findHeader, "Header", components, forwardReferences);
+                document, fields, findHeader, HEADER, components, forwardReferences);
             final Component trailer = extractComponent(
-                document, fields, findTrailer, "Trailer", components, forwardReferences);
+                document, fields, findTrailer, TRAILER, components, forwardReferences);
 
             validateDataFieldsInAggregate(header);
             validateDataFieldsInAggregate(trailer);
 
-            final String specType = getValueOrDefault(fixAttributes, "type", "FIX");
+            final String specType = getValueOrDefault(fixAttributes, "type", DEFAULT_SPEC_TYPE);
             return new Dictionary(messages, fields, components, header, trailer, specType, majorVersion, minorVersion);
         }
     }
@@ -131,36 +138,51 @@ public final class DictionaryParser
 
     private void validateDataFieldsInAggregate(final Aggregate aggregate)
     {
-        final Map<String, Field> nameToField = aggregate
-            .fieldEntries()
-            .map(entry -> (Field)entry.element())
-            .collect(toMap(Field::name, f -> f));
+        final Map<String, Field> nameToField;
+        try
+        {
+            nameToField = aggregate
+                .fieldEntries()
+                .map(entry -> (Field)entry.element())
+                .collect(toMap(Field::name, f -> f));
+        }
+        catch (final IllegalStateException e)
+        {
+            throw new IllegalStateException("Exception when processing: " + aggregate.name(), e);
+        }
 
         for (final Entry entry : aggregate.entries())
         {
             entry.forEach(
                 field ->
                 {
-                    if (field.type().isDataBased())
-                    {
-                        final String name = field.name();
-                        if (!(hasLengthField(field, "Length", nameToField) ||
-                            hasLengthField(field, "Len", nameToField)))
-                        {
-                            throw new IllegalStateException(
-                                String.format("Each DATA field must have a corresponding LENGTH field using the " +
-                                "suffix 'Len' or 'Length'. %1$s is missing a length field in %2$s",
-                                name,
-                                aggregate.name()));
-                        }
-                    }
+                    checkAssociatedLengthField(nameToField, field, aggregate.name());
                 },
                 this::validateDataFieldsInAggregate,
-                this::validateDataFieldsInAggregate);
+                this::validateDataFieldsInAggregate,
+                (anyFields) -> {});
         }
     }
 
-    private boolean hasLengthField(final Field field, final String suffix, final Map<String, Field> nameToField)
+    public static void checkAssociatedLengthField(
+        final Map<String, Field> nameToField, final Field field, final String aggregateName)
+    {
+        if (field.type().isDataBased())
+        {
+            final String name = field.name();
+            if (!(hasLengthField(field, "Length", nameToField) ||
+                hasLengthField(field, "Len", nameToField)))
+            {
+                throw new IllegalStateException(
+                    String.format("Each DATA field must have a corresponding LENGTH field using the " +
+                    "suffix 'Len' or 'Length'. %1$s is missing a length field in %2$s",
+                    name,
+                    aggregateName));
+            }
+        }
+    }
+
+    private static boolean hasLengthField(final Field field, final String suffix, final Map<String, Field> nameToField)
     {
         final String fieldName = field.name() + suffix;
         final Field associatedLengthField = nameToField.get(fieldName);
@@ -175,6 +197,22 @@ public final class DictionaryParser
         }
 
         return false;
+    }
+
+    private void validateAnyFields(final List<Message> messages)
+    {
+        for (final Message message : messages)
+        {
+            final List<String> anyFieldsEntries = message.anyFieldsEntries()
+                .map(Entry::name)
+                .collect(Collectors.toList());
+
+            if (anyFieldsEntries.size() > 1)
+            {
+                throw new IllegalStateException("At most one anyFields entry is allowed, but " + message.name() +
+                    " contains multiple: " + anyFieldsEntries);
+            }
+        }
     }
 
     private void correctMultiCharacterCharEnums(final Map<String, Field> fields)
@@ -217,7 +255,7 @@ public final class DictionaryParser
                 final String name = name(attributes);
                 final Component component = new Component(name);
 
-                extractEntries(node.getChildNodes(), fields, component.entries(), components, forwardReferences);
+                extractEntries(node.getChildNodes(), fields, component.entries(), components, forwardReferences, false);
 
                 components.put(name, component);
             });
@@ -302,7 +340,7 @@ public final class DictionaryParser
                 final String category = getValue(attributes, "msgcat");
                 final Message message = new Message(name, fullType, category);
 
-                extractEntries(node.getChildNodes(), fields, message.entries(), components, forwardReferences);
+                extractEntries(node.getChildNodes(), fields, message.entries(), components, forwardReferences, true);
 
                 messages.add(message);
             });
@@ -315,7 +353,8 @@ public final class DictionaryParser
         final Map<String, Field> fields,
         final List<Entry> entries,
         final Map<String, Component> components,
-        final Map<Entry, String> forwardReferences)
+        final Map<Entry, String> forwardReferences,
+        final boolean isMessage)
     {
         forEach(childNodes,
             (node) ->
@@ -342,8 +381,14 @@ public final class DictionaryParser
                         break;
 
                     case "group":
-                        final Group group = Group.of(fields.get(name));
-                        extractEntries(node.getChildNodes(), fields, group.entries(), components, forwardReferences);
+                        final Group group = Group.of(fields.get(name), fields);
+                        extractEntries(
+                            node.getChildNodes(),
+                            fields,
+                            group.entries(),
+                            components,
+                            forwardReferences,
+                            false);
                         newEntry.accept(group);
                         break;
 
@@ -355,6 +400,15 @@ public final class DictionaryParser
                             forwardReferences.put(entry, name);
                         }
                         entries.add(entry);
+                        break;
+
+                    case "anyFields":
+                        if (!isMessage)
+                        {
+                            throw new IllegalStateException(
+                                "Only messages can contain anyFields entries (" + name + ")");
+                        }
+                        newEntry.accept(new AnyFields(name));
                         break;
                 }
             });
@@ -371,7 +425,7 @@ public final class DictionaryParser
     {
         final Component component = new Component(name);
         final NodeList nodes = evaluate(document, expression);
-        extractEntries(nodes, fields, component.entries(), components, forwardReferences);
+        extractEntries(nodes, fields, component.entries(), components, forwardReferences, false);
 
         return component;
     }
@@ -383,14 +437,28 @@ public final class DictionaryParser
 
     private boolean isRequired(final NamedNodeMap attributes)
     {
-        return "Y".equals(getValue(attributes, "required"));
+        // We interpret missing required clauses as being optional.
+        final String required = getOptionalValue(attributes, "required");
+        return "Y".equals(required);
     }
 
     private String getValue(final NamedNodeMap attributes, final String attributeName)
     {
         Objects.requireNonNull(attributes, "Null attributes for " + attributeName);
-        return Objects.requireNonNull(getOptionalValue(attributes, attributeName), "Empty item for:" +
-           attributeName);
+        final String optionalValue = getOptionalValue(attributes, attributeName);
+        return Objects.requireNonNull(optionalValue,
+            "Empty item for: " + attributeName + " in " + toString(attributes));
+    }
+
+    private String toString(final NamedNodeMap attributes)
+    {
+        return IntStream.range(0, attributes.getLength())
+                        .mapToObj(i ->
+                        {
+                            final Node node = attributes.item(i);
+                            return node.getNodeName() + "=" + node.getNodeValue();
+                        })
+                        .collect(Collectors.joining(",", "{", "}"));
     }
 
     private String getOptionalValue(final NamedNodeMap attributes, final String attributeName)
@@ -457,7 +525,9 @@ public final class DictionaryParser
             if (!allowDuplicates)
             {
                 throw new IllegalStateException(String.format(
-                        "%sUse -D%s=true to allow duplicated fields (Dangerous. May break parser).",
+                        "%sUse -D%s=true to allow duplicated fields (Dangerous. May break parser). " +
+                        "If using shared codecs then duplicate fields are defined on a per dictionary basis," +
+                        " using SharedCodecConfiguration.withDictionary().",
                         errorMessage,
                         CodecConfiguration.FIX_CODECS_ALLOW_DUPLICATE_FIELDS_PROPERTY));
             }
@@ -477,26 +547,27 @@ public final class DictionaryParser
                 (field) -> addField(messageName, field, allFields, path, errorCollector),
                 (group) ->
                 {
-                    path.push(group.name());
+                    path.addLast(group.name());
                     identifyDuplicateFieldDefinitionsForMessage(
                         messageName,
                         group,
                         allFields,
                         path,
                         errorCollector);
-                    path.pop();
+                    path.removeLast();
                 },
                 (component) ->
                 {
-                    path.push(component.name());
+                    path.addLast(component.name());
                     identifyDuplicateFieldDefinitionsForMessage(
                         messageName,
                         component,
                         allFields,
                         path,
                         errorCollector);
-                    path.pop();
-                }
+                    path.removeLast();
+                },
+                (anyFields) -> {}
             );
         }
     }
@@ -533,7 +604,7 @@ public final class DictionaryParser
         }
     }
 
-    private static String enumDescriptionToJavaName(final String enumDescription)
+    public static String enumDescriptionToJavaName(final String enumDescription)
     {
         final StringBuilder enumName = new StringBuilder();
 

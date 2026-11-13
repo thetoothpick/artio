@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,23 +23,31 @@ import io.aeron.archive.ArchivingMediaDriver;
 import io.aeron.archive.client.AeronArchive;
 import io.aeron.archive.codecs.SourceLocation;
 import io.aeron.logbuffer.ControlledFragmentHandler;
-import org.agrona.ErrorHandler;
-import org.agrona.IoUtil;
-import org.agrona.collections.Long2LongHashMap;
-import org.agrona.concurrent.*;
-import org.agrona.concurrent.status.AtomicCounter;
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Test;
-import org.mockito.verification.VerificationMode;
+import io.aeron.logbuffer.Header;
+import org.agrona.BufferUtil;
 import uk.co.real_logic.artio.CommonConfiguration;
 import uk.co.real_logic.artio.TestFixtures;
 import uk.co.real_logic.artio.dictionary.generation.Exceptions;
 import uk.co.real_logic.artio.engine.EngineConfiguration;
+import uk.co.real_logic.artio.engine.SequenceNumberExtractor;
 import uk.co.real_logic.artio.messages.FixPProtocolType;
-import uk.co.real_logic.artio.messages.MessageHeaderEncoder;
+import uk.co.real_logic.artio.messages.ResetSequenceNumberEncoder;
 import uk.co.real_logic.artio.protocol.GatewayPublication;
 import uk.co.real_logic.artio.session.Session;
+import org.agrona.DirectBuffer;
+import org.agrona.ErrorHandler;
+import org.agrona.IoUtil;
+import org.agrona.collections.Long2LongHashMap;
+import org.agrona.collections.LongHashSet;
+import org.agrona.concurrent.*;
+import org.agrona.concurrent.status.AtomicCounter;
+import org.junit.jupiter.api.AfterEach;
+
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+import org.mockito.Mockito;
 
 import java.io.File;
 import java.nio.ByteBuffer;
@@ -49,14 +57,17 @@ import static io.aeron.Aeron.NULL_VALUE;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.aMapWithSize;
 import static org.hamcrest.Matchers.greaterThan;
-import static org.junit.Assert.assertEquals;
+import static org.hamcrest.Matchers.hasEntry;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.*;
 import static uk.co.real_logic.artio.CommonConfiguration.DEFAULT_INBOUND_MAX_CLAIM_ATTEMPTS;
 import static uk.co.real_logic.artio.LogTag.REPLAY;
+import static uk.co.real_logic.artio.TestFixtures.aeronArchiveContext;
 import static uk.co.real_logic.artio.TestFixtures.cleanupMediaDriver;
 import static uk.co.real_logic.artio.TestFixtures.largeTestReqId;
 import static uk.co.real_logic.artio.engine.EngineConfiguration.*;
-import static uk.co.real_logic.artio.engine.logger.ReplayIndexDescriptor.RECORD_LENGTH;
 import static uk.co.real_logic.artio.engine.logger.Replayer.MOST_RECENT_MESSAGE;
 
 public class ReplayIndexTest extends AbstractLogTest
@@ -65,6 +76,7 @@ public class ReplayIndexTest extends AbstractLogTest
 
     private final ExistingBufferFactory existingBufferFactory = spy(new ExistingBufferFactory()
     {
+        @Override
         public ByteBuffer map(final File fileName)
         {
             return LoggerUtil.mapExistingFile(fileName);
@@ -72,6 +84,7 @@ public class ReplayIndexTest extends AbstractLogTest
     });
     private final BufferFactory newBufferFactory = spy(new BufferFactory()
     {
+        @Override
         public ByteBuffer map(final File file, final int size)
         {
             return LoggerUtil.map(file, size);
@@ -80,12 +93,13 @@ public class ReplayIndexTest extends AbstractLogTest
 
     private ReplayIndex replayIndex;
 
-    private final UnsafeBuffer replayPositionBuffer =
-        new UnsafeBuffer(new byte[EngineConfiguration.DEFAULT_REPLAY_POSITION_BUFFER_SIZE]);
+    private final UnsafeBuffer replayPositionBuffer = new UnsafeBuffer(BufferUtil.allocateDirectAligned(
+        EngineConfiguration.DEFAULT_REPLAY_POSITION_BUFFER_SIZE, AtomicBuffer.ALIGNMENT));
+
     private final IndexedPositionConsumer positionConsumer = mock(IndexedPositionConsumer.class);
     private final IndexedPositionReader positionReader = new IndexedPositionReader(replayPositionBuffer);
 
-    private final ControlledFragmentHandler mockHandler = mock(ControlledFragmentHandler.class);
+    private final FakeMessageHandler fakeHandler = new FakeMessageHandler();
     private final ErrorHandler errorHandler = mock(ErrorHandler.class);
 
     private ArchivingMediaDriver mediaDriver;
@@ -98,18 +112,21 @@ public class ReplayIndexTest extends AbstractLogTest
     private void newReplayIndex()
     {
         replayIndex = new ReplayIndex(
+            new SequenceNumberExtractor(),
             DEFAULT_LOG_FILE_DIR,
             STREAM_ID,
-            DEFAULT_REPLAY_INDEX_FILE_SIZE,
-            DEFAULT_LOGGER_CACHE_NUM_SETS,
-            DEFAULT_LOGGER_CACHE_SET_SIZE,
+            DEFAULT_REPLAY_INDEX_RECORD_CAPACITY,
+            DEFAULT_REPLAY_INDEX_SEGMENT_CAPACITY,
             newBufferFactory,
             replayPositionBuffer,
             errorHandler,
             recordingIdLookup,
             new Long2LongHashMap(Session.UNKNOWN),
             FixPProtocolType.ILINK_3,
-            mock(SequenceNumberIndexReader.class));
+            mock(SequenceNumberIndexReader.class),
+            DEFAULT_TIME_INDEX_FLUSH_INTERVAL_IN_NS,
+            DEFAULT_INDEX_CHECKSUM_ENABLED,
+            new ReplayEvictionHandler(errorHandler));
     }
 
     private Aeron aeron()
@@ -119,13 +136,14 @@ public class ReplayIndexTest extends AbstractLogTest
 
     private ReplayQuery query;
 
-    @Before
+    @BeforeEach
     public void setUp()
     {
         mediaDriver = TestFixtures.launchMediaDriver();
-        aeronArchive = AeronArchive.connect();
+        aeronArchive = AeronArchive.connect(aeronArchiveContext());
 
-        recordingIdLookup = new RecordingIdLookup(new YieldingIdleStrategy(), aeron().countersReader());
+        recordingIdLookup =
+            new RecordingIdLookup(aeronArchive.archiveId(), new YieldingIdleStrategy(), aeron().countersReader());
 
         aeronArchive.startRecording(CHANNEL, STREAM_ID, SourceLocation.LOCAL);
 
@@ -133,8 +151,8 @@ public class ReplayIndexTest extends AbstractLogTest
         publication = aeron.addExclusivePublication(CHANNEL, STREAM_ID);
         subscription = aeron.addSubscription(CHANNEL, STREAM_ID);
 
-        IoUtil.deleteIfExists(logFile(SESSION_ID));
-        IoUtil.deleteIfExists(logFile(SESSION_ID_2));
+        final File logFileDir = new File(DEFAULT_LOG_FILE_DIR);
+        IoUtil.delete(logFileDir, false);
 
         newReplayIndex();
         query = new ReplayQuery(
@@ -146,17 +164,21 @@ public class ReplayIndexTest extends AbstractLogTest
             new NoOpIdleStrategy(),
             aeronArchive,
             errorHandler,
-            DEFAULT_ARCHIVE_REPLAY_STREAM);
+            NoOpReplayQueryListener.INSTANCE,
+            DEFAULT_ARCHIVE_REPLAY_STREAM,
+            DEFAULT_REPLAY_INDEX_RECORD_CAPACITY,
+            DEFAULT_REPLAY_INDEX_SEGMENT_CAPACITY);
     }
 
-    @After
+    @AfterEach
     public void teardown()
     {
         Exceptions.closeAll(query, replayIndex, aeronArchive);
         cleanupMediaDriver(mediaDriver);
     }
 
-    @Test(timeout = 20_000L)
+    @Test
+    @Timeout(20_000L)
     public void shouldReturnRecordsMatchingQuery()
     {
         indexExampleMessage();
@@ -168,7 +190,8 @@ public class ReplayIndexTest extends AbstractLogTest
         assertEquals(1, msgCount);
     }
 
-    @Test(timeout = 20_000L)
+    @Test
+    @Timeout(20_000L)
     public void shouldReturnLongRecordsMatchingQuery()
     {
         final String testReqId = largeTestReqId();
@@ -184,7 +207,8 @@ public class ReplayIndexTest extends AbstractLogTest
         assertEquals(1, msgCount);
     }
 
-    @Test(timeout = 20_000L)
+    @Test
+    @Timeout(20_000L)
     public void shouldReadSecondRecord()
     {
         indexExampleMessage();
@@ -198,7 +222,8 @@ public class ReplayIndexTest extends AbstractLogTest
         assertEquals(2, msgCount);
     }
 
-    @Test(timeout = 20_000L)
+    @Test
+    @Timeout(20_000L)
     public void shouldReadRecordsFromBeforeARestart()
     {
         indexExampleMessage();
@@ -214,7 +239,8 @@ public class ReplayIndexTest extends AbstractLogTest
         assertEquals(1, msgCount);
     }
 
-    @Test(timeout = 20_000L)
+    @Test
+    @Timeout(20_000L)
     public void shouldReturnAllLogEntriesWhenMostResentMessageRequested()
     {
         indexExampleMessage();
@@ -226,7 +252,8 @@ public class ReplayIndexTest extends AbstractLogTest
         assertEquals(1, msgCount);
     }
 
-    @Test(timeout = 20_000L)
+    @Test
+    @Timeout(20_000L)
     public void shouldNotReturnLogEntriesWithOtherSessionId()
     {
         indexExampleMessage(SESSION_ID, SEQUENCE_NUMBER, SEQUENCE_INDEX);
@@ -240,7 +267,8 @@ public class ReplayIndexTest extends AbstractLogTest
         verifyMessagesRead(2);
     }
 
-    @Test(timeout = 20_000L)
+    @Test
+    @Timeout(20_000L)
     public void shouldNotReturnLogEntriesWithOutOfRangeSequenceNumbers()
     {
         indexExampleMessage();
@@ -251,7 +279,8 @@ public class ReplayIndexTest extends AbstractLogTest
         verifyNoMessageRead();
     }
 
-    @Test(timeout = 20_000L)
+    @Test
+    @Timeout(20_000L)
     public void shouldQueryOverSequenceIndexBoundaries()
     {
         indexExampleMessage();
@@ -267,11 +296,11 @@ public class ReplayIndexTest extends AbstractLogTest
         assertEquals(2, msgCount);
     }
 
-    @Test(timeout = 20_000L)
+    @Test
+    @Timeout(20_000L)
     public void shouldNotStopIndexingWhenBufferFull()
     {
-        final int totalMessages =
-            (DEFAULT_REPLAY_INDEX_FILE_SIZE - MessageHeaderEncoder.ENCODED_LENGTH) / RECORD_LENGTH;
+        final int totalMessages = DEFAULT_REPLAY_INDEX_RECORD_CAPACITY;
         final int beginSequenceNumber = totalMessages / 2;
         final int endSequenceNumber = totalMessages + 1;
         // +1 because these are inclusive
@@ -286,7 +315,27 @@ public class ReplayIndexTest extends AbstractLogTest
         verifyMessagesRead(expectedMessages);
     }
 
-    @Test(timeout = 20_000L)
+    @Test
+    @Timeout(20_000L)
+    public void shouldBeQueryableWhenLastSegmentIsFull()
+    {
+        final int segmentCapacity = DEFAULT_REPLAY_INDEX_SEGMENT_CAPACITY;
+
+        IntStream.rangeClosed(1, segmentCapacity)
+            .forEach(seqNum -> indexExampleMessage(SESSION_ID, seqNum, SEQUENCE_INDEX));
+
+        final int msgCount = query(1, SEQUENCE_INDEX, MOST_RECENT_MESSAGE, SEQUENCE_INDEX);
+
+        assertEquals(segmentCapacity, msgCount);
+        verifyMessagesRead(segmentCapacity);
+
+        final Long2LongHashMap startPositions = new Long2LongHashMap(NULL_VALUE);
+        query.queryStartPositions(startPositions);
+        assertThat(startPositions, hasEntry(0L, 0L));
+    }
+
+    @Test
+    @Timeout(20_000L)
     public void shouldUpdatePositionForIndexedRecord()
     {
         indexExampleMessage();
@@ -296,11 +345,12 @@ public class ReplayIndexTest extends AbstractLogTest
         final int aeronSessionId = publication.sessionId();
         final long recordingId = recordingIdLookup.getRecordingId(aeronSessionId);
 
-        verify(positionConsumer, times(1))
+        verify(positionConsumer, Mockito.times(1))
             .accept(aeronSessionId, recordingId, alignedEndPosition());
     }
 
-    @Test(timeout = 20_000L)
+    @Test
+    @Timeout(20_000L)
     public void shouldOnlyMapSessionFileOnce()
     {
         indexExampleMessage();
@@ -310,7 +360,8 @@ public class ReplayIndexTest extends AbstractLogTest
         verifyMappedFile(SESSION_ID);
     }
 
-    @Test(timeout = 20_000L)
+    @Test
+@Timeout(20_000L)
     public void shouldRecordIndexesForMultipleSessions()
     {
         indexExampleMessage();
@@ -321,9 +372,8 @@ public class ReplayIndexTest extends AbstractLogTest
         verifyMappedFile(SESSION_ID_2);
     }
 
-    // TODO: deleting old recordings.
-
-    @Test(timeout = 20_000L)
+    @Test
+    @Timeout(20_000L)
     public void shouldQueryStartPositions()
     {
         final ExclusivePublication otherPublication = aeron().addExclusivePublication(CHANNEL, STREAM_ID);
@@ -355,7 +405,127 @@ public class ReplayIndexTest extends AbstractLogTest
         assertEquals(otherPrunePosition, startPositions.get(otherRecordingId));
     }
 
+    @Test
+    @Timeout(20_000L)
+    public void shouldQueryStartPositionsInPresenceOfDuplicateSequenceIndices()
+    {
+        final int newSequenceIndex = SEQUENCE_INDEX + 1;
+
+        indexExampleMessage(SESSION_ID, SEQUENCE_NUMBER, SEQUENCE_INDEX);
+        indexExampleMessage(SESSION_ID, SEQUENCE_NUMBER + 1, SEQUENCE_INDEX);
+
+        final long position = indexExampleMessage(SESSION_ID, 0, newSequenceIndex);
+        indexExampleMessage(SESSION_ID, 1, newSequenceIndex);
+        final long position2 = indexExampleMessage(SESSION_ID, 0, newSequenceIndex);
+        indexExampleMessage(SESSION_ID, 1, newSequenceIndex);
+        final long position3 = indexExampleMessage(SESSION_ID, 0, newSequenceIndex);
+        indexExampleMessage(SESSION_ID, 1, newSequenceIndex);
+        assertThat(position2, greaterThan(position));
+        assertThat(position3, greaterThan(position2));
+
+        final Long2LongHashMap startPositions = new Long2LongHashMap(NULL_VALUE);
+        query.queryStartPositions(startPositions);
+
+        captureRecordingId();
+
+        assertEquals(position3, startPositions.get(recordingId));
+    }
+
+    @Test
+    @Timeout(20_000L)
+    public void shouldDeleteIndexSegmentsOnSequenceResetWhenNoSegmentsHaveBeenTouched()
+    {
+        int seqNo = 1;
+        for (int i = 0; i < DEFAULT_REPLAY_INDEX_RECORD_CAPACITY; i++)
+        {
+            indexExampleMessage(SESSION_ID, seqNo++, SEQUENCE_INDEX);
+        }
+
+        assertTrue(logFile(SESSION_ID).exists());
+
+        assertTrue(segmentFile(SESSION_ID, 0).exists());
+        assertTrue(segmentFile(SESSION_ID, 1).exists());
+        assertTrue(segmentFile(SESSION_ID, 2).exists());
+        assertTrue(segmentFile(SESSION_ID, 3).exists());
+
+        assertFalse(segmentFile(SESSION_ID, 4).exists());
+
+        replayIndex.close();
+
+        newReplayIndex();
+
+        resetSequenceNumber();
+
+        assertFalse(logFile(SESSION_ID).exists());
+
+        assertFalse(segmentFile(SESSION_ID, 0).exists());
+        assertFalse(segmentFile(SESSION_ID, 1).exists());
+        assertFalse(segmentFile(SESSION_ID, 2).exists());
+        assertFalse(segmentFile(SESSION_ID, 3).exists());
+    }
+
+    @Test
+    @Timeout(20_000L)
+    public void shouldDeleteIndexSegmentsOnSequenceResetWhenASegmentHasBeenTouched()
+    {
+        int seqNo = 1;
+        for (int i = 0; i < DEFAULT_REPLAY_INDEX_RECORD_CAPACITY; i++)
+        {
+            indexExampleMessage(SESSION_ID, seqNo++, SEQUENCE_INDEX);
+        }
+
+        assertTrue(logFile(SESSION_ID).exists());
+
+        assertTrue(segmentFile(SESSION_ID, 0).exists());
+        assertTrue(segmentFile(SESSION_ID, 1).exists());
+        assertTrue(segmentFile(SESSION_ID, 2).exists());
+        assertTrue(segmentFile(SESSION_ID, 3).exists());
+
+        assertFalse(segmentFile(SESSION_ID, 4).exists());
+
+        replayIndex.close();
+
+        newReplayIndex();
+
+        indexExampleMessage(SESSION_ID, seqNo++, SEQUENCE_INDEX);
+
+        resetSequenceNumber();
+
+        assertFalse(logFile(SESSION_ID).exists());
+
+        assertFalse(segmentFile(SESSION_ID, 0).exists());
+        assertFalse(segmentFile(SESSION_ID, 1).exists());
+        assertFalse(segmentFile(SESSION_ID, 2).exists());
+        assertFalse(segmentFile(SESSION_ID, 3).exists());
+    }
+
+    private void resetSequenceNumber()
+    {
+        final int offset = START;
+
+        final ResetSequenceNumberEncoder resetEncoder = new ResetSequenceNumberEncoder();
+        resetEncoder
+            .wrapAndApplyHeader(buffer, offset, header)
+            .session(SESSION_ID);
+
+        final int limit = resetEncoder.limit();
+        final int length = limit - offset;
+
+        while (publication.offer(buffer, offset, length) <= 0)
+        {
+            Thread.yield();
+        }
+
+        indexRecord();
+    }
+
     private void captureRecordingIds()
+    {
+        final int recordingCount = captureRecordingId();
+        assertEquals(2, recordingCount);
+    }
+
+    private int captureRecordingId()
     {
         final int recordingCount = aeronArchive.listRecordings(0, 2,
             (controlSessionId, correlationId, recordingId,
@@ -371,7 +541,7 @@ public class ReplayIndexTest extends AbstractLogTest
                     this.otherRecordingId = recordingId;
                 }
             });
-        assertEquals(2, recordingCount);
+        return recordingCount;
     }
 
     private long recordingId;
@@ -394,23 +564,17 @@ public class ReplayIndexTest extends AbstractLogTest
 
     private void verifyNoMessageRead()
     {
-        verifyMessagesRead(never());
+        verifyMessagesRead(0);
     }
 
     private void verifyMessagesRead(final int number)
     {
-        verifyMessagesRead(times(number));
-    }
-
-    private void verifyMessagesRead(final VerificationMode times)
-    {
-        verify(mockHandler, times)
-            .onFragment(any(), anyInt(), anyInt(), any());
+        assertEquals(fakeHandler.times(), number);
     }
 
     private void verifyMappedFile(final long sessionId, final int wantedNumberOfInvocations)
     {
-        verify(existingBufferFactory, times(wantedNumberOfInvocations)).map(logFile(sessionId));
+        verify(existingBufferFactory, Mockito.times(wantedNumberOfInvocations)).map(logFile(sessionId));
     }
 
     private void verifyMappedFile(final long sessionId)
@@ -420,7 +584,12 @@ public class ReplayIndexTest extends AbstractLogTest
 
     private File logFile(final long sessionId)
     {
-        return ReplayIndexDescriptor.replayIndexFile(DEFAULT_LOG_FILE_DIR, sessionId, STREAM_ID);
+        return ReplayIndexDescriptor.replayIndexHeaderFile(DEFAULT_LOG_FILE_DIR, sessionId, STREAM_ID);
+    }
+
+    private File segmentFile(final long sessionId, final int segmentIndex)
+    {
+        return ReplayIndexDescriptor.replayIndexSegmentFile(DEFAULT_LOG_FILE_DIR, sessionId, STREAM_ID, segmentIndex);
     }
 
     private void indexRecord()
@@ -493,23 +662,43 @@ public class ReplayIndexTest extends AbstractLogTest
         final int endSequenceNumber,
         final int endSequenceIndex)
     {
-        final ReplayOperation operation = query.query(
+        try (ReplayOperation operation = query.query(
             sessionId,
             beginSequenceNumber,
             beginSequenceIndex,
             endSequenceNumber,
             endSequenceIndex,
             REPLAY,
-            new FixMessageTracker(REPLAY, mockHandler, sessionId));
-
-        final IdleStrategy idleStrategy = CommonConfiguration.backoffIdleStrategy();
-        while (!operation.pollReplay())
+            new FixMessageTracker(REPLAY, fakeHandler, sessionId)))
         {
-            idleStrategy.idle();
-        }
-        idleStrategy.reset();
+            final IdleStrategy idleStrategy = CommonConfiguration.backoffIdleStrategy();
+            while (!operation.pollReplay())
+            {
+                idleStrategy.idle();
+            }
+            idleStrategy.reset();
 
-        return operation.replayedMessages();
+            return operation.replayedMessages();
+        }
     }
 
+    static class FakeMessageHandler implements ControlledFragmentHandler
+    {
+        LongHashSet positions = new LongHashSet();
+        int times = 0;
+
+        @Override
+        public Action onFragment(
+            final DirectBuffer buffer, final int offset, final int length, final Header header)
+        {
+            positions.add(header.position());
+            times++;
+            return Action.CONTINUE;
+        }
+
+        public int times()
+        {
+            return times;
+        }
+    }
 }

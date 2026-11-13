@@ -1,7 +1,23 @@
+/*
+ * Copyright 2015-2025 Real Logic Limited.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package uk.co.real_logic.artio.engine.framer;
 
 import org.agrona.CloseHelper;
 import org.agrona.LangUtil;
+import uk.co.real_logic.artio.dictionary.generation.Exceptions;
 import uk.co.real_logic.artio.engine.EngineConfiguration;
 
 import java.io.IOException;
@@ -45,6 +61,7 @@ public class DefaultTcpChannelSupplier extends TcpChannelSupplier
         }
     }
 
+    @Override
     public int pollSelector(final long timeInMs, final TcpChannelSupplier.NewChannelHandler handler) throws IOException
     {
         if (hasBindAddress || openingSocketChannels.size() > 0)
@@ -81,10 +98,10 @@ public class DefaultTcpChannelSupplier extends TcpChannelSupplier
                         {
                             if (channel.finishConnect())
                             {
-                                channelHandler.onInitiatedChannel(newTcpChannel(channel), null);
                                 selectionKey.interestOps(selectionKey.interestOps() & (~OP_CONNECT));
                                 it.remove();
-                                openingSocketChannels.remove(channel);
+
+                                onFinishConnect(channelHandler, channel);
                             }
                         }
                         catch (final IOException e)
@@ -92,6 +109,7 @@ public class DefaultTcpChannelSupplier extends TcpChannelSupplier
                             channelHandler.onInitiatedChannel(null, e);
                             it.remove();
                             openingSocketChannels.remove(channel);
+                            CloseHelper.quietClose(channel);
                         }
                     }
                 }
@@ -103,6 +121,14 @@ public class DefaultTcpChannelSupplier extends TcpChannelSupplier
         return 0;
     }
 
+    protected void onFinishConnect(
+        final InitiatedChannelHandler channelHandler, final SocketChannel channel) throws IOException
+    {
+        channelHandler.onInitiatedChannel(newTcpChannel(channel), null);
+        openingSocketChannels.remove(channel);
+    }
+
+    @Override
     public void unbind() throws IOException
     {
         if (listeningChannel != null)
@@ -113,11 +139,16 @@ public class DefaultTcpChannelSupplier extends TcpChannelSupplier
         }
     }
 
+    @Override
     public void bind() throws IOException
     {
         if (hasBindAddress && listeningChannel == null)
         {
             listeningChannel = ServerSocketChannel.open();
+            if (configuration.receiverSocketBufferSize() > 0)
+            {
+                listeningChannel.setOption(SO_RCVBUF, configuration.receiverSocketBufferSize());
+            }
             listeningChannel.bind(configuration.bindAddress()).configureBlocking(false);
             listeningChannel.register(selector, SelectionKey.OP_ACCEPT);
         }
@@ -136,12 +167,27 @@ public class DefaultTcpChannelSupplier extends TcpChannelSupplier
         }
     }
 
+    @Override
     public void close()
     {
-        CloseHelper.close(listeningChannel);
-        CloseHelper.close(selector);
+        Exceptions.closeAll(
+            selector,
+            () ->
+            {
+                if (listeningChannel != null)
+                {
+                    listeningChannel.configureBlocking(true);
+                }
+            },
+            listeningChannel);
+
+        for (final SocketChannel channel : openingSocketChannels)
+        {
+            CloseHelper.quietClose(channel);
+        }
     }
 
+    @Override
     public void open(final InetSocketAddress address, final TcpChannelSupplier.InitiatedChannelHandler channelHandler)
         throws IOException
     {
@@ -170,9 +216,10 @@ public class DefaultTcpChannelSupplier extends TcpChannelSupplier
 
     protected TcpChannel newTcpChannel(final SocketChannel channel) throws IOException
     {
-        return new TcpChannel(channel);
+        return new DefaultTcpChannel(channel);
     }
 
+    @Override
     public void stopConnecting(final InetSocketAddress address) throws IOException
     {
         final Iterator<SocketChannel> iterator = openingSocketChannels.iterator();
@@ -181,6 +228,7 @@ public class DefaultTcpChannelSupplier extends TcpChannelSupplier
             final SocketChannel channel = iterator.next();
             if (channel.getRemoteAddress().equals(address))
             {
+                CloseHelper.quietClose(channel);
                 iterator.remove();
                 break;
             }

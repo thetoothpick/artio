@@ -1,8 +1,23 @@
+/*
+ * Copyright 2015-2025 Real Logic Limited.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package uk.co.real_logic.artio;
 
 import org.agrona.ErrorHandler;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 import org.mockito.verification.VerificationMode;
 import uk.co.real_logic.artio.library.FixLibrary;
 import uk.co.real_logic.artio.library.SessionConfiguration;
@@ -14,8 +29,8 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 import static io.aeron.Publication.BACK_PRESSURED;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.*;
 
 public class SessionSchedulerTest
@@ -32,7 +47,7 @@ public class SessionSchedulerTest
 
     private SessionScheduler sessionScheduler;
 
-    @Before
+    @BeforeEach
     public void setup()
     {
         SessionScheduler.timeEventPool = timeEventPool;
@@ -57,7 +72,7 @@ public class SessionSchedulerTest
 
         sessionScheduler = newSessionScheduler(LocalTime.of(9, 30));
         verifyNoTimeEvent();
-        assertTrue("not during day", sessionScheduler.duringDay());
+        assertTrue(sessionScheduler.duringDay(), "not during day");
 
         sessionScheduler = newSessionScheduler(LocalTime.of(17, 30));
         verifyNoTimeEvent();
@@ -216,7 +231,7 @@ public class SessionSchedulerTest
 
     private void assertNotDuringDay()
     {
-        assertFalse("during day", sessionScheduler.duringDay());
+        assertFalse(sessionScheduler.duringDay(), "during day");
     }
 
     private void verifyTimeEvent(final long delayInMilliseconds)

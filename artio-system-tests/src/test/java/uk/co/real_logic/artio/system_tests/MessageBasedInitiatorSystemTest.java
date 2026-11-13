@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,13 +15,19 @@
  */
 package uk.co.real_logic.artio.system_tests;
 
+import io.aeron.Aeron;
 import io.aeron.archive.ArchivingMediaDriver;
 import org.agrona.ErrorHandler;
+import org.agrona.collections.IntHashSet;
 import org.agrona.concurrent.EpochNanoClock;
 import org.agrona.concurrent.OffsetEpochNanoClock;
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Test;
+import org.agrona.concurrent.status.CountersReader;
+import org.junit.jupiter.api.AfterEach;
+
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import uk.co.real_logic.artio.*;
 import uk.co.real_logic.artio.builder.ExecutionReportEncoder;
 import uk.co.real_logic.artio.builder.HeaderEncoder;
@@ -36,29 +42,36 @@ import uk.co.real_logic.artio.library.SessionConfiguration;
 import uk.co.real_logic.artio.messages.InitialAcceptedSessionOwner;
 import uk.co.real_logic.artio.messages.SessionState;
 import uk.co.real_logic.artio.session.Session;
+import uk.co.real_logic.artio.session.SessionWriter;
 import uk.co.real_logic.artio.util.MutableAsciiBuffer;
 
 import java.io.IOException;
 import java.util.List;
 
 import static org.hamcrest.MatcherAssert.assertThat;
-import static org.hamcrest.Matchers.greaterThan;
-import static org.junit.Assert.*;
+import static org.hamcrest.Matchers.*;
+import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static uk.co.real_logic.artio.Constants.*;
+import static uk.co.real_logic.artio.FixCounters.FixCountersId.RECV_MSG_SEQ_NO_TYPE_ID;
+import static uk.co.real_logic.artio.FixCounters.lookupCounterIds;
 import static uk.co.real_logic.artio.Reply.State.COMPLETED;
 import static uk.co.real_logic.artio.Reply.State.ERRORED;
 import static uk.co.real_logic.artio.TestFixtures.*;
 import static uk.co.real_logic.artio.Timing.assertEventuallyTrue;
 import static uk.co.real_logic.artio.messages.SessionState.ACTIVE;
-import static uk.co.real_logic.artio.system_tests.SystemTestUtil.*;
+import static uk.co.real_logic.artio.system_tests.AbstractGatewayToGatewaySystemTest.TEST_TIMEOUT_IN_MS;
+import static uk.co.real_logic.artio.system_tests.AbstractGatewayToGatewaySystemTest.createFollowerSession;
 import static uk.co.real_logic.artio.system_tests.SystemTestUtil.PASSWORD;
 import static uk.co.real_logic.artio.system_tests.SystemTestUtil.USERNAME;
+import static uk.co.real_logic.artio.system_tests.SystemTestUtil.*;
 
 // For reproducing error scenarios when initiating a connection
+@Timeout(20_000)
 public class MessageBasedInitiatorSystemTest
 {
+
     private static final int LOGON_SEQ_NUM = 2;
 
     private final ErrorHandler errorHandler = mock(ErrorHandler.class);
@@ -72,11 +85,10 @@ public class MessageBasedInitiatorSystemTest
     private FixEngine engine;
     private FixLibrary library;
     private TestSystem testSystem;
-    private int polled;
 
     private Reply<Session> sessionReply;
 
-    @Before
+    @BeforeEach
     public void setUp()
     {
         mediaDriver = launchMediaDriver();
@@ -254,7 +266,7 @@ public class MessageBasedInitiatorSystemTest
             assertFalse(handler.hasDisconnected());
 
             final Session session = handler.lastSession();
-            assertThat(session.logoutAndDisconnect(), greaterThan(0L));
+            testSystem.awaitSend(session::logoutAndDisconnect);
 
             assertConnectionDisconnects(testSystem, connection);
 
@@ -276,7 +288,7 @@ public class MessageBasedInitiatorSystemTest
             connection.close();
 
             testSystem.awaitReply(sessionReply);
-            assertEquals(sessionReply.toString(), sessionReply.state(), ERRORED);
+            assertEquals(sessionReply.state(), ERRORED, sessionReply.toString());
         }
 
         verifyNoInteractions(errorHandler);
@@ -297,6 +309,7 @@ public class MessageBasedInitiatorSystemTest
 
             testSystem.awaitCompletedReply(sessionReply);
         }
+        assertSessionDisconnected(testSystem, sessionReply.resultIfPresent());
 
         verifyNoInteractions(errorHandler);
     }
@@ -447,6 +460,59 @@ public class MessageBasedInitiatorSystemTest
         }
     }
 
+    @Test
+    public void shouldInitiateConnectionAfterRequestSession() throws IOException
+    {
+        final SessionWriter sessionWriter = createFollowerSession(
+            TEST_TIMEOUT_IN_MS, testSystem, library, ACCEPTOR_ID, INITIATOR_ID);
+        final long sessionId = sessionWriter.id();
+
+        final Session session = acquireSession(handler, library, sessionId, testSystem);
+        assertNotNull(session);
+
+        try (FixConnection connection = acceptConnection())
+        {
+            sendLogonToAcceptor(connection);
+
+            connection.logon(false);
+
+            final Session session1 = lookupSession();
+            assertSame(session, session1);
+            assertEquals(sessionId, session1.id());
+        }
+    }
+
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
+    public void shouldNotLeakCountersIfDisconnectedBeforeLogonCompleteInSoleLibraryMode() throws IOException
+    {
+        // Replicates a client issue, note that we only close the counters when we're
+        initiatorFailsToConnect();
+
+        initiatorFailsToConnect();
+
+        initiatorFailsToConnect();
+
+        try (Aeron aeron = Aeron.connect(engine.configuration().aeronContextClone()))
+        {
+            final CountersReader countersReader = aeron.countersReader();
+            final IntHashSet ids = lookupCounterIds(RECV_MSG_SEQ_NO_TYPE_ID, countersReader, label -> true);
+            assertThat(ids.toString(), ids, hasSize(1));
+        }
+    }
+
+    private void initiatorFailsToConnect() throws IOException
+    {
+        try (FixConnection connection = acceptConnection())
+        {
+            sendLogonToAcceptor(connection);
+        }
+
+        final Reply<Session> reply = testSystem.awaitReply(this.sessionReply);
+        assertEquals(ERRORED, reply.state());
+        assertThat(reply.error().toString(), containsString("UNABLE_TO_LOGON"));
+    }
+
     private Session completeLogon()
     {
         return testSystem.awaitCompletedReply(sessionReply).resultIfPresent();
@@ -459,36 +525,36 @@ public class MessageBasedInitiatorSystemTest
         final List<FixMessage> messages = testSystem.awaitMessageCount(otfAcceptor, 6);
 
         final FixMessage logon = messages.get(0);
-        assertEquals(logon.toString(), 4, logon.messageSequenceNumber());
-        assertEquals(logon.toString(), LOGON_MESSAGE_AS_STR, logon.msgType());
-        assertFalse(logon.toString(), logon.isValid());
+        assertEquals(4, logon.messageSequenceNumber(), logon.toString());
+        assertEquals(LOGON_MESSAGE_AS_STR, logon.msgType(), logon.toString());
+        assertFalse(logon.isValid(), logon.toString());
 
         final FixMessage invalidReport5 = messages.get(1);
-        assertEquals(invalidReport5.toString(), 5, invalidReport5.messageSequenceNumber());
-        assertEquals(invalidReport5.toString(), EXECUTION_REPORT_MESSAGE_AS_STR, invalidReport5.msgType());
-        assertNull(invalidReport5.toString(), invalidReport5.possDup());
-        assertFalse(invalidReport5.toString(), invalidReport5.isValid());
+        assertEquals(5, invalidReport5.messageSequenceNumber(), invalidReport5.toString());
+        assertEquals(EXECUTION_REPORT_MESSAGE_AS_STR, invalidReport5.msgType(), invalidReport5.toString());
+        assertNull(invalidReport5.possDup(), invalidReport5.toString());
+        assertFalse(invalidReport5.isValid(), invalidReport5.toString());
 
         final FixMessage report3 = messages.get(2);
-        assertEquals(report3.toString(), 3, report3.messageSequenceNumber());
-        assertEquals(report3.toString(), EXECUTION_REPORT_MESSAGE_AS_STR, report3.msgType());
-        assertEquals(report3.toString(), "Y", report3.possDup());
+        assertEquals(3, report3.messageSequenceNumber(), report3.toString());
+        assertEquals(EXECUTION_REPORT_MESSAGE_AS_STR, report3.msgType(), report3.toString());
+        assertEquals("Y", report3.possDup(), report3.toString());
 
         final FixMessage gapFill = messages.get(3);
-        assertEquals(gapFill.toString(), 4, gapFill.messageSequenceNumber());
-        assertEquals(gapFill.toString(), SEQUENCE_RESET_MESSAGE_AS_STR, gapFill.msgType());
-        assertEquals(gapFill.toString(), "Y", gapFill.gapFill());
-        assertEquals(gapFill.toString(), "Y", gapFill.possDup());
+        assertEquals(4, gapFill.messageSequenceNumber(), gapFill.toString());
+        assertEquals(SEQUENCE_RESET_MESSAGE_AS_STR, gapFill.msgType(), gapFill.toString());
+        assertEquals("Y", gapFill.gapFill(), gapFill.toString());
+        assertEquals("Y", gapFill.possDup(), gapFill.toString());
 
         final FixMessage report5 = messages.get(4);
-        assertEquals(report5.toString(), 5, report5.messageSequenceNumber());
-        assertEquals(report5.toString(), EXECUTION_REPORT_MESSAGE_AS_STR, report5.msgType());
-        assertEquals(report5.toString(), "Y", report5.possDup());
+        assertEquals(5, report5.messageSequenceNumber(), report5.toString());
+        assertEquals(EXECUTION_REPORT_MESSAGE_AS_STR, report5.msgType(), report5.toString());
+        assertEquals("Y", report5.possDup(), report5.toString());
 
         final FixMessage report6 = messages.get(5);
-        assertEquals(report6.toString(), 6, report6.messageSequenceNumber());
-        assertEquals(report6.toString(), EXECUTION_REPORT_MESSAGE_AS_STR, report6.msgType());
-        assertNull(report6.toString(), report6.possDup());
+        assertEquals(6, report6.messageSequenceNumber(), report6.toString());
+        assertEquals(EXECUTION_REPORT_MESSAGE_AS_STR, report6.msgType(), report6.toString());
+        assertNull(report6.possDup(), report6.toString());
     }
 
     private void sendTwoOrdersReceiveOneReportAndDisconnect(
@@ -536,17 +602,11 @@ public class MessageBasedInitiatorSystemTest
 
     private void sendLogonToAcceptor(final FixConnection connection)
     {
-        assertEventuallyTrue(
-            "Never sent logon", () ->
-            {
-                polled += library.poll(LIBRARY_LIMIT);
-                return polled > 2;
-            });
-
-        connection.readLogon();
+        //noinspection Convert2MethodRef
+        testSystem.awaitBlocking(() -> connection.readLogon());
     }
 
-    @After
+    @AfterEach
     public void tearDown()
     {
         Exceptions.closeAll(library, engine);

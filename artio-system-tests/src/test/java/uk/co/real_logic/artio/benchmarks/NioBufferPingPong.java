@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -34,6 +34,7 @@ public final class NioBufferPingPong extends AbstractPingPong
         new NioBufferPingPong().benchmark();
     }
 
+    @Override
     protected void ping(final SocketChannel channel, final long time) throws IOException
     {
         writeByteBuffer(channel, pingWriteBuffer, time);
@@ -43,6 +44,7 @@ public final class NioBufferPingPong extends AbstractPingPong
         checkEqual(time, result);
     }
 
+    @Override
     protected void pong(final SocketChannel channel) throws IOException
     {
         final long value = readByteBuffer(channel, pongReadBuffer);

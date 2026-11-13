@@ -17,30 +17,40 @@ package uk.co.real_logic.artio.engine.logger;
 
 import uk.co.real_logic.artio.util.AsciiBuffer;
 
+import java.util.List;
+
 public class EnqueuedReplay
 {
     private final long sessionId;
     private final long connectionId;
+    private final long correlationId;
     private final long beginSeqNo;
     private final long endSeqNo;
     private final int sequenceIndex;
+    private final long overriddenBeginSeqNo;
     private final AsciiBuffer asciiBuffer;
+    private final List<RecordingRange> recordingRanges;
 
     public EnqueuedReplay(
         final long sessionId,
         final long connectionId,
-        final long beginSeqNo,
+        final long correlationId, final long beginSeqNo,
         final long endSeqNo,
         final int sequenceIndex,
-        final AsciiBuffer asciiBuffer)
+        final long overriddenBeginSeqNo,
+        final AsciiBuffer asciiBuffer,
+        final List<RecordingRange> recordingRanges)
     {
 
         this.sessionId = sessionId;
         this.connectionId = connectionId;
+        this.correlationId = correlationId;
         this.beginSeqNo = beginSeqNo;
         this.endSeqNo = endSeqNo;
         this.sequenceIndex = sequenceIndex;
+        this.overriddenBeginSeqNo = overriddenBeginSeqNo;
         this.asciiBuffer = asciiBuffer;
+        this.recordingRanges = recordingRanges;
     }
 
     public long sessionId()
@@ -68,14 +78,32 @@ public class EnqueuedReplay
         return sequenceIndex;
     }
 
+    public long correlationId()
+    {
+        return correlationId;
+    }
+
+    public long overriddenBeginSeqNo()
+    {
+        return overriddenBeginSeqNo;
+    }
+
+    public List<RecordingRange> recordingRanges()
+    {
+        return recordingRanges;
+    }
+
+    @Override
     public String toString()
     {
         return "EnqueuedReplay{" +
             "sessionId=" + sessionId +
             ", connectionId=" + connectionId +
+            ", correlationId=" + correlationId +
             ", beginSeqNo=" + beginSeqNo +
             ", endSeqNo=" + endSeqNo +
             ", sequenceIndex=" + sequenceIndex +
+            ", overriddenBeginSeqNo=" + overriddenBeginSeqNo +
             ", asciiBuffer=" + asciiBuffer.getAscii(0, asciiBuffer.capacity()) +
             '}';
     }

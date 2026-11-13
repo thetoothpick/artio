@@ -17,18 +17,18 @@ package uk.co.real_logic.artio.dictionary.generation;
 
 import org.agrona.generation.CompilerUtil;
 import org.agrona.generation.StringWriterOutputManager;
-import org.junit.BeforeClass;
-import org.junit.Test;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
 import uk.co.real_logic.artio.dictionary.CharArrayWrapper;
 
 import java.lang.reflect.Method;
 import java.util.Map;
 
-import static junit.framework.TestCase.assertTrue;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.*;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static uk.co.real_logic.artio.dictionary.ExampleDictionary.*;
 import static uk.co.real_logic.artio.dictionary.generation.AbstractDecoderGeneratorTest.CODEC_LOGGING;
 import static uk.co.real_logic.artio.dictionary.generation.CodecConfiguration.DEFAULT_PARENT_PACKAGE;
@@ -45,7 +45,7 @@ public class EnumGeneratorTest
     private static Class<?> stringEnumClass;
     private static Class<?> currencyEnumClass;
 
-    @BeforeClass
+    @BeforeAll
     public static void generate() throws Exception
     {
         sources = generateEnums();
@@ -62,8 +62,8 @@ public class EnumGeneratorTest
     @Test
     public void generatesEnumClass()
     {
-        assertNotNull("Failed to generate a class", egEnumClass);
-        assertTrue("Generated class isn't an enum", egEnumClass.isEnum());
+        assertNotNull(egEnumClass, "Failed to generate a class");
+        assertTrue(egEnumClass.isEnum(), "Generated class isn't an enum");
 
         assertNotNull(currencyEnumClass);
     }
@@ -184,7 +184,7 @@ public class EnumGeneratorTest
         return CompilerUtil.compileInMemory(className, sources);
     }
 
-    private void assertRepresentation(final char expected, final Enum<?> enumElement) throws Exception
+    public static void assertRepresentation(final char expected, final Enum<?> enumElement) throws Exception
     {
         final char representation = (char)enumElement
             .getDeclaringClass()

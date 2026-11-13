@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ package uk.co.real_logic.artio.library;
 
 import org.agrona.DirectBuffer;
 import org.agrona.IoUtil;
+import org.agrona.concurrent.EpochClock;
 import org.agrona.concurrent.IdleStrategy;
 import org.agrona.concurrent.SystemEpochClock;
 import uk.co.real_logic.artio.CommonConfiguration;
@@ -24,6 +25,7 @@ import uk.co.real_logic.artio.FixGatewayException;
 import uk.co.real_logic.artio.GatewayProcess;
 import uk.co.real_logic.artio.Reply;
 import uk.co.real_logic.artio.builder.SessionHeaderEncoder;
+import uk.co.real_logic.artio.fixp.FixPContext;
 import uk.co.real_logic.artio.ilink.ILink3Connection;
 import uk.co.real_logic.artio.ilink.ILink3ConnectionConfiguration;
 import uk.co.real_logic.artio.messages.MetaDataStatus;
@@ -78,14 +80,16 @@ public class FixLibrary extends GatewayProcess
         try
         {
             scheduler.configure(configuration.aeronContext());
-            init(configuration);
+            init(configuration, configuration.libraryId());
             final LibraryTimers timers = new LibraryTimers(
                 configuration.epochNanoClock(), fixCounters.negativeTimestamps());
             initMonitoringAgent(timers.all(), configuration, null, null);
 
             final LibraryTransport transport = new LibraryTransport(configuration, fixCounters, aeron);
+            final EpochClock epochClock = configuration.isReproductionEnabled() ?
+                configuration.reproductionConfiguration().clock().toMillis() : new SystemEpochClock();
             poller = new LibraryPoller(
-                configuration, timers, fixCounters, transport, this, new SystemEpochClock());
+                configuration, timers, fixCounters, transport, this, epochClock, errorHandler);
         }
         catch (final Exception e)
         {
@@ -105,20 +109,21 @@ public class FixLibrary extends GatewayProcess
 
     private void closeAnythingHoldingFileHandles()
     {
-        if (monitoringAgent == null)
+        if (monitoringCompositeAgent == null)
         {
             monitoringFile.close();
         }
         else
         {
-            monitoringAgent.onClose();
+            monitoringCompositeAgent.onClose();
         }
     }
 
     private FixLibrary connect()
     {
         poller.startConnecting();
-        scheduler.launch(configuration, errorHandler, monitoringAgent, conductorAgent());
+        scheduler.launch(configuration, errorHandler, monitoringCompositeAgent, conductorAgent());
+        poller.onStart();
         return this;
     }
 
@@ -159,6 +164,11 @@ public class FixLibrary extends GatewayProcess
         {
             isPolling = false;
         }
+    }
+
+    void clearPollStatus()
+    {
+        isPolling = false;
     }
 
     /**
@@ -216,7 +226,7 @@ public class FixLibrary extends GatewayProcess
      * <p>
      * Note: the list is unmodifiable.
      *
-     * @return a list of tthe initiator sessions that are currently pending.
+     * @return a list of the initiator sessions that are currently pending.
      */
     public List<Session> pendingInitiatorSessions()
     {
@@ -226,6 +236,7 @@ public class FixLibrary extends GatewayProcess
     /**
      * Close the Library. This will also remove all files associated with the library.
      */
+    @Override
     public void close()
     {
         if (isPolling)
@@ -243,14 +254,11 @@ public class FixLibrary extends GatewayProcess
 
     private void deleteFiles()
     {
-        if (configuration.gracefulShutdown())
-        {
-            final boolean deletedHistogramFile = removeParentDirectory(configuration.histogramLoggingFile());
-            final boolean deletedMonitoringFile = removeParentDirectory(configuration.monitoringFile());
+        final boolean deletedHistogramFile = removeParentDirectory(configuration.histogramLoggingFile());
+        final boolean deletedMonitoringFile = removeParentDirectory(configuration.monitoringFile());
 
-            checkFileDeletion(deletedHistogramFile, configuration.histogramLoggingFile());
-            checkFileDeletion(deletedMonitoringFile, configuration.monitoringFile());
-        }
+        checkFileDeletion(deletedHistogramFile, configuration.histogramLoggingFile());
+        checkFileDeletion(deletedMonitoringFile, configuration.monitoringFile());
     }
 
     private void checkFileDeletion(final boolean deletedFile, final String path)
@@ -347,7 +355,7 @@ public class FixLibrary extends GatewayProcess
      *                                   If you don't care about message replay then
      *                                   use {@link FixLibrary#NO_MESSAGE_REPLAY} as the parameter.
      * @param resendFromSequenceIndex the index of the sequence within which the resendFromSequenceNumber
-     *                      refers. if you wish to use the curren sequence (ie all messages since the latest logon
+     *                      refers. if you wish to use the current sequence (ie all messages since the latest logon
      *                      then you can use {@link FixLibrary#CURRENT_SEQUENCE}.If you don't care about message replay
      *                      then use {@link FixLibrary#NO_MESSAGE_REPLAY} as the parameter.
      * @param timeoutInMs the timeout for this operation
@@ -364,11 +372,12 @@ public class FixLibrary extends GatewayProcess
     }
 
     /**
-     * NB: This is an experimental API and is subject to change or potentially removal.
-     *
      * Creates a new SessionWriter for a specified session. This can be used in a clustered system to write messages
      * outbound for a system on its primary node. In a clustered system the <code>SessionProxy</code> would be hooked so
      * writing messages outbound on a normal Session object won't work.
+     *
+     * Messages written using this writer won't update the sent sequence number of any corresponding Session object.
+     * This is designed to support the intended use-case of hooking the session proxy.
      *
      * @param sessionId the id of the session to use.
      * @param connectionId the id of the connection to use.
@@ -378,15 +387,19 @@ public class FixLibrary extends GatewayProcess
     public SessionWriter sessionWriter(
         final long sessionId, final long connectionId, final int sequenceIndex)
     {
-        return poller.followerSession(sessionId, connectionId, sequenceIndex);
+        return poller.sessionWriter(sessionId, connectionId, sequenceIndex);
     }
 
     /**
-     * NB: This is an experimental API and is subject to change or potentially removal.
-     *
      * Create a SessionWriter for a Session from a different Artio instance. This SessionWriter can be used in a
      * clustered system to fill the archive on a follower node with FIX messages that have been replicated by a
      * leader node.
+     *
+     * Messages written using this writer will update the sent sequence number of any corresponding Session object.
+     * This allows offline sessions to be created using this method and messages sent via either the SessionWriter
+     * or the Session itself.
+     *
+     * For the FIXP version see {@link #followerFixPSession(FixPContext, long)}.
      *
      * @param headerEncoder the message header that contains fields that identify the Session. You could set the
      *                      senderCompId and targetCompId on this header for example if those are the fields used to
@@ -398,6 +411,31 @@ public class FixLibrary extends GatewayProcess
         final SessionHeaderEncoder headerEncoder, final long timeoutInMs)
     {
         return poller.followerSession(headerEncoder, timeoutInMs);
+    }
+
+    /**
+     * Create a FixPConnection for a FIXP Session from a different Artio instance. This FixPConnection can be used in a
+     * clustered system to fill the archive on a follower node with FIX messages that have been replicated by a
+     * leader node. This allows offline sessions to be created using this method.
+     *
+     * When a connection is re-established with the correct logon credentials then the messages written via this
+     * offline session can be retransmitted. If a session already exists within the engine with the same identity then
+     * no duplicate session will be created and the session id of the original session will be returned. In the case
+     * that the session is currently connected, care must be taken to ensure that the version of the FIXP connection
+     * is the same as the connected session id or an error will be returned.
+     *
+     * For the FIX version see {@link #followerSession(SessionHeaderEncoder, long)}.
+     *
+     * @param context the context that uniquely identifies the connection
+     * @param testTimeoutInMs the timeout required for this operation.
+     * @return the sessionId that can be used to request the offline session object using {@link #requestSession(long, int, int, long)}.
+     * @throws IllegalArgumentException if the {@link uk.co.real_logic.artio.fixp.FixPProtocol} of the context is
+     * different to the established protocol within the library.
+     */
+    public Reply<Long> followerFixPSession(
+        final FixPContext context, final long testTimeoutInMs)
+    {
+        return poller.followerFixPSession(context, testTimeoutInMs);
     }
 
     /**
@@ -458,8 +496,8 @@ public class FixLibrary extends GatewayProcess
      *
      * @param configuration the configuration for this Session.
      * @return a reply object wrapping the Connection itself.
-     * @see <a href="https://github.com/real-logic/artio/wiki/ILink-3-Support">
-     *     https://github.com/real-logic/artio/wiki/ILink-3-Support</a>
+     * @see <a href="https://github.com/artiofix/artio/wiki/ILink-3-Support">
+     *     https://github.com/artiofix/artio/wiki/ILink-3-Support</a>
      */
     public Reply<ILink3Connection> initiate(final ILink3ConnectionConfiguration configuration)
     {
@@ -494,8 +532,19 @@ public class FixLibrary extends GatewayProcess
         return poller.iLink3Sessions();
     }
 
+    @Override
     protected boolean shouldRethrowExceptionInErrorHandler()
     {
         return RETHROW_EXCEPTION.get();
+    }
+
+    /**
+     * Returns information about library streams. Internal API for testing.
+     *
+     * @return information about library streams
+     */
+    LibraryStreamInfo libraryStreamInfo()
+    {
+        return poller.libraryStreamInfo();
     }
 }

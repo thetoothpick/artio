@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,7 +29,7 @@ import java.util.function.Function;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.typeCompatibleWith;
-import static org.junit.Assert.fail;
+import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * Custom hamcrest matchers to support our own types in tests.
@@ -55,6 +55,7 @@ public final class CustomMatchers
         {
             private String string;
 
+            @Override
             protected boolean matchesSafely(final AsciiBuffer item)
             {
                 this.string = item.getAscii(offset, length);
@@ -62,6 +63,7 @@ public final class CustomMatchers
                 return expectedValue.equals(string);
             }
 
+            @Override
             public void describeTo(final Description description)
             {
                 description.appendText("Expected a String like: ");
@@ -78,6 +80,7 @@ public final class CustomMatchers
         {
             public String error = null;
 
+            @Override
             protected boolean matchesSafely(final T item)
             {
                 try
@@ -104,6 +107,7 @@ public final class CustomMatchers
                 }
             }
 
+            @Override
             public void describeTo(final Description description)
             {
                 if (error != null)
@@ -126,12 +130,14 @@ public final class CustomMatchers
     {
         return new TypeSafeMatcher<T>()
         {
+            @Override
             protected boolean matchesSafely(final T item)
             {
                 final Object value = getter.apply(item);
                 return valueMatcher.matches(value);
             }
 
+            @Override
             protected void describeMismatchSafely(final T item, final Description mismatchDescription)
             {
                 final V value = getter.apply(item);
@@ -140,6 +146,7 @@ public final class CustomMatchers
                     .appendValue(value);
             }
 
+            @Override
             public void describeTo(final Description description)
             {
                 description

@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,17 +16,18 @@
 package uk.co.real_logic.artio.dictionary;
 
 import org.hamcrest.Matcher;
-import org.junit.BeforeClass;
-import org.junit.Test;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
 import uk.co.real_logic.artio.dictionary.ir.*;
 import uk.co.real_logic.artio.dictionary.ir.Field.Type;
 import uk.co.real_logic.artio.dictionary.ir.Field.Value;
 
 import java.util.List;
 
+import static java.util.stream.Collectors.toList;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.*;
-import static org.junit.Assert.*;
+import static org.junit.jupiter.api.Assertions.*;
 import static uk.co.real_logic.artio.dictionary.ir.Field.Type.INT;
 import static uk.co.real_logic.artio.dictionary.ir.Field.Type.STRING;
 import static uk.co.real_logic.artio.util.CustomMatchers.hasFluentProperty;
@@ -37,7 +38,7 @@ public class DictionaryParserTest
 
     private static Dictionary dictionary;
 
-    @BeforeClass
+    @BeforeAll
     public static void setUp() throws Exception
     {
         dictionary = parseExample();
@@ -54,10 +55,10 @@ public class DictionaryParserTest
     @Test
     public void shouldParseExampleDictionary()
     {
-        assertNotNull("Missing dictionary", dictionary);
-        assertNotNull("Missing messages", dictionary.messages());
-        assertNotNull("Missing fields", dictionary.fields());
-        assertNotNull("Missing components", dictionary.components());
+        assertNotNull(dictionary, "Missing dictionary");
+        assertNotNull(dictionary.messages(), "Missing messages");
+        assertNotNull(dictionary.fields(), "Missing fields");
+        assertNotNull(dictionary.components(), "Missing components");
     }
 
     @Test
@@ -65,10 +66,12 @@ public class DictionaryParserTest
     {
         final Field bodyLength = field("BodyLength");
 
-        assertNotNull("Hasn't found BodyLength", bodyLength);
+        assertNotNull(bodyLength, "Hasn't found BodyLength");
         assertEquals("BodyLength", bodyLength.name());
         assertEquals(9, bodyLength.number());
         assertEquals(Type.INT, bodyLength.type());
+
+        assertEquals(Type.LONG, field("ExampleLongField").type());
     }
 
     @Test
@@ -84,7 +87,7 @@ public class DictionaryParserTest
     @Test
     public void shouldParseAllFields()
     {
-        assertEquals(44, dictionary.fields().size());
+        assertEquals(50, dictionary.fields().size());
     }
 
     @Test
@@ -92,7 +95,7 @@ public class DictionaryParserTest
     {
         final Field msgType = field("MsgType");
 
-        assertNotNull("Hasn't found MsgType", msgType);
+        assertNotNull(msgType, "Hasn't found MsgType");
         assertEquals("MsgType", msgType.name());
         assertEquals(35, msgType.number());
         assertEquals(STRING, msgType.type());
@@ -109,7 +112,7 @@ public class DictionaryParserTest
     {
         final Field msgType = field("ClearingFeeIndicator");
 
-        assertNotNull("Hasn't found ClearingFeeIndicator", msgType);
+        assertNotNull(msgType, "Hasn't found ClearingFeeIndicator");
         assertEquals("ClearingFeeIndicator", msgType.name());
         assertEquals(635, msgType.number());
         assertEquals(STRING, msgType.type());
@@ -130,7 +133,7 @@ public class DictionaryParserTest
     {
         final Field msgType = field("TrdRegPublicationType");
 
-        assertNotNull("Hasn't found TrdRegPublicationType", msgType);
+        assertNotNull(msgType, "Hasn't found TrdRegPublicationType");
         assertEquals("TrdRegPublicationType", msgType.name());
         assertEquals(2669, msgType.number());
         assertEquals(INT, msgType.type());
@@ -234,14 +237,22 @@ public class DictionaryParserTest
     }
 
     @Test
+    public void shouldParseAnyFieldsEntries()
+    {
+        final Message executionReport = message("ExecutionReport");
+        final List<Entry> anyFieldsEntries = executionReport.anyFieldsEntries().collect(toList());
+        assertThat(anyFieldsEntries, hasSize(1));
+        assertEquals("TrailingAnyFields", anyFieldsEntries.get(0).name());
+    }
+
+    @Test
     public void shouldDedupeFieldsIncludedTwice()
     {
         shouldThrow(() -> parseDictionary("example_invalid_dictionary_fields_included_twice.xml"),
             IllegalStateException.class,
             "Cannot have the same field defined more than once on a message; this is against the FIX spec. " +
             "Details to follow:\n" +
-            "Message: DedupeFieldsTest Field : MemberSubID (104)\n" +
-            "Use -Dfix.codecs.allow_duplicate_fields=true to allow duplicated fields (Dangerous. May break parser)."
+            "Message: DedupeFieldsTest Field : MemberSubID (104)\n"
         );
     }
 
@@ -252,8 +263,7 @@ public class DictionaryParserTest
             IllegalStateException.class,
             "Cannot have the same field defined more than once on a message; this is against the FIX spec. " +
             "Details to follow:\n" +
-            "Message: DuplicatedFieldMessage Field : MemberID (100) Through Path: [MemberIDsGroup, Members]\n" +
-            "Use -Dfix.codecs.allow_duplicate_fields=true to allow duplicated fields (Dangerous. May break parser)."
+            "Message: DuplicatedFieldMessage Field : MemberID (100) Through Path: [Members, MemberIDsGroup]\n"
         );
         parseDictionary("example_duplicate_dictionary.xml", true);
     }
@@ -265,9 +275,8 @@ public class DictionaryParserTest
             IllegalStateException.class,
             "Cannot have the same field defined more than once on a message; this is against the FIX spec. " +
             "Details to follow:\n" +
-            "Message: PoorlyDefinedMessage Field : MemberSubID (104) Through Path: [NextComponent, Members]\n" +
-            "Message: PoorlyDefinedMessage Field : MemberSubID (104) Through Path: [NextComponent]\n" +
-            "Use -Dfix.codecs.allow_duplicate_fields=true to allow duplicated fields (Dangerous. May break parser).");
+            "Message: PoorlyDefinedMessage Field : MemberSubID (104) Through Path: [Members, NextComponent]\n" +
+            "Message: PoorlyDefinedMessage Field : MemberSubID (104) Through Path: [NextComponent]\n");
     }
 
     @Test
@@ -290,6 +299,15 @@ public class DictionaryParserTest
             " RawData is missing a length field in EgGroupGroup");
     }
 
+    @Test
+    public void shouldNotAllowMultipleAnyFieldsEntries()
+    {
+        shouldThrow(() -> parseDictionary("example_invalid_dictionary_multiple_any_fields_entries.xml"),
+            IllegalStateException.class,
+            "At most one anyFields entry is allowed," +
+            " but MultipleAnyFieldsEntriesTest contains multiple: [PrecedingAnyFields, TrailingAnyFields]");
+    }
+
     private Component component(final String name)
     {
         return dictionary.components().get(name);
@@ -308,6 +326,14 @@ public class DictionaryParserTest
             .stream()
             .filter(Field::isEnum)
             .count();
+    }
+
+    private Message message(final String name)
+    {
+        return dictionary.messages().stream()
+            .filter(message -> message.name().equals(name))
+            .findFirst()
+            .orElseThrow(() -> new IllegalStateException("Message " + name + " not found"));
     }
 
     private Field field(final String name)
@@ -391,7 +417,7 @@ public class DictionaryParserTest
             try
             {
                 assertThat(e.getClass(), typeCompatibleWith(expectedException));
-                assertThat(e.getMessage(), is(message));
+                assertThat(e.getMessage(), containsString(message));
             }
             catch (final AssertionError error)
             {

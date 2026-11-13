@@ -15,8 +15,12 @@
  */
 package uk.co.real_logic.artio.system_tests;
 
-import org.junit.After;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterEach;
+
+
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+
 import uk.co.real_logic.artio.Reply;
 import uk.co.real_logic.artio.engine.EngineConfiguration;
 import uk.co.real_logic.artio.engine.FixEngine;
@@ -24,8 +28,8 @@ import uk.co.real_logic.artio.library.LibraryConfiguration;
 import uk.co.real_logic.artio.session.Session;
 
 import static org.hamcrest.Matchers.*;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static uk.co.real_logic.artio.Constants.LOGOUT_MESSAGE_AS_STR;
 import static uk.co.real_logic.artio.TestFixtures.launchMediaDriver;
 import static uk.co.real_logic.artio.library.SessionConfiguration.AUTOMATIC_INITIAL_SEQUENCE_NUMBER;
@@ -37,22 +41,45 @@ public class StateResetAndCloseTest extends AbstractGatewayToGatewaySystemTest
 
     private final Backup backup = new Backup();
 
-    @After
+    @AfterEach
     public void cleanup()
     {
         backup.cleanup();
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void shouldPerformEndOfDayOperationWithLibrarySession()
     {
         shouldPerformEndOfDayOperation(true);
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void shouldPerformEndOfDayOperationWithGatewaySession()
     {
         shouldPerformEndOfDayOperation(false);
+    }
+
+    // Reproduces a case where a library reconnect, continuing a previous recording
+    @Test
+    public void shouldResetStateEvenWithALibraryReconnect()
+    {
+        deleteLogs();
+        mediaDriver = launchMediaDriver();
+        launch(AUTOMATIC_INITIAL_SEQUENCE_NUMBER, AUTOMATIC_INITIAL_SEQUENCE_NUMBER);
+        acquireAcceptingSession();
+
+        messagesCanBeExchanged();
+
+        testSystem.remove(acceptingLibrary);
+        awaitLibraryDisconnect(acceptingEngine, testSystem);
+
+        testSystem.add(acceptingLibrary);
+        awaitLibraryCount(acceptingEngine, testSystem, 2);
+
+        testSystem.awaitBlocking(() -> acceptingEngine.close());
+        acceptingEngine.resetState(null);
     }
 
     private void shouldPerformEndOfDayOperation(final boolean libraryOwnsSession)
@@ -128,7 +155,7 @@ public class StateResetAndCloseTest extends AbstractGatewayToGatewaySystemTest
 
         final Reply<Session> reply = connectPersistentSessions(
             initiatorInitialSentSequenceNumber, initialReceivedSequenceNumber, false);
-        assertEquals("Repy failed: " + reply, Reply.State.COMPLETED, reply.state());
+        assertEquals(Reply.State.COMPLETED, reply.state(), "Reply failed: " + reply);
         initiatingSession = reply.resultIfPresent();
     }
 }

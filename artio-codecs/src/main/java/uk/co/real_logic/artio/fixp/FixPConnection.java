@@ -50,7 +50,7 @@ public interface FixPConnection
         /**
          * Negotiate accepted, The Establish message hasn't been sent due to back-pressure in Artio,
          * retrying attempt to send.
-         * */
+         */
         RETRY_ESTABLISH,
         /** Received an Establish Reject message. */
         ESTABLISH_REJECTED,
@@ -249,4 +249,16 @@ public interface FixPConnection
      * @return the key associated with this connection.
      */
     FixPKey key();
+
+
+    /**
+     * Returns true if a connection is connected at this point in time.
+     *
+     * @return true if a connection is connected at this point in time.
+     */
+    boolean isConnected();
+
+    long counterpartyKeepAliveIntervalInMs();
+
+    long ourKeepAliveIntervalInMs();
 }

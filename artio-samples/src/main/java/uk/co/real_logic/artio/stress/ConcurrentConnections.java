@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -51,6 +51,10 @@ public final class ConcurrentConnections
             .libraryAeronChannel(aeronChannel)
             .logFileDir("stress-client-logs");
         engineConfiguration.authenticationStrategy((logon) -> true);
+
+        engineConfiguration.aeronArchiveContext()
+            .controlRequestChannel(StressConfiguration.CONTROL_REQUEST_CHANNEL)
+            .controlResponseChannel(StressConfiguration.CLIENT_CONTROL_RESPONSE_CHANNEL);
 
         System.out.println("Client Logs at " + engineConfiguration.logFileDir());
 
@@ -138,7 +142,7 @@ public final class ConcurrentConnections
                 System.out.println(session.id() + " Replied with: " + reply.state());
             }
 
-            while (!session.canSendMessage())
+            while (!session.isActive())
             {
                 idleStrategy.idle(library.poll(1));
             }

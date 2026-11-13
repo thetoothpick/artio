@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,8 +17,8 @@ package uk.co.real_logic.artio.dictionary.generation;
 
 import org.agrona.collections.IntHashSet;
 import org.agrona.generation.StringWriterOutputManager;
-import org.junit.BeforeClass;
-import org.junit.Test;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
 import uk.co.real_logic.artio.util.Reflection;
 
 import java.util.Map;
@@ -27,7 +27,8 @@ import java.util.Set;
 import static org.agrona.generation.CompilerUtil.compileInMemory;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.*;
-import static org.junit.Assert.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static uk.co.real_logic.artio.dictionary.ExampleDictionary.*;
 import static uk.co.real_logic.artio.util.Reflection.getField;
 
@@ -35,11 +36,11 @@ public class ConstantGeneratorTest
 {
     private static final StringWriterOutputManager OUTPUT_MANAGER = new StringWriterOutputManager();
     private static final ConstantGenerator CONSTANT_GENERATOR = new ConstantGenerator(
-        MESSAGE_EXAMPLE, TEST_PACKAGE, OUTPUT_MANAGER);
+        MESSAGE_EXAMPLE, TEST_PACKAGE, null, OUTPUT_MANAGER);
 
     private static Object constants;
 
-    @BeforeClass
+    @BeforeAll
     public static void generate() throws Exception
     {
         CONSTANT_GENERATOR.generate();
@@ -95,9 +96,9 @@ public class ConstantGeneratorTest
         assertThat(allFields, not(hasItem(999)));
     }
 
-    @Test(expected = NoSuchFieldException.class)
+    @Test
     public void shouldNotGenerateUnnecessaryValuesOfMethods() throws Exception
     {
-        Reflection.field(constants, "VALUES_OF_TestReqID");
+        assertThrows(NoSuchFieldException.class, () -> Reflection.field(constants, "VALUES_OF_Heartbeat"));
     }
 }

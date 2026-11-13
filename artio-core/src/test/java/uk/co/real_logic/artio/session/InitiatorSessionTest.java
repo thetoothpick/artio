@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,14 +15,16 @@
  */
 package uk.co.real_logic.artio.session;
 
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
+import uk.co.real_logic.artio.messages.ConnectionType;
 import uk.co.real_logic.artio.protocol.GatewayPublication;
 import uk.co.real_logic.artio.util.MutableAsciiBuffer;
 
 import static io.aeron.logbuffer.ControlledFragmentHandler.Action.CONTINUE;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.*;
+import static uk.co.real_logic.artio.CommonConfiguration.DEFAULT_RESEND_REQUEST_CONTROLLER;
 import static uk.co.real_logic.artio.CommonConfiguration.DEFAULT_SESSION_BUFFER_SIZE;
 import static uk.co.real_logic.artio.dictionary.generation.CodecUtil.MISSING_INT;
 import static uk.co.real_logic.artio.engine.EngineConfiguration.DEFAULT_REASONABLE_TRANSMISSION_TIME_IN_MS;
@@ -32,12 +34,15 @@ import static uk.co.real_logic.artio.session.Session.UNKNOWN_TIME;
 
 public class InitiatorSessionTest extends AbstractSessionTest
 {
-    private final InitiatorSession session;
+
+    @Override
+    protected Session newSession()
     {
-        session = new InitiatorSession(HEARTBEAT_INTERVAL_IN_S,
+        final InternalSession session = new InternalSession(HEARTBEAT_INTERVAL_IN_S,
             CONNECTION_ID,
-            fakeClock,
             nanoClock,
+            CONNECTED,
+            false,
             sessionProxy,
             mock(GatewayPublication.class),
             mockPublication,
@@ -48,32 +53,38 @@ public class InitiatorSessionTest extends AbstractSessionTest
             LIBRARY_ID,
             1,
             SEQUENCE_INDEX,
-            CONNECTED,
-            false,
             DEFAULT_REASONABLE_TRANSMISSION_TIME_IN_MS,
             new MutableAsciiBuffer(new byte[DEFAULT_SESSION_BUFFER_SIZE]),
             false,
             SessionCustomisationStrategy.none(),
             messageInfo,
-            fakeEpochFractionClock);
+            fakeEpochFractionClock,
+            ConnectionType.INITIATOR,
+            DEFAULT_RESEND_REQUEST_CONTROLLER,
+            forcedHeartbeatIntervalInS,
+            disableHeartbeatRepliesToTestRequests,
+            true,
+            new InternalSession.Formatters());
         session.fixDictionary(makeDictionary());
-        session.sessionProcessHandler(mockLogonListener);
+        session.sessionProcessHandler(fixSessionOwner);
+        return session;
     }
 
     @Test
     public void shouldInitiallyBeConnected()
     {
-        assertEquals(CONNECTED, session.state());
+        assertEquals(CONNECTED, session().state());
     }
 
     @Test
     public void shouldActivateUponLogonResponse()
     {
-        session.state(SENT_LOGON);
+        readyForLogon();
 
         assertEquals(CONTINUE, onLogon(1));
 
         assertState(ACTIVE);
+        verify(sessionProxy).seqNumResetRequested();
         verifyNoFurtherMessages();
         verifyNotifiesLoginListener();
         assertHasLogonTime();
@@ -82,23 +93,23 @@ public class InitiatorSessionTest extends AbstractSessionTest
     @Test
     public void shouldAttemptLogonWhenConnected()
     {
-        session.id(SESSION_ID);
-        session.poll(0);
+        session().id(SESSION_ID);
+        session().poll(0);
 
         verifyLogon();
 
-        assertEquals(1, session.lastSentMsgSeqNum());
+        assertEquals(1, session().lastSentMsgSeqNum());
     }
 
     @Test
     public void shouldAttemptLogonOnlyOnce()
     {
-        session.id(SESSION_ID);
-        session.poll(0);
+        session().id(SESSION_ID);
+        session().poll(0);
 
-        session.poll(10_000_000);
+        session().poll(10_000_000);
 
-        session.poll(20_000_000);
+        session().poll(20_000_000);
 
         verifyLogon();
     }
@@ -106,7 +117,7 @@ public class InitiatorSessionTest extends AbstractSessionTest
     @Test
     public void shouldNotifyGatewayWhenLoggedIn()
     {
-        session.state(SENT_LOGON);
+        session().state(SENT_LOGON);
 
         assertEquals(CONTINUE, onLogon(1));
 
@@ -117,7 +128,7 @@ public class InitiatorSessionTest extends AbstractSessionTest
     @Test
     public void shouldNotifyGatewayWhenLoggedInOnce()
     {
-        session.state(SENT_LOGON);
+        session().state(SENT_LOGON);
 
         assertEquals(CONTINUE, onLogon(1));
 
@@ -133,6 +144,34 @@ public class InitiatorSessionTest extends AbstractSessionTest
         shouldStartAcceptLogonBasedSequenceNumberResetWhenSequenceNumberIsOne(SEQUENCE_INDEX);
     }
 
+    @Test
+    public void shouldTakeForcedHeartbeatConfigurationIntoAccountWhenSendingInitialLogon()
+    {
+        forcedHeartbeatIntervalInS = 5;
+        session().id(SESSION_ID);
+
+        session().poll(0);
+
+        verifyLogon();
+
+        onLogon(1);
+        assertForcedHeartbeatInterval();
+    }
+
+    @Test
+    public void shouldDisconnectIfFirstMessageNotALogon()
+    {
+        session().id(SESSION_ID);
+        session().poll(0);
+
+        verifyLogon();
+
+        onMessage(1);
+
+        verifyDisconnect(times(1));
+        verifyNoFurtherMessages();
+    }
+
     private void verifyLogon()
     {
         verify(sessionProxy, times(1)).sendLogon(
@@ -140,14 +179,10 @@ public class InitiatorSessionTest extends AbstractSessionTest
             null, MISSING_INT);
     }
 
+    @Override
     protected void readyForLogon()
     {
-        session.state(SENT_LOGON);
-    }
-
-    protected Session session()
-    {
-        return session;
+        session().state(SENT_LOGON);
     }
 
     private void assertHasLogonTime()

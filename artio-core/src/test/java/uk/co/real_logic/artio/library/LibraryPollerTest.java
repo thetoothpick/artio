@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,10 +16,12 @@
 package uk.co.real_logic.artio.library;
 
 import io.aeron.Subscription;
+import io.aeron.driver.DutyCycleTracker;
+import org.agrona.LangUtil;
 import org.agrona.concurrent.UnsafeBuffer;
 import org.agrona.concurrent.status.AtomicCounter;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 import org.mockito.stubbing.Answer;
@@ -28,11 +30,8 @@ import org.mockito.verification.VerificationMode;
 import uk.co.real_logic.artio.FixCounters;
 import uk.co.real_logic.artio.dictionary.FixDictionary;
 import uk.co.real_logic.artio.engine.framer.FakeEpochClock;
-import uk.co.real_logic.artio.messages.CancelOnDisconnectOption;
+import uk.co.real_logic.artio.messages.*;
 import uk.co.real_logic.artio.messages.ControlNotificationDecoder.SessionsDecoder;
-import uk.co.real_logic.artio.messages.MetaDataStatus;
-import uk.co.real_logic.artio.messages.SessionStatus;
-import uk.co.real_logic.artio.messages.SlowStatus;
 import uk.co.real_logic.artio.protocol.GatewayPublication;
 import uk.co.real_logic.artio.session.InternalSession;
 import uk.co.real_logic.artio.session.Session;
@@ -43,8 +42,8 @@ import java.util.List;
 import static io.aeron.CommonContext.IPC_CHANNEL;
 import static java.util.Arrays.asList;
 import static java.util.Collections.singletonList;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.*;
 import static uk.co.real_logic.artio.CommonConfiguration.DEFAULT_REPLY_TIMEOUT_IN_MS;
 import static uk.co.real_logic.artio.LivenessDetector.SEND_INTERVAL_FRACTION;
@@ -85,14 +84,15 @@ public class LibraryPollerTest
 
     private LibraryPoller library;
 
-    @Before
+    @BeforeEach
     public void setUp()
     {
         when(transport.outboundPublication()).thenReturn(outboundPublication);
         when(transport.inboundSubscription()).thenReturn(inboundSubscription);
 
-        when(counters.receivedMsgSeqNo(anyLong())).thenReturn(mock(AtomicCounter.class));
-        when(counters.sentMsgSeqNo(anyLong())).thenReturn(mock(AtomicCounter.class));
+        when(counters.getLibraryDutyCycleTracker(anyLong())).thenReturn(mock(DutyCycleTracker.class));
+        when(counters.receivedMsgSeqNo(anyLong(), anyLong())).thenReturn(mock(AtomicCounter.class));
+        when(counters.sentMsgSeqNo(anyLong(), anyLong())).thenReturn(mock(AtomicCounter.class));
 
         when(sessionAcquireHandler.onSessionAcquired(session.capture(), any())).thenReturn(sessionHandler);
     }
@@ -257,7 +257,7 @@ public class LibraryPollerTest
 
         pollTwice();
 
-        assertFalse("Library failed to timeout", library.isConnected());
+        assertFalse(library.isConnected(), "Library failed to timeout");
     }
 
     private void reconnectAfterTimeout()
@@ -266,7 +266,7 @@ public class LibraryPollerTest
 
         pollTwice();
 
-        assertTrue("Library still timed out", library.isConnected());
+        assertTrue(library.isConnected(), "Library still timed out");
     }
 
     private void advanceBeyondReplyTimeout()
@@ -305,7 +305,7 @@ public class LibraryPollerTest
 
         pollTwice();
 
-        assertTrue("Failed to connect", library.isConnected());
+        assertTrue(library.isConnected(), "Failed to connect");
     }
 
     private void receiveOneApplicationHeartbeat()
@@ -319,7 +319,7 @@ public class LibraryPollerTest
     {
         return (inv) ->
         {
-            library.onApplicationHeartbeat(libraryId());
+            library.onApplicationHeartbeat(libraryId(), ApplicationHeartbeatDecoder.TEMPLATE_ID, 0);
             return 1;
         };
     }
@@ -335,12 +335,14 @@ public class LibraryPollerTest
             new LibraryConfiguration()
                 .libraryAeronChannels(libraryAeronChannels)
                 .sessionAcquireHandler(sessionAcquireHandler)
-                .libraryConnectHandler(connectHandler),
+                .libraryConnectHandler(connectHandler)
+                .conclude(),
             new LibraryTimers(clock::time, mock(AtomicCounter.class)),
             counters,
             transport,
             fixLibrary,
-            clock);
+            clock,
+            LangUtil::rethrowUnchecked);
     }
 
     private OngoingStubbing<Integer> whenPolled()
@@ -390,18 +392,28 @@ public class LibraryPollerTest
             0);
     }
 
-    private SessionsDecoder hasOtherSessionId()
+    private ControlNotificationDecoder hasOtherSessionId()
     {
         final SessionsDecoder sessionsDecoder = mock(SessionsDecoder.class);
         when(sessionsDecoder.hasNext()).thenReturn(true, false);
         when(sessionsDecoder.sessionId()).thenReturn(OTHER_SESSION_ID);
-        return sessionsDecoder;
+        return controlNotification(sessionsDecoder);
     }
 
-    private SessionsDecoder noSessionIds()
+    private ControlNotificationDecoder noSessionIds()
     {
         final SessionsDecoder sessionsDecoder = mock(SessionsDecoder.class);
         when(sessionsDecoder.hasNext()).thenReturn(false);
-        return sessionsDecoder;
+        return controlNotification(sessionsDecoder);
+    }
+
+    private ControlNotificationDecoder controlNotification(final SessionsDecoder sessionsDecoder)
+    {
+        final ControlNotificationDecoder controlNotificationDecoder = mock(ControlNotificationDecoder.class);
+        when(controlNotificationDecoder.sessions()).thenReturn(sessionsDecoder);
+        final ControlNotificationDecoder.DisconnectedSessionsDecoder disconnectedSessions =
+            mock(ControlNotificationDecoder.DisconnectedSessionsDecoder.class);
+        when(controlNotificationDecoder.disconnectedSessions()).thenReturn(disconnectedSessions);
+        return controlNotificationDecoder;
     }
 }

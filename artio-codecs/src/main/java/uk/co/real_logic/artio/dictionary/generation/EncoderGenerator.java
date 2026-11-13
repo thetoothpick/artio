@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited., Monotonic Ltd.
+ * Copyright 2015-2025 Real Logic Limited., Monotonic Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,18 +21,18 @@ import org.agrona.MutableDirectBuffer;
 import org.agrona.concurrent.UnsafeBuffer;
 import org.agrona.generation.OutputManager;
 import uk.co.real_logic.artio.builder.Encoder;
+import uk.co.real_logic.artio.builder.FieldBagEncoder;
 import uk.co.real_logic.artio.builder.SessionHeaderEncoder;
+import uk.co.real_logic.artio.dictionary.Generated;
 import uk.co.real_logic.artio.dictionary.ir.*;
+import uk.co.real_logic.artio.dictionary.ir.Dictionary;
 import uk.co.real_logic.artio.dictionary.ir.Entry.Element;
 import uk.co.real_logic.artio.dictionary.ir.Field.Type;
 import uk.co.real_logic.artio.util.MutableAsciiBuffer;
 
 import java.io.IOException;
 import java.io.Writer;
-import java.util.Arrays;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
+import java.util.*;
 import java.util.function.Function;
 import java.util.stream.IntStream;
 
@@ -41,7 +41,8 @@ import static java.util.stream.Collectors.joining;
 import static uk.co.real_logic.artio.dictionary.generation.AggregateType.GROUP;
 import static uk.co.real_logic.artio.dictionary.generation.AggregateType.HEADER;
 import static uk.co.real_logic.artio.dictionary.generation.EnumGenerator.enumName;
-import static uk.co.real_logic.artio.dictionary.generation.EnumGenerator.hasEnumGenerated;
+import static uk.co.real_logic.artio.dictionary.generation.GenerationUtil.GENERATED_ANNOTATION;
+import static uk.co.real_logic.artio.dictionary.generation.GenerationUtil.SUPPRESS_THIS_ESCAPE_ANNOTATION;
 import static uk.co.real_logic.artio.dictionary.generation.GenerationUtil.fileHeader;
 import static uk.co.real_logic.artio.dictionary.generation.GenerationUtil.importFor;
 import static uk.co.real_logic.artio.dictionary.generation.OptionalSessionFields.ENCODER_OPTIONAL_SESSION_FIELDS;
@@ -63,7 +64,6 @@ class EncoderGenerator extends Generator
         "BusinessMessageRejectEncoder"));
 
     private static final String TRAILER_ENCODE_PREFIX =
-        "    // |10=...|\n" +
         "    long finishMessage(final MutableAsciiBuffer buffer, final int messageStart, final int offset)\n" +
         "    {\n" +
         "        int position = offset;\n" +
@@ -79,7 +79,6 @@ class EncoderGenerator extends Generator
         "        return Encoder.result(position - messageStart, messageStart);\n" +
         "    }" +
         "\n" +
-        "    // Optional trailer fields\n" +
         "    int startTrailer(final MutableAsciiBuffer buffer, final int offset)\n" +
         "    {\n" +
         "        final int start = offset;\n" +
@@ -88,7 +87,6 @@ class EncoderGenerator extends Generator
 
     // returns offset where message starts
     private static final String HEADER_ENCODE_PREFIX =
-        "    // 8=...|9=...|\n" +
         "    int finishHeader(final MutableAsciiBuffer buffer, final int bodyStart, final int bodyLength)\n" +
         "    {\n" +
         "        int position = bodyStart - 1;\n" +
@@ -168,10 +166,11 @@ class EncoderGenerator extends Generator
         final Class<?> validationClass,
         final Class<?> rejectUnknownFieldClass,
         final Class<?> rejectUnknownEnumValueClass,
-        final String codecRejectUnknownEnumValueEnabled)
+        final String codecRejectUnknownEnumValueEnabled,
+        final boolean fixTagsInJavadoc)
     {
         super(dictionary, builderPackage, builderCommonPackage, outputManager, validationClass, rejectUnknownFieldClass,
-            rejectUnknownEnumValueClass, false, codecRejectUnknownEnumValueEnabled);
+            rejectUnknownEnumValueClass, false, codecRejectUnknownEnumValueEnabled, fixTagsInJavadoc, null);
 
         final Component header = dictionary.header();
         validateHasField(header, BEGIN_STRING);
@@ -188,6 +187,7 @@ class EncoderGenerator extends Generator
         }
     }
 
+    @Override
     protected void generateAggregateFile(final Aggregate aggregate, final AggregateType aggregateType)
     {
         final String className = encoderClassName(aggregate.name());
@@ -202,6 +202,7 @@ class EncoderGenerator extends Generator
                 {
                     out.append(importFor("uk.co.real_logic.artio.builder.Abstract" + className));
                 }
+                out.append(importFor(Generated.class));
 
                 generateImports(
                     "Encoder",
@@ -210,35 +211,48 @@ class EncoderGenerator extends Generator
                     DirectBuffer.class,
                     MutableDirectBuffer.class,
                     UnsafeBuffer.class,
-                    AsciiSequenceView.class);
+                    AsciiSequenceView.class,
+                    FieldBagEncoder.class);
                 generateAggregateClass(aggregate, aggregateType, className, out);
             });
     }
 
+    @Override
     protected Class<?> topType(final AggregateType aggregateType)
     {
         return Encoder.class;
     }
 
+    @Override
     protected String resetGroup(final Entry entry)
     {
         final Group group = (Group)entry.element();
         final String name = group.name();
         final Entry numberField = group.numberField();
-        return String.format(
-            "    public void %1$s()\n" +
-            "    {\n" +
-            "        if (%2$s != null)\n" +
-            "        {\n" +
-            "            %2$s.reset();\n" +
-            "        }\n" +
-            "        %3$s = 0;\n" +
-            "        has%4$s = false;\n" +
-            "    }\n\n",
-            nameOfResetMethod(name),
-            formatPropertyName(name),
-            formatPropertyName(numberField.name()),
-            numberField.name());
+        final String resetMethod = nameOfResetMethod(name);
+        if (isSharedParent())
+        {
+            return String.format(
+                "    public abstract void %1$s();\n\n",
+                resetMethod);
+        }
+        else
+        {
+            return String.format(
+                "    public void %1$s()\n" +
+                "    {\n" +
+                "        if (%2$s != null)\n" +
+                "        {\n" +
+                "            %2$s.reset();\n" +
+                "        }\n" +
+                "        %3$s = 0;\n" +
+                "        has%4$s = false;\n" +
+                "    }\n\n",
+                resetMethod,
+                formatPropertyName(name),
+                formatPropertyName(numberField.name()),
+                numberField.name());
+        }
     }
 
     private void generateAggregateClass(
@@ -247,6 +261,8 @@ class EncoderGenerator extends Generator
         final String className,
         final Writer out) throws IOException
     {
+        push(aggregate);
+
         final boolean isHeader = type == AggregateType.HEADER;
         final boolean isMessage = type == AggregateType.MESSAGE;
         final List<String> interfaces;
@@ -266,48 +282,83 @@ class EncoderGenerator extends Generator
         {
             interfaces = emptyList();
         }
-        out.append(classDeclaration(className, interfaces, type == GROUP));
+        out.append(classDeclaration(
+            className, interfaces, type == GROUP, aggregate.isInParent()));
         out.append(constructor(className, aggregate, type, dictionary));
-        if (isMessage)
+        if (isMessage && !isSharedParent())
         {
             out.append(commonCompoundImports("Encoder", false, ""));
         }
         else if (type == GROUP)
         {
             final Group group = (Group)aggregate;
-            out.append(nextMethod(group));
+
+            // shared parents are abstract, generate the next() method in the concrete children.
+            if (isSharedParent())
+            {
+                out.append(abstractNextMethod(group));
+            }
+            else
+            {
+                out.append(nextMethod(group));
+            }
         }
         else if (type == HEADER)
         {
             out.append(
                 String.format("\n" +
-                "    private static final byte[] DEFAULT_BEGIN_STRING=\"%s\".getBytes(StandardCharsets.US_ASCII);" +
+                "    %2$s static final byte[] DEFAULT_BEGIN_STRING=\"%1$s\".getBytes(StandardCharsets.US_ASCII);" +
                 "\n\n",
-                beginString));
+                beginString,
+                scope));
         }
 
         precomputedHeaders(out, aggregate.entries());
         generateSetters(out, className, aggregate.entries());
         out.append(encodeMethod(aggregate.entries(), type));
-        out.append(completeResetMethod(aggregate, isMessage, type));
+        final String resetMethod = completeResetMethod(aggregate, isMessage, type);
+        out.append(resetMethod);
         out.append(generateAppendTo(aggregate, isMessage));
         out.append(generateCopyTo(aggregate));
         out.append("}\n");
+
+        pop();
     }
 
     private String classDeclaration(
         final String className,
         final List<String> interfaces,
-        final boolean isStatic)
+        final boolean isGroup,
+        final boolean inParent)
     {
         final String interfaceList = interfaces.isEmpty() ? "" : " implements " + String.join(", ", interfaces);
 
+        final String extendsClause;
+        if (inParent)
+        {
+            String qualifiedName = className;
+            // Groups are inner classes in their parent
+            if (isGroup)
+            {
+                qualifiedName = qualifiedAggregateStackNames(aggregate -> encoderClassName(aggregate.name()));
+            }
+            extendsClause = " extends " + parentDictPackage() + "." + qualifiedName;
+        }
+        else
+        {
+            extendsClause = "";
+        }
         return String.format(
-            "\n\npublic %3$sclass %1$s%2$s\n" +
-                "{\n",
+            "\n" +
+            GENERATED_ANNOTATION +
+            SUPPRESS_THIS_ESCAPE_ANNOTATION +
+            "public %3$s%4$sclass %1$s%5$s%2$s\n" +
+            "{\n",
             className,
             interfaceList,
-            isStatic ? "static " : "");
+            isGroup ? "static " : "",
+            isSharedParent() ? "abstract " : "",
+            extendsClause);
     }
 
     private String completeResetMethod(
@@ -320,15 +371,16 @@ class EncoderGenerator extends Generator
                 additionalReset = RESET_NEXT_GROUP;
                 break;
             case HEADER:
-                additionalReset = "        beginString(DEFAULT_BEGIN_STRING);\n";
+                additionalReset = "        beginStringAsCopy(DEFAULT_BEGIN_STRING, 0, DEFAULT_BEGIN_STRING.length);\n";
                 break;
             default:
                 additionalReset = "";
         }
-        return super.completeResetMethod(isMessage, aggregate.entries(), additionalReset);
+        return super.completeResetMethod(isMessage, aggregate.entries(), additionalReset, aggregate.isInParent());
     }
 
-    private void generateGroupClass(final Group group, final Writer out) throws IOException
+    private void generateGroupClass(final Group group, final Writer out)
+        throws IOException
     {
         final String className = encoderClassName(group.name());
         generateAggregateClass(group, GROUP, className, out);
@@ -350,6 +402,13 @@ class EncoderGenerator extends Generator
         );
     }
 
+    private String abstractNextMethod(final Group group)
+    {
+        return String.format(
+            "    public abstract %1$s next();\n\n",
+            encoderClassName(group.name()));
+    }
+
     private String constructor(
         final String className, final Aggregate aggregate, final AggregateType type, final Dictionary dictionary)
     {
@@ -359,9 +418,9 @@ class EncoderGenerator extends Generator
             final Message message = (Message)aggregate;
             final long packedType = message.packedType();
             final String fullType = message.fullType();
-            final String msgType = header.hasField(MSG_TYPE) ?
-                String.format("        header.msgType(\"%s\");\n", fullType) : "";
 
+            final String msgType = header.hasField(MSG_TYPE) && !isSharedParent() ?
+                String.format("        header.msgType(\"%s\");\n", fullType) : "";
             return String.format(
                 "    public long messageType()\n" +
                 "    {\n" +
@@ -380,7 +439,7 @@ class EncoderGenerator extends Generator
             return String.format(
                 "    public %s()\n" +
                 "    {\n" +
-                "        beginString(DEFAULT_BEGIN_STRING);\n" +
+                "        beginStringAsCopy(DEFAULT_BEGIN_STRING, 0, DEFAULT_BEGIN_STRING.length);\n" +
                 "    }\n\n",
                 className);
         }
@@ -390,7 +449,8 @@ class EncoderGenerator extends Generator
         }
     }
 
-    private void generateSetters(final Writer out, final String className, final List<Entry> entries)
+    private void generateSetters(
+        final Writer out, final String className, final List<Entry> entries)
         throws IOException
     {
         final List<String> optionalFields = ENCODER_OPTIONAL_SESSION_FIELDS.get(className);
@@ -525,32 +585,42 @@ class EncoderGenerator extends Generator
     }
 
     private void generateSetter(
-        final String className, final Entry entry, final Writer out, final Set<String> optionalFields)
+        final String className,
+        final Entry entry,
+        final Writer out,
+        final Set<String> optionalFields)
     {
         if (!isBodyLength(entry))
         {
             entry.forEach(
-                (field) -> out.append(generateFieldSetter(className, field, optionalFields)),
+                (field) ->
+                {
+                    optionalFields.remove(field.name());
+                    if (!entry.isInParent())
+                    {
+                        out.append(generateFieldSetter(className, field));
+                    }
+                },
                 (group) -> generateGroup(className, group, out, optionalFields),
-                (component) -> generateComponentField(encoderClassName(entry.name()), component, out));
+                (component) -> generateComponentField(encoderClassName(entry.name()), component, out),
+                (anyFields) -> generateAnyFields(entry, out));
         }
     }
 
-    private String generateFieldSetter(final String className, final Field field, final Set<String> optionalFields)
+    private String generateFieldSetter(final String className, final Field field)
     {
         final String name = field.name();
         final String fieldName = formatPropertyName(name);
-        final String hasField = String.format("    private boolean has%1$s;\n\n", name) + hasGetter(name);
+        final String hasField = String.format("    %2$s boolean has%1$s;\n\n", name, scope) + hasGetter(name);
+        final String javadoc = generateAccessorJavadoc(field);
 
         final String hasAssign = String.format("        has%s = true;\n", name);
 
-        final String enumSetter = hasEnumGenerated(field) && !field.type().isMultiValue() ?
+        final String enumSetter = shouldGenerateClassEnumMethods(field) ?
             enumSetter(className, fieldName, enumName(field.name())) : "";
 
         final Function<String, String> generateSetter =
-            (type) -> generateSetter(name, type, fieldName, hasField, className, hasAssign, enumSetter);
-
-        optionalFields.remove(name);
+            (type) -> generateSetter(name, type, fieldName, hasField, className, hasAssign, enumSetter, javadoc);
 
         switch (field.type())
         {
@@ -562,7 +632,7 @@ class EncoderGenerator extends Generator
             case EXCHANGE:
             case COUNTRY:
             case LANGUAGE:
-                return generateStringSetter(className, fieldName, name, enumSetter);
+                return generateStringSetter(className, fieldName, name, enumSetter, javadoc);
             case BOOLEAN:
                 return generateSetter.apply("boolean");
 
@@ -576,18 +646,23 @@ class EncoderGenerator extends Generator
             case DAYOFMONTH:
                 return generateSetter.apply("int");
 
+            case LONG:
+                return generateSetter.apply("long");
+
             case FLOAT:
             case PRICE:
             case PRICEOFFSET:
             case QTY:
+            case QUANTITY:
             case PERCENTAGE:
             case AMT:
-                return decimalFloatSetter(fieldName, hasField, className, hasAssign, enumSetter);
+                return decimalFloatSetter(fieldName, hasField, className, hasAssign, enumSetter, javadoc);
 
             case DATA:
             case XMLDATA:
                 // DATA fields always come with their own Length field defined by the schema
-                return generateSetter.apply("byte[]") + generateCopyingDataSetter(className, fieldName, hasAssign);
+                return generateSetter.apply("byte[]") +
+                    generateCopyingDataSetter(className, fieldName, hasAssign, javadoc);
 
             case UTCTIMESTAMP:
             case LOCALMKTDATE:
@@ -596,160 +671,196 @@ class EncoderGenerator extends Generator
             case MONTHYEAR:
             case TZTIMEONLY:
             case TZTIMESTAMP:
-                return generateBytesSetter(className, fieldName, name);
+                return generateBytesSetter(className, fieldName, name, javadoc);
 
             default: throw new UnsupportedOperationException("Unknown type: " + field.type());
         }
     }
 
-    private String generateCopyingDataSetter(final String className, final String fieldName, final String hasAssign)
+    private String generateCopyingDataSetter(
+        final String className, final String fieldName, final String hasAssign, final String javadoc)
     {
         return String.format(
-            "    public %2$s %1$sAsCopy(final byte[] value, final int offset, final int length)\n" +
+            "    %4$spublic %2$s %1$sAsCopy(final byte[] value, final int offset, final int length)\n" +
             "    {\n" +
-            "        %1$s = copyInto(%1$s, value, offset, length);\n" +
+            "        this.%1$s = copyInto(this.%1$s, value, offset, length);\n" +
             "%3$s" +
             "        return this;\n" +
             "    }\n\n",
             fieldName,
             className,
-            hasAssign);
+            hasAssign,
+            javadoc);
     }
 
     private void generateGroup(
-        final String className, final Group group, final Writer out, final Set<String> optionalFields)
+        final String className,
+        final Group group,
+        final Writer out,
+        final Set<String> optionalFields)
         throws IOException
     {
         generateGroupClass(group, out);
 
         final Entry numberField = group.numberField();
-        generateSetter(className, numberField, out, optionalFields);
 
-        out.append(String.format(
-            "\n" +
-            "    private %1$s %2$s = null;\n\n" +
-            "    public %1$s %2$s(final int numberOfElements)\n" +
-            "    {\n" +
-            "        has%3$s = true;\n" +
-            "        %4$s = numberOfElements;\n" +
-            "        if (%2$s == null)\n" +
-            "        {\n" +
-            "            %2$s = new %1$s();\n" +
-            "        }\n" +
-            "        return %2$s;\n" +
-            "    }\n\n",
-            encoderClassName(group.name()),
-            formatPropertyName(group.name()),
-            numberField.name(),
-            formatPropertyName(numberField.name())));
+        final boolean inParent = group.isInParent();
+        if (!inParent)
+        {
+            generateSetter(className, numberField, out, optionalFields);
+        }
+
+        // Abstraction layer in shared parent, implementation in children
+        if (isSharedParent())
+        {
+            out.append(String.format(
+                "\n    public abstract %1$s %2$s(final int numberOfElements);\n\n",
+                encoderClassName(group.name()),
+                formatPropertyName(group.name())));
+        }
+        else
+        {
+            out.append(String.format(
+                "\n" +
+                "    private %1$s %2$s = null;\n\n" +
+                "    public %1$s %2$s(final int numberOfElements)\n" +
+                "    {\n" +
+                "        has%3$s = true;\n" +
+                "        %4$s = numberOfElements;\n" +
+                "        if (%2$s == null)\n" +
+                "        {\n" +
+                "            %2$s = new %1$s();\n" +
+                "        }\n" +
+                "        return %2$s;\n" +
+                "    }\n\n",
+                encoderClassName(group.name()),
+                formatPropertyName(group.name()),
+                numberField.name(),
+                formatPropertyName(numberField.name())));
+        }
     }
 
-    private String generateBytesSetter(final String className, final String fieldName, final String name)
+    private String generateBytesSetter(
+        final String className, final String fieldName, final String name, final String javadoc)
     {
         return String.format(
-            "    private final MutableDirectBuffer %1$s = new UnsafeBuffer();\n\n" +
-            "    private int %1$sOffset = 0;\n\n" +
-            "    private int %1$sLength = 0;\n\n" +
-            "    public %2$s %1$s(final DirectBuffer value, final int offset, final int length)\n" +
+            "    %4$s final MutableDirectBuffer %1$s = new UnsafeBuffer();\n" +
+            "    %4$s byte[] %1$sInternalBuffer = this.%1$s.byteArray();\n" +
+            "    %4$s int %1$sOffset = 0;\n" +
+            "    %4$s int %1$sLength = 0;\n\n" +
+            "    %5$spublic %2$s %1$s(final DirectBuffer value, final int offset, final int length)\n" +
             "    {\n" +
-            "        %1$s.wrap(value);\n" +
-            "        %1$sOffset = offset;\n" +
-            "        %1$sLength = length;\n" +
+            "        this.%1$s.wrap(value);\n" +
+            "        this.%1$sOffset = offset;\n" +
+            "        this.%1$sLength = length;\n" +
             "        return this;\n" +
             "    }\n\n" +
-            "    public %2$s %1$s(final DirectBuffer value, final int length)\n" +
+            "    %5$spublic %2$s %1$s(final DirectBuffer value, final int length)\n" +
             "    {\n" +
             "        return %1$s(value, 0, length);\n" +
             "    }\n\n" +
-            "    public %2$s %1$s(final DirectBuffer value)\n" +
+            "    %5$spublic %2$s %1$s(final DirectBuffer value)\n" +
             "    {\n" +
             "        return %1$s(value, 0, value.capacity());\n" +
             "    }\n\n" +
-            "    public %2$s %1$s(final byte[] value, final int offset, final int length)\n" +
+            "    %5$spublic %2$s %1$s(final byte[] value, final int offset, final int length)\n" +
             "    {\n" +
-            "        %1$s.wrap(value);\n" +
-            "        %1$sOffset = offset;\n" +
-            "        %1$sLength = length;\n" +
+            "        this.%1$s.wrap(value);\n" +
+            "        this.%1$sOffset = offset;\n" +
+            "        this.%1$sLength = length;\n" +
             "        return this;\n" +
             "    }\n\n" +
-            "    public %2$s %1$sAsCopy(final byte[] value, final int offset, final int length)\n" +
+            "    %5$spublic %2$s %1$sAsCopy(final byte[] value, final int offset, final int length)\n" +
             "    {\n" +
-            "        copyInto(%1$s, value, offset, length);\n" +
-            "        %1$sOffset = offset;\n" +
-            "        %1$sLength = length;\n" +
+            "        if (copyInto(this.%1$s, value, offset, length))\n" +
+            "        {\n" +
+            "            %1$sInternalBuffer = this.%1$s.byteArray();\n" +
+            "        }\n" +
+            "        this.%1$sOffset = 0;\n" +
+            "        this.%1$sLength = length;\n" +
             "        return this;\n" +
             "    }\n\n" +
-            "    public %2$s %1$s(final byte[] value, final int length)\n" +
+            "    %5$spublic %2$s %1$s(final byte[] value, final int length)\n" +
             "    {\n" +
             "        return %1$s(value, 0, length);\n" +
             "    }\n\n" +
-            "    public %2$s %1$s(final byte[] value)\n" +
+            "    %5$spublic %2$s %1$s(final byte[] value)\n" +
             "    {\n" +
             "        return %1$s(value, 0, value.length);\n" +
             "    }\n\n" +
-            "    public boolean has%3$s()\n" +
+            "    %5$spublic boolean has%3$s()\n" +
             "    {\n" +
             "        return %1$sLength > 0;\n" +
             "    }\n\n" +
-            "    public MutableDirectBuffer %1$s()\n" +
+            "    %5$spublic MutableDirectBuffer %1$s()\n" +
             "    {\n" +
             "        return %1$s;\n" +
             "    }\n\n" +
-            "    public String %1$sAsString()\n" +
+            "    %5$spublic String %1$sAsString()\n" +
             "    {\n" +
             "        return %1$s.getStringWithoutLengthAscii(%1$sOffset, %1$sLength);\n" +
             "    }\n\n",
             fieldName,
             className,
-            name);
+            name,
+            scope,
+            javadoc);
     }
 
     private String generateStringSetter(
         final String className,
         final String fieldName,
         final String name,
-        final String enumSetter)
+        final String enumSetter,
+        final String javadoc)
     {
         return String.format(
             "%2$s" +
-            "    public %3$s %1$s(final CharSequence value)\n" +
+            "    %5$spublic %3$s %1$s(final CharSequence value)\n" +
             "    {\n" +
-            "        toBytes(value, %1$s);\n" +
-            "        %1$sOffset = 0;\n" +
-            "        %1$sLength = value.length();\n" +
+            "        if (toBytes(value, this.%1$s))\n" +
+            "        {\n" +
+            "            %1$sInternalBuffer = this.%1$s.byteArray();\n" +
+            "        }\n" +
+            "        this.%1$sOffset = 0;\n" +
+            "        this.%1$sLength = value.length();\n" +
             "        return this;\n" +
             "    }\n\n" +
-            "    public %3$s %1$s(final AsciiSequenceView value)\n" +
+            "    %5$spublic %3$s %1$s(final AsciiSequenceView value)\n" +
             "    {\n" +
             "        final DirectBuffer buffer = value.buffer();\n" +
             "        if (buffer != null)\n" +
             "        {\n" +
-            "            %1$s.wrap(buffer);\n" +
-            "            %1$sOffset = value.offset();\n" +
-            "            %1$sLength = value.length();\n" +
+            "            this.%1$s.wrap(buffer);\n" +
+            "            this.%1$sOffset = value.offset();\n" +
+            "            this.%1$sLength = value.length();\n" +
             "        }\n" +
             "        return this;\n" +
             "    }\n\n" +
-            "    public %3$s %1$s(final char[] value)\n" +
+            "    %5$spublic %3$s %1$s(final char[] value)\n" +
             "    {\n" +
             "        return %1$s(value, 0, value.length);\n" +
             "    }\n\n" +
-            "    public %3$s %1$s(final char[] value, final int length)\n" +
+            "    %5$spublic %3$s %1$s(final char[] value, final int length)\n" +
             "    {\n" +
-                "        return %1$s(value, 0, length);\n" +
+            "        return %1$s(value, 0, length);\n" +
             "    }\n\n" +
-            "    public %3$s %1$s(final char[] value, final int offset, final int length)\n" +
+            "    %5$spublic %3$s %1$s(final char[] value, final int offset, final int length)\n" +
             "    {\n" +
-            "        toBytes(value, %1$s, offset, length);\n" +
-            "        %1$sOffset = 0;\n" +
-            "        %1$sLength = length;\n" +
+            "        if (toBytes(value, this.%1$s, offset, length))\n" +
+            "        {\n" +
+            "            %1$sInternalBuffer = this.%1$s.byteArray();\n" +
+            "        }\n" +
+            "        this.%1$sOffset = 0;\n" +
+            "        this.%1$sLength = length;\n" +
             "        return this;\n" +
             "    }\n\n" +
             "%4$s",
             fieldName,
-            generateBytesSetter(className, fieldName, name),
+            generateBytesSetter(className, fieldName, name, javadoc),
             className,
-            enumSetter);
+            enumSetter,
+            javadoc);
     }
 
     private String generateSetter(
@@ -759,29 +870,31 @@ class EncoderGenerator extends Generator
         final String optionalField,
         final String className,
         final String optionalAssign,
-        final String enumSetter)
+        final String enumSetter,
+        final String javadoc)
     {
         return String.format(
             "    %1$s %2$s %3$s;\n\n" +
             "%4$s" +
-            "    public %5$s %3$s(%2$s value)\n" +
+            "    %8$spublic %5$s %3$s(%2$s value)\n" +
             "    {\n" +
             "        %3$s = value;\n" +
             "%6$s" +
             "        return this;\n" +
             "    }\n\n" +
-            "    public %2$s %3$s()\n" +
+            "    %8$spublic %2$s %3$s()\n" +
             "    {\n" +
             "        return %3$s;\n" +
             "    }\n\n" +
             "%7$s",
-            isBodyLength(name) ? "public" : "private",
+            isBodyLength(name) ? "public" : scope,
             type,
             fieldName,
             optionalField,
             className,
             optionalAssign,
-            enumSetter);
+            enumSetter,
+            javadoc);
     }
 
     private String decimalFloatSetter(
@@ -789,24 +902,25 @@ class EncoderGenerator extends Generator
         final String optionalField,
         final String className,
         final String optionalAssign,
-        final String enumSetter)
+        final String enumSetter,
+        final String javadoc)
     {
         return String.format(
-            "    private final DecimalFloat %1$s = new DecimalFloat();\n\n" +
+            "    %6$s final DecimalFloat %1$s = new DecimalFloat();\n\n" +
             "%2$s" +
-            "    public %3$s %1$s(DecimalFloat value)\n" +
+            "    %7$spublic %3$s %1$s(ReadOnlyDecimalFloat value)\n" +
             "    {\n" +
-            "        %1$s.set(value);\n" +
+            "        this.%1$s.set(value);\n" +
             "%4$s" +
             "        return this;\n" +
             "    }\n\n" +
-            "    public %3$s %1$s(long value, int scale)\n" +
+            "    %7$spublic %3$s %1$s(long value, int scale)\n" +
             "    {\n" +
-            "        %1$s.set(value, scale);\n" +
+            "        this.%1$s.set(value, scale);\n" +
             "%4$s" +
             "        return this;\n" +
             "    }\n\n" +
-            "    public DecimalFloat %1$s()\n" +
+            "    %7$spublic DecimalFloat %1$s()\n" +
             "    {\n" +
             "        return %1$s;\n" +
             "    }\n\n" +
@@ -815,7 +929,9 @@ class EncoderGenerator extends Generator
             optionalField,
             className,
             optionalAssign,
-            enumSetter);
+            enumSetter,
+            scope,
+            javadoc);
     }
 
     private String enumSetter(
@@ -846,6 +962,11 @@ class EncoderGenerator extends Generator
 
     private String encodeMethod(final List<Entry> entries, final AggregateType aggregateType)
     {
+        if (isSharedParent())
+        {
+            return "";
+        }
+
         final String prefix;
         switch (aggregateType)
         {
@@ -924,7 +1045,7 @@ class EncoderGenerator extends Generator
         }
         else
         {
-            return entry.matchEntry(this::encodeField, this::encodeGroup, this::encodeComponent);
+            return entry.matchEntry(this::encodeField, this::encodeGroup, this::encodeComponent, this::encodeAnyFields);
         }
     }
 
@@ -970,10 +1091,14 @@ class EncoderGenerator extends Generator
             case DAYOFMONTH:
                 return putValue(fieldName, tag, "Int", enablingSuffix, indent);
 
+            case LONG:
+                return putValue(fieldName, tag, "Long", enablingSuffix, indent);
+
             case FLOAT:
             case PRICE:
             case PRICEOFFSET:
             case QTY:
+            case QUANTITY:
             case PERCENTAGE:
             case AMT:
                 return putValue(fieldName, tag, "Float", enablingSuffix, indent);
@@ -1005,15 +1130,16 @@ class EncoderGenerator extends Generator
             case XMLDATA:
                 return String.format(
                     "%1$s" +
-                    "%4$s        buffer.putBytes(position, %2$s);\n" +
-                    "%4$s        position += %2$s.length;\n" +
+                    "%4$s        buffer.putBytes(position, %2$s, 0, %5$s);\n" +
+                    "%4$s        position += %5$s;\n" +
                     "%4$s        buffer.putSeparator(position);\n" +
                     "%4$s        position++;\n" +
                     "%3$s",
                     tag,
                     fieldName,
                     enablingSuffix,
-                    indent);
+                    indent,
+                    formatPropertyName(field.associatedLengthField().name()));
 
             default:
                 throw new UnsupportedOperationException("Unknown type: " + type);
@@ -1067,10 +1193,98 @@ class EncoderGenerator extends Generator
 
     private String encodeComponent(final Entry entry)
     {
-        // TODO: make component return int, split encode prefix
         return String.format(
             "            position += %1$s.encode(buffer, position);\n",
             formatPropertyName(entry.name()));
+    }
+
+    private void generateAnyFields(final Entry entry, final Writer out) throws IOException
+    {
+        if (isSharedParent())
+        {
+            out.write(String.format(
+                "    public abstract FieldBagEncoder %1$s();\n\n",
+                formatPropertyName(entry.name())
+            ));
+        }
+        else
+        {
+            out.write(String.format(
+                "    private final FieldBagEncoder %1$s = new FieldBagEncoder();\n" +
+                "\n" +
+                "    public FieldBagEncoder %1$s()\n" +
+                "    {\n" +
+                "        return %1$s;\n" +
+                "    }\n\n",
+                formatPropertyName(entry.name())
+            ));
+        }
+    }
+
+    @Override
+    protected String resetAnyFields(final List<Entry> entries, final StringBuilder methods)
+    {
+        if (isSharedParent())
+        {
+            return "";
+        }
+
+        return resetAllBy(entries, methods, Entry::isAnyFields, entry -> "", this::resetAnyFields);
+    }
+
+    private String resetAnyFields(final Entry entry)
+    {
+        return String.format(
+            "        this.%1$s.reset();\n",
+            formatPropertyName(entry.name()));
+    }
+
+    private String encodeAnyFields(final Entry entry)
+    {
+        if (isSharedParent())
+        {
+            return "";
+        }
+
+        return String.format(
+            "        if (!%1$s.isEmpty())\n" +
+            "        {\n" +
+            "            position += %1$s.encode(buffer, position);\n" +
+            "        }\n\n",
+            formatPropertyName(entry.name()));
+    }
+
+    @Override
+    protected String anyFieldsAppendTo(final AnyFields element)
+    {
+        if (isSharedParent())
+        {
+            return "";
+        }
+
+        return String.format(
+            "        if (!%1$s.isEmpty())\n" +
+            "        {\n" +
+            "            indent(builder, level);\n" +
+            "            builder.append(\"\\\"%2$s\\\": \\\"\");\n" +
+            "            %1$s.appendTo(builder);\n" +
+            "            builder.append(\"\\\",\\n\");\n" +
+            "        }\n",
+            formatPropertyName(element.name()),
+            element.name());
+    }
+
+    private String anyFieldsCopyTo(final AnyFields element, final String encoderName)
+    {
+        if (isSharedParent())
+        {
+            return "";
+        }
+
+        return String.format(
+            "        this.%1$s.copyTo(%2$s.%1$s());\n",
+            formatPropertyName(element.name()),
+            encoderName);
     }
 
     private String formatTag(final String fieldName, final String optionalPrefix)
@@ -1122,7 +1336,8 @@ class EncoderGenerator extends Generator
             else if (element instanceof Group)
             {
                 final Group group = (Group)element;
-                precomputedFieldHeader(out, (Field)group.numberField().element());
+                final Entry numberFieldEntry = group.numberField();
+                precomputedFieldHeader(out, (Field)numberFieldEntry.element());
             }
         }
     }
@@ -1138,65 +1353,112 @@ class EncoderGenerator extends Generator
             .collect(joining(", ", "", ", (byte) '='"));
 
         out.append(String.format(
-            "    private static final int %sHeaderLength = %d;\n" +
-            "    private static final byte[] %1$sHeader = new byte[] {%s};\n\n",
+            "    %4$s static final int %sHeaderLength = %d;\n" +
+            "    %4$s static final byte[] %1$sHeader = new byte[] {%s};\n\n",
             fieldName,
             length + 1,
-            bytes));
+            bytes,
+            scope));
     }
 
+    @Override
     protected String stringAppendTo(final String fieldName)
     {
         return String.format("appendBuffer(builder, %1$s, %1$sOffset, %1$sLength)", fieldName);
     }
 
+    @Override
     protected String timeAppendTo(final String fieldName)
     {
         return stringAppendTo(fieldName);
     }
 
+    @Override
     protected String dataAppendTo(final Field field, final String fieldName)
     {
-        final String lengthName = formatPropertyName(field.associatedLengthField().name());
+        final Field associatedLengthField = field.associatedLengthField();
+        Objects.requireNonNull(associatedLengthField, "Length field for: " + fieldName);
+        final String lengthName = formatPropertyName(associatedLengthField.name());
         return String.format("appendData(builder, %1$s, %2$s)", fieldName, lengthName);
     }
 
+    @Override
     protected String componentAppendTo(final Component component)
     {
-        final String name = component.name();
-        return String.format(
-            "    indent(builder, level);\n" +
-            "    builder.append(\"\\\"%1$s\\\": \");\n" +
-            "    %2$s.appendTo(builder, level + 1);\n" +
-            "    builder.append(\"\\n\");\n",
-            name,
-            formatPropertyName(name));
+        // appendTo shared components in children
+        if (isSharedParent())
+        {
+            return "";
+        }
+        else
+        {
+            final String name = component.name();
+            return String.format(
+                "    indent(builder, level);\n" +
+                "    builder.append(\"\\\"%1$s\\\": \");\n" +
+                "    %2$s.appendTo(builder, level + 1);\n" +
+                "    builder.append(\"\\n\");\n",
+                name,
+                formatPropertyName(name));
+        }
     }
 
     private void generateComponentField(
         final String className, final Component element, final Writer out)
         throws IOException
     {
-        out.append(String.format(
-            "    private final %1$s %2$s = new %1$s();\n" +
-            "    public %1$s %2$s()\n" +
-            "    {\n" +
-            "        return %2$s;\n" +
-            "    }\n\n",
-            className,
-            formatPropertyName(element.name())));
+        if (isSharedParent())
+        {
+            out.append(String.format(
+                "    public abstract %1$s %2$s();\n\n",
+                className,
+                formatPropertyName(element.name())));
+        }
+        else
+        {
+            out.append(String.format(
+                "    private final %1$s %2$s = new %1$s();\n" +
+                "    public %1$s %2$s()\n" +
+                "    {\n" +
+                "        return %2$s;\n" +
+                "    }\n\n",
+                className,
+                formatPropertyName(element.name())));
+        }
     }
 
+    @Override
+    protected String resetLength(final String name)
+    {
+        return String.format(
+            "    public void %1$s()\n" +
+            "    {\n" +
+            "        %2$sLength = 0;\n" +
+            "        %2$s.wrap(%2$sInternalBuffer);\n" +
+            "    }\n\n",
+            nameOfResetMethod(name),
+            formatPropertyName(name));
+    }
+
+    @Override
     protected String resetRequiredFloat(final String name)
     {
         return resetByFlag(name);
     }
 
+    @Override
     protected String resetRequiredInt(final Field field)
     {
         return resetByFlag(field.name());
     }
 
+    @Override
+    protected String resetRequiredLong(final Field field)
+    {
+        return resetByFlag(field.name());
+    }
+
+    @Override
     protected boolean hasFlag(final Entry entry, final Field field)
     {
         final Type type = field.type();
@@ -1204,27 +1466,52 @@ class EncoderGenerator extends Generator
             type.isFloatBased() || type.isIntBased() || type.isCharBased();
     }
 
+    @Override
     protected String resetTemporalValue(final String name)
     {
         return resetLength(name);
     }
 
+    @Override
     protected String resetComponents(final List<Entry> entries, final StringBuilder methods)
     {
-        return entries
-            .stream()
-            .filter(Entry::isComponent)
-            .map(this::callComponentReset)
-            .collect(joining());
+        // reset shared components in children
+        if (isSharedParent())
+        {
+            return "";
+        }
+        else
+        {
+            return entries
+                .stream()
+                .filter(Entry::isComponent)
+                .map(this::callComponentReset)
+                .collect(joining());
+        }
     }
 
+    private String callComponentReset(final Entry entry)
+    {
+        return String.format(
+            "        this.%1$s.reset();\n",
+            formatPropertyName(entry.name()));
+    }
+
+    @Override
     protected String resetStringBasedData(final String name)
     {
         return resetLength(name);
     }
 
+    @Override
     protected String groupEntryAppendTo(final Group group, final String name)
     {
+        // only append groups in the children
+        if (isSharedParent())
+        {
+            return "";
+        }
+
         final Entry numberField = group.numberField();
 
         return String.format(
@@ -1255,7 +1542,6 @@ class EncoderGenerator extends Generator
             encoderClassName(name));
     }
 
-
     private String generateCopyTo(final Aggregate aggregate)
     {
         final String entriesCopyTo = aggregate
@@ -1266,9 +1552,6 @@ class EncoderGenerator extends Generator
         final String name = aggregate.name();
 
         return String.format(
-            "    /**\n" +
-            "     * {@inheritDoc}\n" +
-            "     */\n" +
             "    public %1$s copyTo(final Encoder encoder)\n" +
             "    {\n" +
             "        return copyTo((%1$s)encoder);\n" +
@@ -1324,6 +1607,10 @@ class EncoderGenerator extends Generator
         {
             return componentCopyTo((Component)element, encoderName);
         }
+        else if (element instanceof AnyFields)
+        {
+            return anyFieldsCopyTo((AnyFields)element, encoderName);
+        }
 
         return "";
     }
@@ -1338,6 +1625,12 @@ class EncoderGenerator extends Generator
 
     protected String groupEntryCopyTo(final Group group, final String name, final String encoderName)
     {
+        // only append groups in the children
+        if (isSharedParent())
+        {
+            return "";
+        }
+
         final String numberField = group.numberField().name();
 
         return String.format(
@@ -1366,13 +1659,21 @@ class EncoderGenerator extends Generator
 
     protected String componentCopyTo(final Component component, final String encoderName)
     {
-        final String name = component.name();
-        final String varName = formatPropertyName(name);
+        // copyTo shared components in children
+        if (isSharedParent())
+        {
+            return "";
+        }
+        else
+        {
+            final String name = component.name();
+            final String varName = formatPropertyName(name);
 
-        return String.format(
-            "\n        %1$s.copyTo(%2$s.%1$s());",
-            varName,
-            encoderName);
+            return String.format(
+                "\n        %1$s.copyTo(%2$s.%1$s());",
+                varName,
+                encoderName);
+        }
     }
 
     private String fieldCopyTo(final Field field, final String encoderName)
@@ -1401,6 +1702,7 @@ class EncoderGenerator extends Generator
             case PRICE:
             case PRICEOFFSET:
             case QTY:
+            case QUANTITY:
             case PERCENTAGE:
             case AMT:
 
@@ -1410,14 +1712,15 @@ class EncoderGenerator extends Generator
             case CHAR:
             case SEQNUM:
             case DAYOFMONTH:
-                return String.format("%2$s.%1$s(%1$s());", fieldName, encoderName);
+            case LONG:
+                return String.format("%2$s.%1$s(this.%1$s());", fieldName, encoderName);
 
             case DATA:
             case XMLDATA:
                 final String lengthName = formatPropertyName(field.associatedLengthField().name());
 
                 return String.format(
-                    "%3$s.%1$sAsCopy(%1$s(), 0, %2$s());%n%3$s.%2$s(%2$s());", fieldName, lengthName, encoderName);
+                    "%3$s.%1$sAsCopy(this.%1$s(), 0, %2$s());%n%3$s.%2$s(%2$s());", fieldName, lengthName, encoderName);
 
             case NUMINGROUP:
                 // Deliberately blank since it gets set by the group CopyTo logic.
@@ -1426,11 +1729,13 @@ class EncoderGenerator extends Generator
         }
     }
 
+    @Override
     protected String optionalReset(final Field field, final String name)
     {
         return field.type().hasLengthField(false) ? resetLength(name) : resetByFlag(name);
     }
 
+    @Override
     protected boolean appendToChecksHasGetter(final Entry entry, final Field field)
     {
         return hasFlag(entry, field) || field.type().hasLengthField(false);

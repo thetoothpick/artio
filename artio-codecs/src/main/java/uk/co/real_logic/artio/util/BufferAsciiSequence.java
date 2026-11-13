@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,16 +31,19 @@ public class BufferAsciiSequence implements CharSequence
         return this;
     }
 
+    @Override
     public int length()
     {
         return length;
     }
 
+    @Override
     public char charAt(final int index)
     {
         return (char)buffer.getByte(index + offset);
     }
 
+    @Override
     public CharSequence subSequence(final int start, final int end)
     {
         if (start < 0 || end < 0 || end > length || start > end)
@@ -52,6 +55,7 @@ public class BufferAsciiSequence implements CharSequence
         return new BufferAsciiSequence().wrap(buffer, offset + start, end - start);
     }
 
+    @Override
     public String toString()
     {
         return buffer.getStringWithoutLengthUtf8(offset, length);

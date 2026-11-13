@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,24 +25,25 @@ import uk.co.real_logic.artio.protocol.GatewayPublication;
 
 class FixEndPointFactory
 {
-    private final FixReceiverEndPoint.FixReceiverEndPointFormatters formatters =
+    private final FixReceiverEndPoint.FixReceiverEndPointFormatters receiverFormatters =
         new FixReceiverEndPoint.FixReceiverEndPointFormatters();
+    private final FixSenderEndPoint.Formatters senderFormatters = new FixSenderEndPoint.Formatters();
 
     private final EngineConfiguration configuration;
     private final FixContexts fixContexts;
     private final GatewayPublication inboundLibraryPublication;
+    private final ReproductionLogWriter reproductionLogWriter;
     private final FixCounters fixCounters;
     private final ErrorHandler errorHandler;
     private final FixGatewaySessions gatewaySessions;
     private final SenderSequenceNumbers senderSequenceNumbers;
     private final MessageTimingHandler messageTimingHandler;
 
-    private SlowPeeker replaySlowPeeker;
-
     FixEndPointFactory(
         final EngineConfiguration configuration,
         final FixContexts fixContexts,
         final GatewayPublication inboundLibraryPublication,
+        final ReproductionLogWriter reproductionLogWriter,
         final FixCounters fixCounters,
         final ErrorHandler errorHandler,
         final FixGatewaySessions gatewaySessions,
@@ -52,6 +53,7 @@ class FixEndPointFactory
         this.configuration = configuration;
         this.fixContexts = fixContexts;
         this.inboundLibraryPublication = inboundLibraryPublication;
+        this.reproductionLogWriter = reproductionLogWriter;
         this.fixCounters = fixCounters;
         this.errorHandler = errorHandler;
         this.gatewaySessions = gatewaySessions;
@@ -75,32 +77,33 @@ class FixEndPointFactory
             sessionId,
             sequenceIndex,
             fixContexts,
-            fixCounters.messagesRead(connectionId, channel.remoteAddress()),
+            fixCounters.messagesRead(connectionId, channel.remoteAddr()),
             framer,
             errorHandler,
             libraryId,
             gatewaySessions,
             configuration.epochNanoClock(),
             framer.acceptorFixDictionaryLookup(),
-            formatters,
+            receiverFormatters,
             configuration.throttleWindowInMs(),
-            configuration.throttleLimitOfMessages());
+            configuration.throttleLimitOfMessages(),
+            configuration.isReproductionEnabled());
     }
 
     FixSenderEndPoint senderEndPoint(
         final TcpChannel channel,
         final long connectionId,
         final int libraryId,
-        final BlockablePosition libraryBlockablePosition,
-        final Framer framer)
+        final Framer framer,
+        final FixReceiverEndPoint receiverEndPoint)
     {
-        final String remoteAddress = channel.remoteAddress();
+        final String remoteAddress = channel.remoteAddr();
         final AtomicCounter bytesInBuffer = fixCounters.bytesInBuffer(connectionId, remoteAddress);
         return new FixSenderEndPoint(
             connectionId,
             libraryId,
-            libraryBlockablePosition,
-            replaySlowPeeker,
+            inboundLibraryPublication.dataPublication(),
+            reproductionLogWriter,
             channel,
             bytesInBuffer,
             fixCounters.invalidLibraryAttempts(connectionId, remoteAddress),
@@ -109,12 +112,9 @@ class FixEndPointFactory
             configuration.senderMaxBytesInBuffer(),
             configuration.slowConsumerTimeoutInMs(),
             System.currentTimeMillis(),
-            senderSequenceNumbers.onNewSender(connectionId, bytesInBuffer),
-            messageTimingHandler);
-    }
-
-    void replaySlowPeeker(final SlowPeeker replaySlowPeeker)
-    {
-        this.replaySlowPeeker = replaySlowPeeker;
+            senderSequenceNumbers.onNewSender(false, connectionId, bytesInBuffer),
+            messageTimingHandler,
+            receiverEndPoint,
+            senderFormatters);
     }
 }

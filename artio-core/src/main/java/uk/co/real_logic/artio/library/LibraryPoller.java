@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,16 +19,15 @@ import io.aeron.ChannelUri;
 import io.aeron.CommonContext;
 import io.aeron.ControlledFragmentAssembler;
 import io.aeron.Subscription;
+import io.aeron.driver.DutyCycleTracker;
 import io.aeron.exceptions.RegistrationException;
 import io.aeron.logbuffer.ControlledFragmentHandler;
 import io.aeron.logbuffer.ControlledFragmentHandler.Action;
+import io.aeron.logbuffer.Header;
 import org.agrona.DirectBuffer;
 import org.agrona.ErrorHandler;
 import org.agrona.LangUtil;
-import org.agrona.collections.ArrayUtil;
-import org.agrona.collections.CollectionUtil;
-import org.agrona.collections.Long2ObjectHashMap;
-import org.agrona.collections.LongHashSet;
+import org.agrona.collections.*;
 import org.agrona.concurrent.EpochClock;
 import org.agrona.concurrent.EpochNanoClock;
 import org.agrona.concurrent.status.AtomicCounter;
@@ -55,10 +54,7 @@ import uk.co.real_logic.artio.validation.MessageValidationStrategy;
 import java.lang.ref.WeakReference;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
-import java.util.AbstractList;
-import java.util.ArrayList;
-import java.util.Iterator;
-import java.util.List;
+import java.util.*;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
@@ -72,12 +68,11 @@ import static uk.co.real_logic.artio.LogTag.*;
 import static uk.co.real_logic.artio.engine.FixEngine.ENGINE_LIBRARY_ID;
 import static uk.co.real_logic.artio.library.SessionConfiguration.AUTOMATIC_INITIAL_SEQUENCE_NUMBER;
 import static uk.co.real_logic.artio.messages.ConnectionType.INITIATOR;
-import static uk.co.real_logic.artio.messages.DisconnectReason.ENGINE_SHUTDOWN;
-import static uk.co.real_logic.artio.messages.InitialAcceptedSessionOwner.SOLE_LIBRARY;
+import static uk.co.real_logic.artio.messages.InitialAcceptedSessionOwner.ENGINE;
 import static uk.co.real_logic.artio.messages.SessionState.ACTIVE;
 import static uk.co.real_logic.artio.session.Session.UNKNOWN_TIME;
 
-final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, AutoCloseable, FixPSessionOwner
+final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, AutoCloseable
 {
     /**
      * Has connected to an engine instance
@@ -109,11 +104,15 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
      */
     private static final int ENGINE_DISCONNECT = 5;
 
+    private static final long NO_MESSAGE_TIMESTAMP = -1;
+
     private static final InternalFixPConnection[] EMPTY_FIXP_CONNECTIONS = new InternalFixPConnection[0];
     private static final InternalSession[] EMPTY_SESSIONS = new InternalSession[0];
 
     private final Long2ObjectHashMap<WeakReference<InternalSession>> sessionIdToCachedSession =
         new Long2ObjectHashMap<>();
+    private final Long2ObjectHashMap<WeakReference<SessionWriter>> sessionIdToFollowerSessionWriter =
+        new Long2ObjectHashMap<>(0, Hashing.DEFAULT_LOAD_FACTOR);
     private final Long2ObjectHashMap<SessionSubscriber> connectionIdToSession = new Long2ObjectHashMap<>();
     private InternalFixPConnection[] fixPConnections = EMPTY_FIXP_CONNECTIONS;
     private final List<InternalFixPConnection> unmodifiableFixPConnections =
@@ -128,10 +127,9 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
     private final Long2ObjectHashMap<FixPSubscription> connectionIdToFixPSubscription =
         new Long2ObjectHashMap<>();
 
-    private static final ErrorHandler THROW_ERRORS = LangUtil::rethrowUnchecked;
-
     // Used when checking the consistency of the session ids
     private final LongHashSet sessionIds = new LongHashSet();
+    private final LongHashSet disconnectedSessionIds = new LongHashSet();
 
     // Uniquely identifies library session
     private final int libraryId;
@@ -144,7 +142,12 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
     private final Timer receiveTimer;
     private final SessionExistsHandler sessionExistsHandler;
     private final boolean enginesAreClustered;
+    private final ErrorHandler errorHandler;
     private final FixCounters fixCounters;
+    private final DutyCycleTracker dutyCycleTracker;
+
+    private final boolean isReproductionEnabled;
+    private final ReproductionClock reproductionClock;
 
     private final Long2ObjectHashMap<LibraryReply<?>> correlationIdToReply = new Long2ObjectHashMap<>();
     private final List<BooleanSupplier> tasks = new ArrayList<>();
@@ -164,7 +167,9 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
     private final CharFormatter controlNotificationFormatter = new CharFormatter(
         "%s: Received Control Notification from engine at timeInMs %s");
     private final CharFormatter applicationHeartbeatFormatter = new CharFormatter(
-        "%s: Received Heartbeat from engine at timeInMs %s");
+        "%s: Received Heartbeat(msg=%s) from engine at %sms, sent at %sns");
+    private final CharFormatter applicationHeartbeatFormatterNoTimestamp = new CharFormatter(
+        "%s: Received Heartbeat(msg=%s) from engine at %sms");
     private final CharFormatter reconnectFormatter = new CharFormatter("Reconnect: %s, %s, %s");
     private final CharFormatter onDisconnectFormatter = new CharFormatter(
         "%s: Session Disconnect @ Library %s, %s");
@@ -193,10 +198,42 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
 
     // State changed during end of day operation
     private int sessionLogoutIndex = 0;
-    private Iterator<FixPSubscription> iLink3LogoutIterator = null;
+    private Iterator<FixPSubscription> fixpLogoutIterator = null;
 
     private FixPProtocol fixPProtocol;
+    private FixPMessageDissector commonFixPDissector;
     private AbstractFixPParser commonFixPParser;
+    private AbstractFixPProxy commonFixPProxy;
+
+    private final FixPSessionOwner fixPSessionOwner = new FixPSessionOwner()
+    {
+        @Override
+        public void enqueueTask(final BooleanSupplier task)
+        {
+            enqueueTask(task);
+        }
+
+        @Override
+        public void remove(final InternalFixPConnection connection)
+        {
+            fixPConnections = ArrayUtil.remove(fixPConnections, connection);
+            connectionIdToFixPSubscription.remove(connection.connectionId());
+        }
+
+        @Override
+        public Reply<ThrottleConfigurationStatus> messageThrottle(
+            final long sessionId, final int throttleWindowInMs, final int throttleLimitOfMessages)
+        {
+            return new ThrottleConfigurationReply(
+                LibraryPoller.this,
+                timeInMs() + configuration.replyTimeoutInMs(),
+                sessionId,
+                throttleWindowInMs,
+                throttleLimitOfMessages);
+        }
+    };
+
+    private final InternalSession.Formatters formatters = new InternalSession.Formatters();
 
     LibraryPoller(
         final LibraryConfiguration configuration,
@@ -204,7 +241,8 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
         final FixCounters fixCounters,
         final LibraryTransport transport,
         final FixLibrary fixLibrary,
-        final EpochClock epochClock)
+        final EpochClock epochClock,
+        final ErrorHandler errorHandler)
     {
         this.libraryId = configuration.libraryId();
         this.fixCounters = fixCounters;
@@ -220,8 +258,13 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
         this.epochClock = epochClock;
         epochNanoClock = configuration.epochNanoClock();
         this.enginesAreClustered = configuration.libraryAeronChannels().size() > 1;
+        this.errorHandler = errorHandler;
         this.epochFractionClock = EpochFractionClocks.create(
             epochClock, configuration.epochNanoClock(), configuration.sessionEpochFractionFormat());
+        this.isReproductionEnabled = configuration.isReproductionEnabled();
+        this.reproductionClock = isReproductionEnabled ? configuration.reproductionConfiguration().clock() : null;
+
+        this.dutyCycleTracker = fixCounters.getLibraryDutyCycleTracker(configuration.libraryCycleThresholdNs());
     }
 
     boolean isConnected()
@@ -296,13 +339,13 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
             resendFromSequenceIndex);
     }
 
-    SessionWriter followerSession(final long id, final long connectionId, final int sequenceIndex)
+    SessionWriter sessionWriter(final long sessionId, final long connectionId, final int sequenceIndex)
     {
         checkState();
 
         return new SessionWriter(
             libraryId,
-            id,
+            sessionId,
             connectionId,
             sessionBuffer(),
             outboundPublication,
@@ -315,6 +358,20 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
 
         return new FollowerSessionReply(
             this, timeInMs() + timeoutInMs, headerEncoder);
+    }
+
+    public Reply<Long> followerFixPSession(final FixPContext context, final long testTimeoutInMs)
+    {
+        validateEndOfDay();
+
+        final FixPProtocolType protocolType = context.protocolType();
+        validateFixP(protocolType);
+        initFixP(protocolType);
+
+        final byte[] firstMessage = commonFixPProxy.encodeFirstMessage(context);
+
+        return new FixPFollowerSessionReply(
+            this, timeInMs() + testTimeoutInMs, firstMessage, protocolType);
     }
 
     Reply<MetaDataStatus> writeMetaData(
@@ -522,43 +579,49 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
     }
 
     long saveFollowerSessionRequest(
-        final long correlationId, final MutableAsciiBuffer buffer, final int offset, final int length)
+        final long correlationId,
+        final FixPProtocolType protocolType,
+        final MutableAsciiBuffer buffer, final int offset, final int length)
     {
         checkState();
 
         return outboundPublication.saveFollowerSessionRequest(
             libraryId,
             correlationId,
+            protocolType,
             buffer,
-            offset,
-            length);
+            length, offset
+        );
     }
 
     int poll(final int fragmentLimit)
     {
+        final long timeInNs = epochNanoClock.nanoTime();
         final long timeInMs = timeInMs();
+
+        dutyCycleTracker.measureAndUpdate(timeInNs);
 
         switch (state)
         {
             case CONNECTED:
-                return pollWithoutReconnect(timeInMs, fragmentLimit);
+                return pollWithoutReconnect(timeInNs, timeInMs, fragmentLimit);
 
             case ATTEMPT_CONNECT:
-                startConnecting();
-                return pollWithoutReconnect(timeInMs, fragmentLimit);
+                startConnecting(timeInMs);
+                return pollWithoutReconnect(timeInNs, timeInMs, fragmentLimit);
 
             case CONNECTING:
                 nextConnectingStep(timeInMs);
-                return pollWithoutReconnect(timeInMs, fragmentLimit);
+                return pollWithoutReconnect(timeInNs, timeInMs, fragmentLimit);
 
             case ATTEMPT_CURRENT_NODE:
                 connectToNewEngine(timeInMs);
                 state = CONNECTING;
-                return pollWithoutReconnect(timeInMs, fragmentLimit);
+                return pollWithoutReconnect(timeInNs, timeInMs, fragmentLimit);
 
             case ENGINE_DISCONNECT:
                 attemptEngineCloseBasedLogout();
-                return pollWithoutReconnect(timeInMs, fragmentLimit);
+                return pollWithoutReconnect(timeInNs, timeInMs, fragmentLimit);
 
             case CLOSED:
             default:
@@ -566,9 +629,8 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
         }
     }
 
-    private int pollWithoutReconnect(final long timeInMs, final int fragmentLimit)
+    private int pollWithoutReconnect(final long timeInNs, final long timeInMs, final int fragmentLimit)
     {
-        final long timeInNs = epochNanoClock.nanoTime();
         int operations = 0;
         operations += inboundSubscription.controlledPoll(outboundSubscription, fragmentLimit);
         operations += livenessDetector.poll(timeInMs);
@@ -581,6 +643,11 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
     // -----------------------------------------------------------------------
     //                     BEGIN CONNECTION LOGIC
     // -----------------------------------------------------------------------
+
+    void onStart()
+    {
+        dutyCycleTracker.update(epochNanoClock.nanoTime());
+    }
 
     void startConnecting()
     {
@@ -685,7 +752,8 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
             outboundPublication,
             libraryId,
             configuration.replyTimeoutInMs(),
-            onDisconnectFunc);
+            onDisconnectFunc,
+            epochNanoClock);
     }
 
     private boolean isFirstConnect()
@@ -852,6 +920,7 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
     private final ControlledFragmentHandler outboundSubscription = new ControlledFragmentAssembler(
         ProtocolSubscription.of(this, new LibraryProtocolSubscription(this)));
 
+    @Override
     public Action onManageSession(
         final int libraryId,
         final long connectionId,
@@ -1000,18 +1069,22 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
             final int initialSentSequenceNumber = initiatorNewSequenceNumber(
                 sessionConfiguration, SessionConfiguration::initialSentSequenceNumber, lastSentSeqNum);
             final boolean resetSeqNum = sessionConfiguration != null && sessionConfiguration.resetSeqNum();
+            final boolean disconnectOnFirstMessageNotLogon = sessionConfiguration == null ||
+                sessionConfiguration.disconnectOnFirstMessageNotLogon();
 
             if (isNewConnect)
             {
                 session = newInitiatorSession(
                     connectionId, initialSentSequenceNumber, initialReceivedSequenceNumber,
                     sessionState, sequenceIndex, enableLastMsgSeqNumProcessed,
-                    fixDictionary, resetSeqNum, messageInfo);
+                    fixDictionary, resetSeqNum, messageInfo, sessionId, disconnectOnFirstMessageNotLogon);
             }
             else
             {
                 session.lastSentMsgSeqNum(initialSentSequenceNumber - 1);
                 session.lastReceivedMsgSeqNumOnly(initialReceivedSequenceNumber - 1);
+                session.initiatorResetSeqNum(resetSeqNum);
+                session.disconnectOnFirstMessageNotLogon(disconnectOnFirstMessageNotLogon);
             }
         }
         else
@@ -1021,14 +1094,14 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
             {
                 session = acceptSession(
                     connectionId, address, sessionState, heartbeatIntervalInS, sequenceIndex,
-                    enableLastMsgSeqNumProcessed, fixDictionary, messageInfo);
+                    enableLastMsgSeqNumProcessed, fixDictionary, messageInfo, sessionId);
                 session.initialLastReceivedMsgSeqNum(lastRecvSeqNum);
             }
             else
             {
                 session.lastReceivedMsgSeqNumOnly(lastRecvSeqNum);
             }
-            session.lastSentMsgSeqNum(lastSentSeqNum);
+            setupAcceptorSentSequenceNumber(lastSentSeqNum, sequenceIndex, session);
         }
 
         final CompositeKey compositeKey = sessionIdStrategy.onInitiateLogon(
@@ -1036,7 +1109,7 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
             remoteCompId, remoteSubId, remoteLocationId);
 
         session.username(username); session.password(password);
-        session.setupSession(sessionId, compositeKey);
+        session.setupSession(sessionId, compositeKey, sessionIdToFollowerSessionWriter.get(sessionId));
         session.closedResendInterval(closedResendInterval);
         session.resendRequestChunkSize(resendRequestChunkSize);
         session.sendRedundantResendRequests(sendRedundantResendRequests);
@@ -1068,6 +1141,27 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
             connectionId, sessionId, lastSentSeqNum, lastRecvSeqNum);
     }
 
+    private void setupAcceptorSentSequenceNumber(
+        final int lastSentSeqNum, final int sequenceIndex, final InternalSession session)
+    {
+        final int sessionLastSentMsgSeqNum = session.lastSentMsgSeqNum();
+        if (wasOfflineReconnect && sessionLastSentMsgSeqNum > lastSentSeqNum &&
+            offlineSequenceIndex == sequenceIndex)
+        {
+            // Offline sessions can send messages constantly, we want to avoid racing this thread's sequence
+            // number update with the indexer, which could potentially be behind. We use the sequence index
+            // to avoid clobbered a deliberate reset on logon
+            session.lastSentMsgSeqNum(sessionLastSentMsgSeqNum);
+        }
+        else
+        {
+            session.lastSentMsgSeqNum(lastSentSeqNum);
+        }
+    }
+
+    private boolean wasOfflineReconnect;
+    private int offlineSequenceIndex;
+
     // Either a reconnect of an offline session, or the cache.
     private InternalSession checkReconnect(
         final long sessionId,
@@ -1080,12 +1174,19 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
         final ConnectionType connectionType,
         final String address)
     {
+        wasOfflineReconnect = false;
+        offlineSequenceIndex = 0;
+
         final InternalSession[] sessions = this.sessions;
-        for (final InternalSession session : sessions)
+        for (int i = 0, sessionsLength = sessions.length; i < sessionsLength; i++)
         {
+            final InternalSession session = sessions[i];
             if (session.id() == sessionId)
             {
                 DebugLogger.log(FIX_CONNECTION, reconnectFormatter, connectionId, libraryId, sessionId);
+
+                wasOfflineReconnect = true;
+                offlineSequenceIndex = session.sequenceIndex();
 
                 session.onReconnect(
                     connectionId,
@@ -1095,7 +1196,9 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
                     enableLastMsgSeqNumProcessed,
                     fixDictionary,
                     address,
-                    fixCounters);
+                    fixCounters,
+                    connectionType);
+
                 return session;
             }
         }
@@ -1115,7 +1218,8 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
                     enableLastMsgSeqNumProcessed,
                     fixDictionary,
                     address,
-                    fixCounters);
+                    fixCounters,
+                    connectionType);
             }
             return session;
         }
@@ -1135,6 +1239,7 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
         }
     }
 
+    @Override
     public Action onMessage(
         final DirectBuffer buffer,
         final int offset,
@@ -1144,15 +1249,17 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
         final long sessionId,
         final int sequenceIndex,
         final long messageType,
-        final long timestamp,
+        final long timestampInNs,
         final MessageStatus status,
         final int sequenceNumber,
-        final long position,
+        final Header header,
         final int metaDataLength)
     {
         if (libraryId == this.libraryId)
         {
-            DebugLogger.log(FIX_MESSAGE, receivedFormatter, libraryId, buffer, offset, length);
+            DebugLogger.logFixMessage(FIX_MESSAGE, messageType, receivedFormatter, libraryId, buffer, offset, length);
+
+            onApplicationHeartbeat(libraryId, FixMessageDecoder.TEMPLATE_ID, timestampInNs);
 
             final SessionSubscriber subscriber = connectionIdToSession.get(connectionId);
             if (subscriber != null)
@@ -1164,15 +1271,16 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
                     libraryId,
                     sequenceIndex,
                     messageType,
-                    timestamp,
+                    timestampInNs,
                     status,
-                    position);
+                    header.position());
             }
         }
 
         return CONTINUE;
     }
 
+    @Override
     public Action onDisconnect(
         final int libraryId, final long connectionId, final DisconnectReason reason)
     {
@@ -1182,74 +1290,90 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
             return CONTINUE;
         }
 
-        final boolean soleLibraryMode = initialAcceptedSessionOwner == SOLE_LIBRARY;
-        if (soleLibraryMode)
+        onApplicationHeartbeat(libraryId, DisconnectDecoder.TEMPLATE_ID, NO_MESSAGE_TIMESTAMP);
+
+        final SessionSubscriber subscriber = connectionIdToSession.get(connectionId);
+        if (subscriber != null)
         {
-            final SessionSubscriber subscriber = connectionIdToSession.get(connectionId);
-            if (subscriber != null)
+            final InternalSession session = subscriber.session();
+            // Must check the state before calling subscriber.onDisconnect()
+            final boolean isPendingInitiator = session.state() == SessionState.SENT_LOGON;
+            final Action action = subscriber.onDisconnect(libraryId, reason);
+            if (action != ABORT)
             {
-                return subscriber.onDisconnect(libraryId, reason);
-            }
-            else
-            {
-                // FIXP doesn't behave any differently.
-                onFixPDisconnect(connectionId, reason);
-            }
-        }
-        else
-        {
-            final SessionSubscriber subscriber = connectionIdToSession.remove(connectionId);
-            if (subscriber != null)
-            {
-                final Action action = subscriber.onDisconnect(libraryId, reason);
-                if (action == ABORT)
+                // In sole library mode the library retains ownership of sessions that are disconnected.
+                final boolean isEngineOwned = initialAcceptedSessionOwner == ENGINE;
+                if (isPendingInitiator)
                 {
-                    // If we abort the action then we should ensure that it can be processed when
-                    // re-run.
-                    connectionIdToSession.put(connectionId, subscriber);
-                }
-                else
-                {
-                    final InternalSession session = subscriber.session();
-                    session.close();
-                    // session will be in either pendingInitiatorSessions or sessions
                     pendingInitiatorSessions = ArrayUtil.remove(pendingInitiatorSessions, session);
+
+                    if (!isEngineOwned)
+                    {
+                        sessions = ArrayUtil.add(sessions, session);
+                    }
+                }
+
+                final WeakReference<SessionWriter> sessionWriterRef =
+                    sessionIdToFollowerSessionWriter.get(session.id());
+                if (sessionWriterRef != null)
+                {
+                    final SessionWriter sessionWriter = sessionWriterRef.get();
+                    if (sessionWriter != null)
+                    {
+                        InternalSession.disconnectWriter(sessionWriter);
+                    }
+                }
+
+                connectionIdToSession.remove(connectionId);
+
+                if (isEngineOwned)
+                {
+                    session.close();
                     sessions = ArrayUtil.remove(sessions, session);
                     cacheSession(session);
                 }
+            }
 
-                return action;
-            }
-            else
-            {
-                onFixPDisconnect(connectionId, reason);
-            }
+            return action;
+        }
+        else
+        {
+            onFixPDisconnect(connectionId, reason);
         }
 
         return CONTINUE;
     }
 
-    private void onFixPDisconnect(final long connectionId, final DisconnectReason reason)
-    {
-        final FixPSubscription subscription = connectionIdToFixPSubscription.remove(connectionId);
-        if (subscription != null)
-        {
-            subscription.onDisconnect(reason);
-            remove(subscription.session());
-        }
-    }
-
-    public Action onILinkMessage(final long connectionId, final DirectBuffer buffer, final int offset)
+    private Action onFixPDisconnect(final long connectionId, final DisconnectReason reason)
     {
         final FixPSubscription subscription = connectionIdToFixPSubscription.get(connectionId);
         if (subscription != null)
         {
-            return Pressure.apply(subscription.onMessage(buffer, offset));
+            final Action action = subscription.onDisconnect(reason);
+            if (action == ABORT)
+            {
+                return ABORT;
+            }
+            connectionIdToFixPSubscription.remove(connectionId);
+            fixPSessionOwner.remove(subscription.session());
         }
 
         return CONTINUE;
     }
 
+    @Override
+    public Action onFixPMessage(final long connectionId, final DirectBuffer buffer, final int offset)
+    {
+        final FixPSubscription subscription = connectionIdToFixPSubscription.get(connectionId);
+        if (subscription != null)
+        {
+            return subscription.onMessage(buffer, offset);
+        }
+
+        return CONTINUE;
+    }
+
+    @Override
     public Action onError(
         final int libraryId,
         final GatewayError errorType,
@@ -1272,13 +1396,47 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
         return configuration.gatewayErrorHandler().onError(errorType, libraryId, message);
     }
 
-    public Action onApplicationHeartbeat(final int libraryId)
+    @Override
+    public Action onApplicationHeartbeat(final int libraryId, final int messageTemplateId)
+    {
+        return onApplicationHeartbeat(libraryId, messageTemplateId, NO_MESSAGE_TIMESTAMP);
+    }
+
+    @Override
+    public Action onApplicationHeartbeat(final int libraryId, final int messageTemplateId, final long timestampInNs)
     {
         if (libraryId == this.libraryId)
         {
+            if (timestampInNs != NO_MESSAGE_TIMESTAMP)
+            {
+                checkReproductionTimestamp(timestampInNs);
+            }
+
             final long timeInMs = timeInMs();
-            DebugLogger.log(
-                APPLICATION_HEARTBEAT, applicationHeartbeatFormatter, libraryId, timeInMs);
+
+            if (DebugLogger.isEnabled(APPLICATION_HEARTBEAT) && !DebugLogger.inboundFixMessage(messageTemplateId))
+            {
+                if (timestampInNs != NO_MESSAGE_TIMESTAMP)
+                {
+                    DebugLogger.log(
+                        APPLICATION_HEARTBEAT,
+                        applicationHeartbeatFormatter,
+                        libraryId,
+                        messageTemplateId,
+                        timeInMs,
+                        timestampInNs);
+                }
+                else
+                {
+                    DebugLogger.log(
+                        APPLICATION_HEARTBEAT,
+                        applicationHeartbeatFormatterNoTimestamp,
+                        libraryId,
+                        messageTemplateId,
+                        timeInMs);
+                }
+            }
+
             livenessDetector.onHeartbeat(timeInMs);
 
             if (!isConnected() && livenessDetector.isConnected())
@@ -1291,6 +1449,15 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
         return CONTINUE;
     }
 
+    private void checkReproductionTimestamp(final long timestampInNs)
+    {
+        if (isReproductionEnabled)
+        {
+            reproductionClock.advanceTimeTo(timestampInNs);
+        }
+    }
+
+    @Override
     public Action onReleaseSessionReply(final int libraryId, final long replyToId, final SessionReplyStatus status)
     {
         final ReleaseToGatewayReply reply = (ReleaseToGatewayReply)correlationIdToReply.remove(replyToId);
@@ -1302,6 +1469,7 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
         return CONTINUE;
     }
 
+    @Override
     public Action onRequestSessionReply(final int libraryId, final long replyToId, final SessionReplyStatus status)
     {
         final RequestSessionReply reply = (RequestSessionReply)correlationIdToReply.remove(replyToId);
@@ -1313,17 +1481,62 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
         return CONTINUE;
     }
 
+    @Override
     public Action onFollowerSessionReply(final int libraryId, final long replyToId, final long sessionId)
     {
-        final FollowerSessionReply reply = (FollowerSessionReply)correlationIdToReply.remove(replyToId);
+        final LibraryReply<?> reply = correlationIdToReply.remove(replyToId);
         if (reply != null)
         {
-            reply.onComplete(followerSession(sessionId, NO_CONNECTION_ID, 0));
+            if (reply instanceof FollowerSessionReply)
+            {
+                ((FollowerSessionReply)reply).onComplete(followerSession(sessionId));
+            }
+            else if (reply instanceof FixPFollowerSessionReply)
+            {
+                ((FixPFollowerSessionReply)reply).onComplete(sessionId);
+            }
         }
 
         return CONTINUE;
     }
 
+    SessionWriter followerSession(final long sessionId)
+    {
+        checkState();
+
+        // requestFollowerSession called twice for the same session id
+        final WeakReference<SessionWriter> ref = sessionIdToFollowerSessionWriter.get(sessionId);
+        if (ref != null)
+        {
+            final SessionWriter oldRef = ref.get();
+            if (oldRef != null)
+            {
+                return oldRef;
+            }
+        }
+
+        final SessionWriter sessionWriter = sessionWriter(sessionId, GatewayProcess.NO_CONNECTION_ID, 0);
+        sessionIdToFollowerSessionWriter.put(sessionId, new WeakReference<>(sessionWriter));
+
+        linkSession(sessionId, sessionWriter, sessions);
+        linkSession(sessionId, sessionWriter, pendingInitiatorSessions);
+
+        return sessionWriter;
+    }
+
+    private void linkSession(final long sessionId, final SessionWriter sessionWriter, final InternalSession[] sessions)
+    {
+        for (final InternalSession session : sessions)
+        {
+            if (session.id() == sessionId)
+            {
+                session.linkTo(sessionWriter);
+                break;
+            }
+        }
+    }
+
+    @Override
     public Action onReplayMessagesReply(final int libraryId, final long replyToId, final ReplayMessagesStatus status)
     {
         final ReplayMessagesReply reply = (ReplayMessagesReply)correlationIdToReply.remove(replyToId);
@@ -1335,6 +1548,7 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
         return CONTINUE;
     }
 
+    @Override
     public Action onWriteMetaDataReply(final int libraryId, final long replyToId, final MetaDataStatus status)
     {
         final WriteMetaDataReply reply = (WriteMetaDataReply)correlationIdToReply.remove(replyToId);
@@ -1346,6 +1560,7 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
         return CONTINUE;
     }
 
+    @Override
     public Action onILinkConnect(
         final int libraryId,
         final long correlationId,
@@ -1369,11 +1584,11 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
 
                 final ILink3ConnectionConfiguration configuration = reply.configuration();
                 final InternalFixPConnection connection = makeILink3Connection(
-                    configuration, connectionId, reply, libraryId, this,
+                    configuration, connectionId, reply, libraryId, fixPSessionOwner,
                     uuid, lastReceivedSequenceNumber, lastSentSequenceNumber, newlyAllocated, lastUuid);
-                final FixPProtocol protocol = FixPProtocolFactory.make(FixPProtocolType.ILINK_3, THROW_ERRORS);
+                final FixPProtocol protocol = FixPProtocolFactory.make(FixPProtocolType.ILINK_3, errorHandler);
                 final FixPSubscription subscription = new FixPSubscription(
-                    protocol.makeParser((ILink3Connection)connection), connection);
+                    protocol.makeParser(connection), connection);
                 connectionIdToFixPSubscription.put(connectionId, subscription);
                 fixPConnections = ArrayUtil.add(fixPConnections, connection);
             }
@@ -1387,17 +1602,20 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
         final long connectionId,
         final InitiateILink3ConnectionReply initiateReply,
         final int libraryId,
-        final LibraryPoller owner,
+        final FixPSessionOwner owner,
         final long uuid,
         final long lastReceivedSequenceNumber,
         final long lastSentSequenceNumber,
         final boolean newlyAllocated,
         final long lastUuid)
     {
+        initFixP(FixPProtocolType.ILINK_3);
+
         try
         {
             final Class<?> cls = Class.forName("uk.co.real_logic.artio.library.InternalILink3Connection");
             final Constructor<?> constructor = cls.getConstructor(
+                FixPProtocol.class,
                 ILink3ConnectionConfiguration.class,
                 long.class,
                 InitiateILink3ConnectionReply.class,
@@ -1410,9 +1628,11 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
                 long.class,
                 boolean.class,
                 long.class,
-                EpochNanoClock.class);
+                EpochNanoClock.class,
+                FixPMessageDissector.class);
 
             return (InternalFixPConnection)constructor.newInstance(
+                fixPProtocol,
                 configuration,
                 connectionId,
                 initiateReply,
@@ -1425,7 +1645,8 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
                 lastSentSequenceNumber,
                 newlyAllocated,
                 lastUuid,
-                this.configuration.epochNanoClock());
+                this.configuration.epochNanoClock(),
+                commonFixPDissector);
         }
         catch (final InvocationTargetException e)
         {
@@ -1440,6 +1661,7 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
         }
     }
 
+    @Override
     public Action onReadMetaDataReply(
         final int libraryId,
         final long replyToId,
@@ -1460,6 +1682,7 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
         return CONTINUE;
     }
 
+    @Override
     public Action onThrottleConfigurationReply(
         final int libraryId, final long replyToId, final ThrottleConfigurationStatus status)
     {
@@ -1475,6 +1698,7 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
         return CONTINUE;
     }
 
+    @Override
     public Action onEngineClose(final int libraryId)
     {
         if (libraryId == this.libraryId)
@@ -1525,14 +1749,14 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
         }
 
         // Continue from previous position on backpressured re-attempts
-        if (iLink3LogoutIterator == null)
+        if (fixpLogoutIterator == null)
         {
-            iLink3LogoutIterator = connectionIdToFixPSubscription.values().iterator();
+            fixpLogoutIterator = connectionIdToFixPSubscription.values().iterator();
         }
-        while (iLink3LogoutIterator.hasNext())
+        while (fixpLogoutIterator.hasNext())
         {
-            final FixPSubscription fixPSubscription = iLink3LogoutIterator.next();
-            if (Pressure.isBackPressured(fixPSubscription.requestDisconnect(ENGINE_SHUTDOWN)))
+            final FixPSubscription fixPSubscription = fixpLogoutIterator.next();
+            if (Pressure.isBackPressured(fixPSubscription.startEndOfDay()))
             {
                 return;
             }
@@ -1540,7 +1764,7 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
 
         if (!connectionIdToFixPSubscription.isEmpty())
         {
-            DebugLogger.log(CLOSE, "Completed logging out ILink 3 Sessions");
+            DebugLogger.log(CLOSE, "Completed logging out FIXP Sessions");
         }
 
         // Yes, technically the engine is closing down, so we could flip to ATTEMPT_CONNECT state here.
@@ -1556,10 +1780,11 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
         }
     }
 
+    @Override
     public Action onControlNotification(
         final int libraryId,
         final InitialAcceptedSessionOwner initialAcceptedSessionOwner,
-        final SessionsDecoder sessionsDecoder)
+        final ControlNotificationDecoder controlNotificationDecoder)
     {
         if (libraryId == this.libraryId)
         {
@@ -1575,7 +1800,7 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
 
             controlUpdateILinkSessions();
 
-            return controlUpdateSessions(libraryId, sessionsDecoder);
+            return controlUpdateSessions(libraryId, controlNotificationDecoder);
         }
 
         return CONTINUE;
@@ -1596,37 +1821,61 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
         connectionIdToFixPSubscription.clear();
     }
 
-    private Action controlUpdateSessions(final int libraryId, final SessionsDecoder sessionsDecoder)
+    private Action controlUpdateSessions(
+        final int libraryId, final ControlNotificationDecoder controlNotificationDecoder)
     {
-        // TODO(Nick): This should be a new set, not the actual
-        // set as we remove all the ids to check for existence..
-        // Weirdly looks like this.sessionIds is never used anywhere else?
-        // Why do we have it then? Is the caching saving
-        // Is the caching saving enough considering that below we are creating loads of arrays (potentially)
         final LongHashSet sessionIds = this.sessionIds;
+        sessionIds.clear();
+
+        final LongHashSet disconnectedSessionIds = this.disconnectedSessionIds;
+        disconnectedSessionIds.clear();
+
         InternalSession[] sessions = this.sessions;
 
         // copy session ids.
-        sessionIds.clear();
+        final SessionsDecoder sessionsDecoder = controlNotificationDecoder.sessions();
         while (sessionsDecoder.hasNext())
         {
             sessionsDecoder.next();
             sessionIds.add(sessionsDecoder.sessionId());
         }
 
+        final ControlNotificationDecoder.DisconnectedSessionsDecoder disconnectedSessions =
+            controlNotificationDecoder.disconnectedSessions();
+        while (disconnectedSessions.hasNext())
+        {
+            disconnectedSessions.next();
+            disconnectedSessionIds.add(disconnectedSessions.sessionId());
+        }
+
         for (int i = 0, size = sessions.length; i < size; i++)
         {
             final InternalSession session = sessions[i];
             final long sessionId = session.id();
-            if (!sessionIds.remove(sessionId))
+            final boolean acquiredSession = !sessionIds.remove(sessionId);
+            final boolean disconnectedSession = disconnectedSessionIds.remove(sessionId);
+            if (acquiredSession || disconnectedSession)
             {
                 final SessionSubscriber subscriber = connectionIdToSession.remove(session.connectionId());
                 if (subscriber != null)
                 {
-                    subscriber.onTimeout(libraryId);
+                    if (acquiredSession)
+                    {
+                        subscriber.onTimeout(libraryId);
+                    }
+
+                    if (disconnectedSession)
+                    {
+                        final Action action = subscriber.onDisconnect(libraryId, DisconnectReason.REMOTE_DISCONNECT);
+                        if (action == ABORT)
+                        {
+                            this.sessions = sessions;
+                            return ABORT;
+                        }
+                    }
                 }
                 session.disable();
-                // TODO(Nick): Maybe we shouldn't be creating a lot of arrays and batch this up?
+                // TODO: Maybe we shouldn't be creating a lot of arrays and batch this up?
                 sessions = ArrayUtil.remove(sessions, i);
                 cacheSession(session);
                 size--;
@@ -1652,6 +1901,7 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
         return BREAK;
     }
 
+    @Override
     public Action onLibraryExtendPosition(
         final int libraryId,
         final long correlationId,
@@ -1698,6 +1948,7 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
         return CONTINUE;
     }
 
+    @Override
     public Action onSlowStatusNotification(
         final int libraryId, final long connectionId, final boolean hasBecomeSlow)
     {
@@ -1713,6 +1964,7 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
         return CONTINUE;
     }
 
+    @Override
     public Action onResetLibrarySequenceNumber(final int libraryId, final long sessionId)
     {
         if (libraryId == this.libraryId)
@@ -1730,14 +1982,23 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
         return Action.CONTINUE;
     }
 
-    public Action onReplayComplete(final int libraryId, final long connection)
+    @Override
+    public Action onReplayComplete(final int libraryId, final long connection, final long correlationId)
     {
         if (libraryId == this.libraryId)
         {
-            final FixPSubscription subscription = connectionIdToFixPSubscription.get(connection);
-            if (subscription != null)
+            final SessionSubscriber sessionSubscriber = connectionIdToSession.get(connection);
+            if (sessionSubscriber != null)
             {
-                subscription.onReplayComplete();
+                sessionSubscriber.onReplayComplete(correlationId);
+            }
+            else
+            {
+                final FixPSubscription subscription = connectionIdToFixPSubscription.get(connection);
+                if (subscription != null)
+                {
+                    subscription.onReplayComplete();
+                }
             }
 
             return CONTINUE;
@@ -1746,6 +2007,7 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
         return CONTINUE;
     }
 
+    @Override
     public Action onInboundFixPConnect(
         final long connection,
         final long sessionId,
@@ -1770,6 +2032,7 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
                 context);
     }
 
+    @Override
     public Action onManageFixPConnection(
         final int libraryId,
         final long correlationId,
@@ -1779,50 +2042,60 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
         final long lastReceivedSequenceNumber,
         final long lastSentSequenceNumber,
         final long lastConnectPayload,
+        final boolean offline,
         final DirectBuffer buffer,
         final int offset,
         final int messageLength)
     {
+        if (libraryId != this.libraryId)
+        {
+            return CONTINUE;
+        }
         initFixP(protocolType);
-
-        final RequestSessionReply reply = (RequestSessionReply)correlationIdToReply.get(correlationId);
-
+        RequestSessionReply reply = null;
         try
         {
             final FixPContext context = commonFixPParser.lookupContext(
-                buffer,
-                offset,
-                messageLength);
+                buffer, offset, messageLength);
 
-            final InternalFixPConnection connection = fixPProtocol.makeAcceptorConnection(
-                connectionId,
-                outboundPublication,
-                inboundPublication,
-                libraryId,
-                this,
-                lastReceivedSequenceNumber,
-                lastSentSequenceNumber,
-                lastConnectPayload,
-                context,
-                configuration);
-
-            final FixPConnectionHandler handler = configuration
-                .fixPConnectionAcquiredHandler()
-                .onConnectionAcquired(connection);
-
-            connection.handler(handler);
-
-            final FixPSubscription subscription = new FixPSubscription(
-                fixPProtocol.makeParser(connection), connection);
-            connectionIdToFixPSubscription.put(connectionId, subscription);
-
-            subscription.onMessage(buffer, offset);
-
-            fixPConnections = ArrayUtil.add(fixPConnections, connection);
-
-            if (reply != null)
+            if (correlationId == NO_CORRELATION_ID)
             {
-                reply.onComplete(SessionReplyStatus.OK);
+                // Reconnect of an offline session
+                InternalFixPConnection connection = findFixPConnection(context);
+                if (connection == null)
+                {
+                    final FixPMessageDissector dissector = new FixPMessageDissector(fixPProtocol.messageDecoders());
+                    connection = fixPProtocol.makeAcceptorConnection(
+                        connectionId, outboundPublication, inboundPublication, libraryId, fixPSessionOwner,
+                        lastReceivedSequenceNumber, lastSentSequenceNumber, lastConnectPayload, context, configuration,
+                        dissector);
+                    fixPConnections = ArrayUtil.add(fixPConnections, connection);
+                }
+                else
+                {
+                    connection.onOfflineReconnect(connectionId, context);
+                }
+                return handleFixPConnection(connectionId, offline, buffer, offset, connection);
+            }
+            else
+            {
+                reply = (RequestSessionReply)correlationIdToReply.get(correlationId);
+
+                final FixPMessageDissector dissector = new FixPMessageDissector(fixPProtocol.messageDecoders());
+                final InternalFixPConnection connection = fixPProtocol.makeAcceptorConnection(
+                    connectionId, outboundPublication, inboundPublication, libraryId, fixPSessionOwner,
+                    lastReceivedSequenceNumber, lastSentSequenceNumber, lastConnectPayload, context,
+                    configuration, dissector);
+                if (offline)
+                {
+                    connection.state(FixPConnection.State.UNBOUND);
+                }
+                handleFixPConnection(connectionId, offline, buffer, offset, connection);
+                fixPConnections = ArrayUtil.add(fixPConnections, connection);
+                if (reply != null)
+                {
+                    reply.onComplete(SessionReplyStatus.OK);
+                }
             }
         }
         catch (final Exception e)
@@ -1831,12 +2104,56 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
             {
                 reply.onError(e);
             }
-            LangUtil.rethrowUnchecked(e);
+            errorHandler.onError(e);
         }
 
         return CONTINUE;
     }
 
+    private InternalFixPConnection findFixPConnection(final FixPContext context)
+    {
+        final FixPKey key = context.key();
+        for (final InternalFixPConnection connection : fixPConnections)
+        {
+            if (connection.key().equals(key))
+            {
+                return connection;
+            }
+        }
+        return null;
+    }
+
+    private Action handleFixPConnection(
+        final long connectionId,
+        final boolean offline,
+        final DirectBuffer buffer,
+        final int offset,
+        final InternalFixPConnection connection)
+    {
+        final FixPSubscription subscription = new FixPSubscription(
+            fixPProtocol.makeParser(connection), connection);
+
+        final Action action = subscription.onMessage(buffer, offset);
+        if (action == ABORT)
+        {
+            return ABORT;
+        }
+
+        final FixPConnectionHandler handler = configuration
+            .fixPConnectionAcquiredHandler()
+            .onConnectionAcquired(connection);
+
+        connection.handler(handler);
+
+        if (!offline)
+        {
+            connectionIdToFixPSubscription.put(connectionId, subscription);
+        }
+
+        return action;
+    }
+
+    @Override
     public Action onThrottleNotification(
         final int libraryId,
         final long connectionId,
@@ -1849,30 +2166,66 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
     {
         if (libraryId == this.libraryId)
         {
-            final SessionSubscriber sessionSubscriber = connectionIdToSession.get(connectionId);
-            if (sessionSubscriber != null)
+            if (refSeqNum == Session.UNKNOWN)
             {
-                final boolean replied = sessionSubscriber.onThrottleNotification(
-                    refMsgType,
-                    refSeqNum,
-                    businessRejectRefIDBuffer,
-                    businessRejectRefIDOffset,
-                    businessRejectRefIDLength
-                );
+                // FIXP
+                final FixPSubscription fixPSubscription = connectionIdToFixPSubscription.get(connectionId);
+                if (fixPSubscription != null)
+                {
+                    final boolean replied = fixPSubscription.onThrottleNotification(
+                        refMsgType,
+                        businessRejectRefIDBuffer,
+                        businessRejectRefIDOffset,
+                        businessRejectRefIDLength
+                    );
 
-                return replied ? CONTINUE : ABORT;
+                    return replied ? CONTINUE : ABORT;
+                }
+            }
+            else
+            {
+                // FIX
+                final SessionSubscriber sessionSubscriber = connectionIdToSession.get(connectionId);
+                if (sessionSubscriber != null)
+                {
+                    final boolean replied = sessionSubscriber.onThrottleNotification(
+                        refMsgType,
+                        refSeqNum,
+                        businessRejectRefIDBuffer,
+                        businessRejectRefIDOffset,
+                        businessRejectRefIDLength
+                    );
+
+                    return replied ? CONTINUE : ABORT;
+                }
             }
         }
 
         return CONTINUE;
     }
 
+    private void validateFixP(final FixPProtocolType protocolType)
+    {
+        if (fixPProtocol != null)
+        {
+            final FixPProtocolType existingType = fixPProtocol.protocolType();
+            if (existingType != protocolType)
+            {
+                throw new IllegalArgumentException("Provided protocol (" + protocolType +
+                    ") clashes with existing configured protocol: " + fixPProtocol);
+            }
+        }
+    }
+
     private void initFixP(final FixPProtocolType protocolType)
     {
         if (fixPProtocol == null)
         {
-            fixPProtocol = FixPProtocolFactory.make(protocolType, THROW_ERRORS);
+            fixPProtocol = FixPProtocolFactory.make(protocolType, errorHandler);
+            commonFixPDissector = new FixPMessageDissector(fixPProtocol.messageDecoders());
             commonFixPParser = fixPProtocol.makeParser(null);
+            commonFixPProxy = fixPProtocol.makeProxy(
+                commonFixPDissector, outboundPublication.dataPublication(), epochNanoClock);
         }
     }
 
@@ -1891,7 +2244,7 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
         final MessageValidationStrategy validationStrategy = configuration.messageValidationStrategy();
         final SessionParser parser = new SessionParser(
             session, validationStrategy,
-            THROW_ERRORS, configuration.validateCompIdsOnEveryMessage(), configuration.validateTimeStrictly(),
+            errorHandler, configuration.validateCompIdsOnEveryMessage(), configuration.validateTimeStrictly(),
             messageInfo, sessionIdStrategy);
         parser.sessionKey(compositeKey);
         parser.fixDictionary(fixDictionary);
@@ -1902,14 +2255,16 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
             receiveTimer,
             sessionTimer,
             this,
-            configuration.replyTimeoutInMs());
+            configuration.replyTimeoutInMs(),
+            errorHandler);
+        session.isSlowConsumer(sessionAcquiredInfo.isSlow());
         subscriber.reply(reply);
         subscriber.handler(configuration.sessionAcquireHandler().onSessionAcquired(session, sessionAcquiredInfo));
 
         connectionIdToSession.put(connectionId, subscriber);
     }
 
-    private InitiatorSession newInitiatorSession(
+    private InternalSession newInitiatorSession(
         final long connectionId,
         final int initialSentSequenceNumber,
         final int initialReceivedSequenceNumber,
@@ -1918,36 +2273,43 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
         final boolean enableLastMsgSeqNumProcessed,
         final FixDictionary fixDictionary,
         final boolean resetSeqNum,
-        final OnMessageInfo messageInfo)
+        final OnMessageInfo messageInfo,
+        final long sessionId,
+        final boolean disconnectOnFirstMessageNotLogon)
     {
         final int defaultInterval = configuration.defaultHeartbeatIntervalInS();
 
         final MutableAsciiBuffer asciiBuffer = sessionBuffer();
         final SessionProxy sessionProxy = sessionProxy(connectionId);
 
-        final InitiatorSession session = new InitiatorSession(
+        final InternalSession session = new InternalSession(
             defaultInterval,
             connectionId,
-            epochClock,
             configuration.epochNanoClock(),
+            state,
+            resetSeqNum,
             sessionProxy,
             inboundPublication,
             outboundPublication,
             sessionIdStrategy,
             configuration.sendingTimeWindowInMs(),
-            fixCounters.receivedMsgSeqNo(connectionId),
-            fixCounters.sentMsgSeqNo(connectionId),
+            fixCounters.receivedMsgSeqNo(connectionId, sessionId),
+            fixCounters.sentMsgSeqNo(connectionId, sessionId),
             libraryId,
             initialSentSequenceNumber,
             sequenceIndex,
-            state,
-            resetSeqNum,
             configuration.reasonableTransmissionTimeInMs(),
             asciiBuffer,
             enableLastMsgSeqNumProcessed,
             configuration.sessionCustomisationStrategy(),
             messageInfo,
-            epochFractionClock);
+            epochFractionClock,
+            ConnectionType.INITIATOR,
+            configuration.resendRequestController(),
+            configuration.forcedHeartbeatIntervalInS(),
+            configuration.disableHeartbeatRepliesToTestRequests(),
+            disconnectOnFirstMessageNotLogon,
+            formatters);
         session.fixDictionary(fixDictionary);
         session.initialLastReceivedMsgSeqNum(initialReceivedSequenceNumber - 1);
 
@@ -1992,17 +2354,20 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
         final int sequenceIndex,
         final boolean enableLastMsgSeqNumProcessed,
         final FixDictionary fixDictionary,
-        final OnMessageInfo messageInfo)
+        final OnMessageInfo messageInfo,
+        final long sessionId)
     {
         final long sendingTimeWindow = configuration.sendingTimeWindowInMs();
-        final AtomicCounter receivedMsgSeqNo = fixCounters.receivedMsgSeqNo(connectionId);
-        final AtomicCounter sentMsgSeqNo = fixCounters.sentMsgSeqNo(connectionId);
+        final AtomicCounter receivedMsgSeqNo = fixCounters.receivedMsgSeqNo(connectionId, sessionId);
+        final AtomicCounter sentMsgSeqNo = fixCounters.sentMsgSeqNo(connectionId, sessionId);
         final MutableAsciiBuffer asciiBuffer = sessionBuffer();
 
-        final InternalSession session = new AcceptorSession(
+        final InternalSession session = new InternalSession(
             heartbeatIntervalInS,
             connectionId,
             configuration.epochNanoClock(),
+            state,
+            false,
             sessionProxy(connectionId),
             inboundPublication,
             outboundPublication,
@@ -2013,13 +2378,18 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
             libraryId,
             1,
             sequenceIndex,
-            state,
             configuration.reasonableTransmissionTimeInMs(),
             asciiBuffer,
             enableLastMsgSeqNumProcessed,
             configuration.sessionCustomisationStrategy(),
             messageInfo,
-            epochFractionClock);
+            epochFractionClock,
+            ConnectionType.ACCEPTOR,
+            configuration.resendRequestController(),
+            configuration.forcedHeartbeatIntervalInS(),
+            configuration.disableHeartbeatRepliesToTestRequests(),
+            true,
+            formatters);
         session.fixDictionary(fixDictionary);
         session.address(address);
         return session;
@@ -2043,7 +2413,8 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
     {
         if (state != CONNECTED)
         {
-            throw new IllegalStateException("Library has been closed or is performing end of day operation");
+            throw new IllegalStateException(
+                "Library has been closed or is performing end of day operation, state = " + state);
         }
     }
 
@@ -2059,6 +2430,7 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
         }
     }
 
+    @Override
     public void close()
     {
         if (state != CLOSED)
@@ -2071,11 +2443,18 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
                     session.close();
                 }
             }
-            if (configuration.gracefulShutdown())
+
+            for (final WeakReference<SessionWriter> ref : sessionIdToFollowerSessionWriter.values())
             {
-                connectionIdToSession.values().forEach(subscriber -> subscriber.session().disable());
-                state = CLOSED;
+                final SessionWriter sessionWriter = ref.get();
+                if (sessionWriter != null)
+                {
+                    InternalSession.closeWriter(sessionWriter);
+                }
             }
+
+            connectionIdToSession.values().forEach(subscriber -> subscriber.session().disable());
+            state = CLOSED;
         }
     }
 
@@ -2104,10 +2483,13 @@ final class LibraryPoller implements LibraryEndPointHandler, ProtocolHandler, Au
         return (List<FixPConnection>)(List<?>)unmodifiableFixPConnections;
     }
 
-    public void remove(final InternalFixPConnection connection)
+    LibraryStreamInfo libraryStreamInfo()
     {
-        fixPConnections = ArrayUtil.remove(fixPConnections, connection);
-        connectionIdToFixPSubscription.remove(connection.connectionId());
+        return new LibraryStreamInfo(
+            inboundPublication.sessionId(),
+            inboundPublication.position(),
+            outboundPublication.sessionId(),
+            outboundPublication.position());
     }
 }
 
@@ -2120,11 +2502,13 @@ class UnmodifiableWrapper<T> extends AbstractList<T>
         this.sessions = sessions;
     }
 
+    @Override
     public T get(final int index)
     {
         return sessions.get()[index];
     }
 
+    @Override
     public int size()
     {
         return sessions.get().length;

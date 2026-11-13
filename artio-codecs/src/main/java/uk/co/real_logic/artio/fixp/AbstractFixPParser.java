@@ -15,14 +15,16 @@
  */
 package uk.co.real_logic.artio.fixp;
 
+import io.aeron.logbuffer.ControlledFragmentHandler.Action;
 import org.agrona.DirectBuffer;
 
 public abstract class AbstractFixPParser
 {
-    public static final int ILINK_MESSAGE_HEADER_LENGTH = 8;
+    public static final int FIXP_MESSAGE_HEADER_LENGTH = 8;
     public static final int BOOLEAN_FLAG_TRUE = 1;
+    public static final int STANDARD_TEMPLATE_ID_OFFSET = 2;
 
-    public abstract long onMessage(DirectBuffer buffer, int offset);
+    public abstract Action onMessage(DirectBuffer buffer, int offset);
 
     public abstract int templateId(DirectBuffer buffer, int offset);
 
@@ -30,10 +32,20 @@ public abstract class AbstractFixPParser
 
     public abstract int version(DirectBuffer buffer, int offset);
 
-    public abstract FixPContext lookupContext(
+    public abstract InternalFixPContext lookupContext(
         DirectBuffer messageBuffer,
         int messageOffset,
         int messageLength);
 
     public abstract long sessionId(DirectBuffer buffer, int offset);
+
+    public int templateIdOffset()
+    {
+        return STANDARD_TEMPLATE_ID_OFFSET;
+    }
+
+    public abstract int retransmissionTemplateId();
+
+    public abstract boolean isRetransmittedMessage(DirectBuffer buffer, int offset);
+
 }

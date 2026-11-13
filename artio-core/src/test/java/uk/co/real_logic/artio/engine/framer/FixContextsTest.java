@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited., Monotonic Ltd.
+ * Copyright 2015-2025 Real Logic Limited., Monotonic Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,11 +15,12 @@
  */
 package uk.co.real_logic.artio.engine.framer;
 
+import org.agrona.BufferUtil;
 import org.agrona.ErrorHandler;
 import org.agrona.IoUtil;
 import org.agrona.concurrent.AtomicBuffer;
 import org.agrona.concurrent.UnsafeBuffer;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 import uk.co.real_logic.artio.FileSystemCorruptionException;
 import uk.co.real_logic.artio.builder.LogonEncoder;
 import uk.co.real_logic.artio.dictionary.FixDictionary;
@@ -34,22 +35,25 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
+import java.nio.file.Files;
 import java.util.List;
 import java.util.stream.IntStream;
 
 import static java.util.stream.Collectors.toList;
+import static org.agrona.concurrent.AtomicBuffer.ALIGNMENT;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.greaterThan;
 import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 import static org.hamcrest.Matchers.lessThan;
 import static org.hamcrest.Matchers.hasSize;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.*;
 import static uk.co.real_logic.artio.engine.EngineConfiguration.DEFAULT_INITIAL_SEQUENCE_INDEX;
 import static uk.co.real_logic.artio.engine.framer.FixContexts.DUPLICATE_SESSION;
-import static uk.co.real_logic.artio.engine.framer.FixContexts.LOWEST_VALID_SESSION_ID;
+import static uk.co.real_logic.artio.engine.framer.IncrementalSessionIdGenerator.LOWEST_VALID_SESSION_ID;
 
 public class FixContextsTest
 {
@@ -58,7 +62,8 @@ public class FixContextsTest
 
     private final long time = System.currentTimeMillis();
     private final ErrorHandler errorHandler = mock(ErrorHandler.class);
-    private final AtomicBuffer buffer = new UnsafeBuffer(ByteBuffer.allocate(BUFFER_SIZE));
+    private final AtomicBuffer buffer = new UnsafeBuffer(
+        BufferUtil.allocateDirectAligned(BUFFER_SIZE, ALIGNMENT));
     private final MappedFile mappedFile = mock(MappedFile.class);
     private final SessionIdStrategy idStrategy = SessionIdStrategy.senderAndTarget();
     private FixContexts fixContexts = newSessionContexts(buffer);
@@ -139,8 +144,8 @@ public class FixContextsTest
 
         final SessionContext cContext = fixContextsAfterRestart.onLogon(cSession, fixDictionary);
         assertValidSessionId(cContext.sessionId());
-        assertNotEquals("C is a duplicate of A", aContext, cContext);
-        assertNotEquals("C is a duplicate of B", bContext, cContext);
+        assertNotEquals(aContext, cContext, "C is a duplicate of A");
+        assertNotEquals(bContext, cContext, "C is a duplicate of B");
     }
 
     @Test
@@ -168,11 +173,14 @@ public class FixContextsTest
         verify(errorHandler).onError(any(FileSystemCorruptionException.class));
     }
 
-    @Test(expected = IllegalArgumentException.class)
+    @Test
     public void validateSizeOfBuffer()
     {
-        final AtomicBuffer buffer = new UnsafeBuffer(ByteBuffer.allocate(1024));
-        newSessionContexts(buffer);
+        assertThrows(IllegalArgumentException.class, () ->
+        {
+            final AtomicBuffer buffer = new UnsafeBuffer(BufferUtil.allocateDirectAligned(1024, ALIGNMENT));
+            newSessionContexts(buffer);
+        });
     }
 
     @Test
@@ -233,7 +241,7 @@ public class FixContextsTest
     @Test
     public void copiesOldSessionContextFile() throws IOException
     {
-        final File backupLocation = File.createTempFile("sessionContexts", "tmp");
+        final File backupLocation = Files.createTempFile("sessionContexts", "tmp").toFile();
         try
         {
             final SessionContext aContext = fixContexts.onLogon(aSession, fixDictionary);
@@ -300,7 +308,8 @@ public class FixContextsTest
         final int size = EngineConfiguration.DEFAULT_SESSION_ID_BUFFER_SIZE;
         final byte[] data = new byte[size];
         oldFile.read(data);
-        final UnsafeBuffer oldBuffer = new UnsafeBuffer(ByteBuffer.wrap(data));
+        final UnsafeBuffer oldBuffer = new UnsafeBuffer(BufferUtil.allocateDirectAligned(size, ALIGNMENT));
+        oldBuffer.putBytes(0, data);
 
         // Load old buffer
         final FixContexts fixContexts = newSessionContexts(oldBuffer);
@@ -335,8 +344,8 @@ public class FixContextsTest
         final SessionContext newAContext = fixContexts.onLogon(aSession, fixDictionary);
         assertValidSessionId(bContext.sessionId());
         assertValidSessionId(newAContext.sessionId());
-        assertEquals("Session Contexts haven't been reset", aContext, bContext);
-        assertNotEquals("Session Contexts haven't been reset", aContext, newAContext);
+        assertEquals(aContext, bContext, "Session Contexts haven't been reset");
+        assertNotEquals(aContext, newAContext, "Session Contexts haven't been reset");
     }
 
     private void assertValidSessionId(final long cId)
@@ -352,7 +361,8 @@ public class FixContextsTest
     private FixContexts newSessionContexts(final AtomicBuffer buffer, final int initialSequenceIndex)
     {
         when(mappedFile.buffer()).thenReturn(buffer);
-        return new FixContexts(mappedFile, idStrategy, initialSequenceIndex, errorHandler);
+        return new FixContexts(mappedFile, idStrategy, initialSequenceIndex, errorHandler, false,
+            new IncrementalSessionIdGenerator());
     }
 
     private void assertValuesEqual(

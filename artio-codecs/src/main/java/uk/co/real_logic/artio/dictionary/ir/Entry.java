@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,13 +20,21 @@ import org.agrona.Verify;
 import org.agrona.generation.ResourceConsumer;
 
 import java.io.IOException;
+import java.util.Comparator;
+import java.util.List;
 import java.util.function.BiFunction;
 import java.util.function.Function;
 
 public final class Entry
 {
-    private final boolean required;
+    public static final Comparator<Entry> BY_NAME = Comparator.comparing(Entry::name);
+
+    private boolean required;
     private Element element;
+    private boolean isInParent;
+
+    // Only used in shared parent entry in order to store references to child entries
+    private List<Entry> sharedChildEntries;
 
     public static Entry required(final Element element)
     {
@@ -41,7 +49,8 @@ public final class Entry
     public <T> T match(
         final BiFunction<Entry, Field, ? extends T> withField,
         final BiFunction<Entry, Group, ? extends T> withGroup,
-        final BiFunction<Entry, Component, ? extends T> withComponent)
+        final BiFunction<Entry, Component, ? extends T> withComponent,
+        final BiFunction<Entry, AnyFields, ? extends T> withAnyFields)
     {
         if (element instanceof Field)
         {
@@ -55,6 +64,10 @@ public final class Entry
         {
             return withComponent.apply(this, (Component)element);
         }
+        else if (element instanceof AnyFields)
+        {
+            return withAnyFields.apply(this, (AnyFields)element);
+        }
 
         throw new IllegalStateException("Unknown element type: " + element);
     }
@@ -62,7 +75,8 @@ public final class Entry
     public void forEach(
         final ResourceConsumer<Field> withField,
         final ResourceConsumer<Group> withGroup,
-        final ResourceConsumer<Component> withComponent)
+        final ResourceConsumer<Component> withComponent,
+        final ResourceConsumer<AnyFields> withAnyFields)
     {
         try
         {
@@ -78,6 +92,10 @@ public final class Entry
             {
                 withComponent.accept((Component)element);
             }
+            else if (element instanceof AnyFields)
+            {
+                withAnyFields.accept((AnyFields)element);
+            }
             else
             {
                 throw new IllegalStateException("Unknown element type: " + element);
@@ -92,12 +110,14 @@ public final class Entry
     public <T> T matchEntry(
         final Function<Entry, ? extends T> withField,
         final Function<Entry, ? extends T> withGroup,
-        final Function<Entry, ? extends T> withComponent)
+        final Function<Entry, ? extends T> withComponent,
+        final Function<Entry, ? extends T> withAnyFields)
     {
         return match(
             (entry, field) -> withField.apply(entry),
             (entry, group) -> withGroup.apply(entry),
-            (entry, component) -> withComponent.apply(entry));
+            (entry, component) -> withComponent.apply(entry),
+            (entry, anyFields) -> withAnyFields.apply(entry));
     }
 
     /**
@@ -112,7 +132,12 @@ public final class Entry
 
     public boolean required()
     {
-        return this.required;
+        return required;
+    }
+
+    public void required(final boolean required)
+    {
+        this.required = required;
     }
 
     public Element element()
@@ -143,12 +168,29 @@ public final class Entry
         return element() instanceof Group;
     }
 
+    public boolean isAnyFields()
+    {
+        return element() instanceof AnyFields;
+    }
+
+    @Override
     public String toString()
     {
         return "Entry{" +
             "required=" + required +
             ", element=" + element +
+            ", isInParent=" + isInParent +
             '}';
+    }
+
+    public void sharedChildEntries(final List<Entry> sharedChildEntries)
+    {
+        this.sharedChildEntries = sharedChildEntries;
+    }
+
+    public List<Entry> sharedChildEntries()
+    {
+        return sharedChildEntries;
     }
 
     public String name()
@@ -161,11 +203,26 @@ public final class Entry
         return ((Field)element()).number();
     }
 
+    public boolean isInParent()
+    {
+        return isInParent;
+    }
+
+    public void isInParent(final boolean isInParent)
+    {
+        this.isInParent = isInParent;
+    }
+
     public interface Element
     {
         default boolean isEnumField()
         {
             return this instanceof Field && ((Field)this).isEnum();
+        }
+
+        default boolean isCharOrBooleanBasedField()
+        {
+            return this instanceof Field && ((Field)this).isCharOrBooleanBasedField();
         }
 
         String name();

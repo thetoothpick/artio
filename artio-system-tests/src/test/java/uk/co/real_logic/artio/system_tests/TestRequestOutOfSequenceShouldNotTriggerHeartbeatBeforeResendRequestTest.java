@@ -16,9 +16,11 @@
 package uk.co.real_logic.artio.system_tests;
 
 import io.aeron.archive.ArchivingMediaDriver;
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterEach;
+
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 import uk.co.real_logic.artio.engine.EngineConfiguration;
 import uk.co.real_logic.artio.engine.FixEngine;
 import uk.co.real_logic.artio.validation.SessionPersistenceStrategy;
@@ -28,7 +30,7 @@ import java.util.concurrent.locks.LockSupport;
 
 import static io.aeron.CommonContext.IPC_CHANNEL;
 import static org.agrona.CloseHelper.close;
-import static org.junit.Assert.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static uk.co.real_logic.artio.TestFixtures.*;
 import static uk.co.real_logic.artio.system_tests.SystemTestUtil.*;
 
@@ -39,7 +41,7 @@ public class TestRequestOutOfSequenceShouldNotTriggerHeartbeatBeforeResendReques
     private ArchivingMediaDriver mediaDriver;
     private FixEngine engine;
 
-    @Before
+    @BeforeEach
     public void setUp()
     {
         mediaDriver = launchMediaDriver();
@@ -51,6 +53,7 @@ public class TestRequestOutOfSequenceShouldNotTriggerHeartbeatBeforeResendReques
             .monitoringFile(acceptorMonitoringFile("engineCounters"))
             .logFileDir(ACCEPTOR_LOGS)
             .sessionPersistenceStrategy(SessionPersistenceStrategy.alwaysPersistent());
+        configureAeronArchive(config.aeronArchiveContext());
         engine = FixEngine.launch(config);
     }
 
@@ -76,7 +79,7 @@ public class TestRequestOutOfSequenceShouldNotTriggerHeartbeatBeforeResendReques
         }
     }
 
-    @After
+    @AfterEach
     public void tearDown()
     {
         close(engine);

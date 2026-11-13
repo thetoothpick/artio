@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -49,6 +49,7 @@ class InitiateSessionReply extends LibraryReply<Session>
         }
     }
 
+    @Override
     protected void sendMessage()
     {
         final List<String> hosts = configuration.hosts();
@@ -68,6 +69,7 @@ class InitiateSessionReply extends LibraryReply<Session>
         requiresResend = position < 0;
     }
 
+    @Override
     void onError(final GatewayError errorType, final String errorMessage)
     {
         if (errorType == UNABLE_TO_CONNECT)
@@ -82,6 +84,7 @@ class InitiateSessionReply extends LibraryReply<Session>
         }
     }
 
+    @Override
     void onComplete(final Session result)
     {
         final String host = configuration.hosts().get(addressIndex);
@@ -96,6 +99,7 @@ class InitiateSessionReply extends LibraryReply<Session>
         this.connectionId = connectionId;
     }
 
+    @Override
     protected boolean onTimeout()
     {
         libraryPoller.onInitiatorSessionTimeout(correlationId, connectionId);

@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -33,16 +33,19 @@ final class TargetCompIdValidationStrategy implements MessageValidationStrategy
         this.gatewayCompId = gatewayCompId.toCharArray();
     }
 
+    @Override
     public boolean validate(final SessionHeaderDecoder header)
     {
-        return CodecUtil.equals(gatewayCompId, header.targetCompID(), header.targetCompIDLength());
+        return CodecUtil.equals(header.targetCompID(), gatewayCompId, header.targetCompIDLength());
     }
 
+    @Override
     public int invalidTagId()
     {
         return SessionConstants.TARGET_COMP_ID;
     }
 
+    @Override
     public int rejectReason()
     {
         return COMPID_PROBLEM.representation();

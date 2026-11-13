@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -69,15 +69,12 @@ public final class ProtocolSubscription implements ControlledFragmentHandler
         this.defaultAction = defaultAction;
     }
 
+    @Override
     public Action onFragment(
-        final DirectBuffer buffer, final int offset, final int length, final Header header)
+        final DirectBuffer buffer, final int start, final int length, final Header header)
     {
-        return onFragment(buffer, offset, length, header.position());
-    }
+        int offset = start;
 
-    @SuppressWarnings("FinalParameters")
-    private Action onFragment(final DirectBuffer buffer, int offset, int length, final long position)
-    {
         messageHeader.wrap(buffer, offset);
 
         final int blockLength = messageHeader.blockLength();
@@ -88,7 +85,7 @@ public final class ProtocolSubscription implements ControlledFragmentHandler
         {
             case FixMessageDecoder.TEMPLATE_ID:
             {
-                return onFixMessage(buffer, offset, blockLength, version, position);
+                return onFixMessage(buffer, offset, blockLength, version, header);
             }
 
             case DisconnectDecoder.TEMPLATE_ID:
@@ -110,7 +107,7 @@ public final class ProtocolSubscription implements ControlledFragmentHandler
     {
         iLinkMessage.wrap(buffer, offset, blockLength, version);
         final long connectionId = iLinkMessage.connection();
-        return protocolHandler.onILinkMessage(
+        return protocolHandler.onFixPMessage(
             connectionId,
             buffer,
             offset + FixPMessageDecoder.BLOCK_LENGTH);
@@ -138,7 +135,7 @@ public final class ProtocolSubscription implements ControlledFragmentHandler
         final int offset,
         final int blockLength,
         final int version,
-        final long position)
+        final Header header)
     {
         messageFrame.wrap(buffer, offset, blockLength, version);
         final int metaDataLength = messageFrame.skipMetaData();
@@ -157,7 +154,7 @@ public final class ProtocolSubscription implements ControlledFragmentHandler
             messageFrame.timestamp(),
             messageFrame.status(),
             messageFrame.sequenceNumber(),
-            position,
+            header,
             metaDataLength);
     }
 }

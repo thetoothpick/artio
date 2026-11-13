@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,20 +19,22 @@ import io.aeron.logbuffer.ControlledFragmentHandler.Action;
 import org.agrona.DirectBuffer;
 import uk.co.real_logic.artio.dictionary.FixDictionary;
 import uk.co.real_logic.artio.messages.*;
-import uk.co.real_logic.artio.messages.ControlNotificationDecoder.SessionsDecoder;
 
 public interface LibraryEndPointHandler
 {
     Action onError(int libraryId, GatewayError errorType, long replyToId, String message);
 
-    Action onApplicationHeartbeat(int libraryId);
+    Action onApplicationHeartbeat(int libraryId, int messageTemplateId);
+
+    Action onApplicationHeartbeat(int libraryId, int messageTemplateId, long timestampInNs);
 
     Action onReleaseSessionReply(int libraryId, long replyToId, SessionReplyStatus status);
 
     Action onRequestSessionReply(int toId, long replyToId, SessionReplyStatus status);
 
     Action onControlNotification(
-        int libraryId, InitialAcceptedSessionOwner initialAcceptedSessionOwner, SessionsDecoder sessions);
+        int libraryId, InitialAcceptedSessionOwner initialAcceptedSessionOwner,
+        ControlNotificationDecoder controlNotification);
 
     Action onSlowStatusNotification(int libraryId, long connectionId, boolean hasBecomeSlow);
 
@@ -111,7 +113,7 @@ public interface LibraryEndPointHandler
         int libraryId, long correlationId, int newSessionId, long stopPosition, int initialTermId,
         int termBufferLength, int mtuLength);
 
-    Action onReplayComplete(int libraryId, long connection);
+    Action onReplayComplete(int libraryId, long connection, long correlationId);
 
     Action onInboundFixPConnect(
         long connection,
@@ -130,6 +132,7 @@ public interface LibraryEndPointHandler
         long lastReceivedSequenceNumber,
         long lastSentSequenceNumber,
         long lastConnectPayload,
+        boolean offline,
         DirectBuffer buffer,
         int limit,
         int messageLength);

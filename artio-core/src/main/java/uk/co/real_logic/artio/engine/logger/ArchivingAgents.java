@@ -1,0 +1,147 @@
+/*
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package uk.co.real_logic.artio.engine.logger;
+
+import io.aeron.Subscription;
+import io.aeron.archive.client.AeronArchive;
+import io.aeron.logbuffer.ControlledFragmentHandler;
+import io.aeron.logbuffer.FragmentHandler;
+import io.aeron.logbuffer.Header;
+import org.agrona.DirectBuffer;
+import org.agrona.ErrorHandler;
+import org.agrona.concurrent.Agent;
+import uk.co.real_logic.artio.dictionary.generation.Exceptions;
+import uk.co.real_logic.artio.engine.CompletionPosition;
+
+import java.util.Objects;
+
+public class ArchivingAgents implements Agent, FragmentHandler
+{
+    static final int LIMIT = 20;
+
+    private final Indexer indexer;
+    private final AbstractReplayer abstractReplayer;
+    private final Subscription subscription;
+    private final CompletionPosition completionPosition;
+
+    public ArchivingAgents(
+        final Indexer indexer,
+        final AbstractReplayer abstractReplayer,
+        final Subscription subscription,
+        final CompletionPosition completionPosition
+    )
+    {
+        this.indexer = Objects.requireNonNull(indexer);
+        this.abstractReplayer = abstractReplayer;
+        this.subscription = subscription;
+        this.completionPosition = completionPosition;
+    }
+
+    @Override
+    public void onStart()
+    {
+        indexer.onStart();
+        if (null != abstractReplayer)
+        {
+            abstractReplayer.onStart();
+        }
+    }
+
+    @Override
+    public int doWork() throws Exception
+    {
+        int workCount = 0;
+        workCount += subscription.poll(this, LIMIT);
+        workCount += indexer.doWork();
+        if (null != abstractReplayer)
+        {
+            workCount += abstractReplayer.doWork();
+        }
+        return workCount;
+    }
+
+    @Override
+    public void onFragment(final DirectBuffer buffer, final int offset, final int length, final Header header)
+    {
+        indexer.onFragment(buffer, offset, length, header);
+        if (null != abstractReplayer)
+        {
+            abstractReplayer.onFragment(buffer, offset, length, header);
+        }
+    }
+
+    public void catchIndexUp(final AeronArchive aeronArchive, final ErrorHandler errorHandler)
+    {
+        indexer.catchIndexUp(aeronArchive, errorHandler);
+    }
+
+    @Override
+    public void onClose()
+    {
+        quiesce();
+
+        Exceptions.closeAll(() -> Exceptions.closeAll(indexer, abstractReplayer), subscription);
+    }
+
+    private void quiesce()
+    {
+        while (!completionPosition.hasCompleted())
+        {
+            Thread.yield();
+        }
+
+        if (completionPosition.wasStartupComplete())
+        {
+            return;
+        }
+
+        // We know that any remaining data to quiesce at this point must be in the subscription.
+        subscription.controlledPoll(this::quiesceFragment, Integer.MAX_VALUE);
+    }
+
+    private ControlledFragmentHandler.Action quiesceFragment(
+        final DirectBuffer buffer,
+        final int offset,
+        final int length,
+        final Header header)
+    {
+        if (header.position() <= completedPosition(header.sessionId()))
+        {
+            onFragment(buffer, offset, length, header);
+            return ControlledFragmentHandler.Action.CONTINUE;
+        }
+        else
+        {
+            return ControlledFragmentHandler.Action.ABORT;
+        }
+    }
+
+    private long completedPosition(final int aeronSessionId)
+    {
+        return completionPosition.positions().get(aeronSessionId);
+    }
+
+    @Override
+    public String roleName()
+    {
+        if (null != abstractReplayer)
+        {
+            return indexer.roleName() + "," + abstractReplayer.roleName();
+        }
+
+        return indexer.roleName();
+    }
+}

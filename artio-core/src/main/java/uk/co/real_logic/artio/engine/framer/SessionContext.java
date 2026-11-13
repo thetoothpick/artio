@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -35,8 +35,9 @@ class SessionContext implements SessionInfo
     // SessionInfo interface.
     private volatile int sequenceIndex;
     private final int initialSequenceIndex;
+    private final boolean reproductionEnabled;
 
-    private long lastLogonTime;
+    private long lastLogonTimeInNs;
     private long lastSequenceResetTimeInNs;
     private FixDictionary lastFixDictionary;
     private int filePosition;
@@ -45,33 +46,48 @@ class SessionContext implements SessionInfo
         final CompositeKey compositeKey,
         final long sessionId,
         final int sequenceIndex,
-        final long lastLogonTime,
+        final long lastLogonTimeInNs,
         final long lastSequenceResetTimeInNs,
         final FixContexts fixContexts,
         final int filePosition,
         final int initialSequenceIndex,
-        final FixDictionary lastFixDictionary)
+        final FixDictionary lastFixDictionary,
+        final boolean reproductionEnabled)
     {
         this.compositeKey = compositeKey;
         this.sessionId = sessionId;
         this.sequenceIndex = sequenceIndex;
         this.initialSequenceIndex = initialSequenceIndex;
-        lastLogonTime(lastLogonTime);
+        this.reproductionEnabled = reproductionEnabled;
+        lastLogonTimeInNs(lastLogonTimeInNs);
         this.lastSequenceResetTimeInNs = lastSequenceResetTimeInNs;
         this.fixContexts = fixContexts;
         this.filePosition = filePosition;
         this.lastFixDictionary = lastFixDictionary;
     }
 
-    private void lastLogonTime(final long lastLogonTime)
+    private void lastLogonTimeInNs(final long lastLogonTime)
     {
-        this.lastLogonTime = lastLogonTime;
+        this.lastLogonTimeInNs = lastLogonTime;
     }
 
     void onSequenceReset(final long resetTimeInNs)
     {
+        final int newSequenceIndex = sequenceIndex == UNKNOWN_SEQUENCE_INDEX ? initialSequenceIndex : sequenceIndex + 1;
+
+        if (reproductionEnabled && (sequenceIndex != UNKNOWN_SEQUENCE_INDEX))
+        {
+            // Don't increment the sequence index during the
+            return;
+        }
+
+        onSequenceIndex(resetTimeInNs, newSequenceIndex);
+    }
+
+    void onSequenceIndex(final long resetTimeInNs, final int sequenceIndex)
+    {
         lastSequenceResetTimeInNs = resetTimeInNs;
-        sequenceIndex = sequenceIndex == UNKNOWN_SEQUENCE_INDEX ? initialSequenceIndex : sequenceIndex + 1;
+        this.sequenceIndex = sequenceIndex;
         save();
     }
 
@@ -103,19 +119,19 @@ class SessionContext implements SessionInfo
     void updateFrom(final Session session)
     {
         sequenceIndex = session.sequenceIndex();
-        lastLogonTime(session.lastLogonTimeInNs());
+        lastLogonTimeInNs(session.lastLogonTimeInNs());
         lastSequenceResetTimeInNs = session.lastSequenceResetTimeInNs();
     }
 
-    void onLogon(final boolean resetSeqNum, final long time, final FixDictionary fixDictionary)
+    void onLogon(final boolean resetSeqNum, final long timeInNs, final FixDictionary fixDictionary)
     {
         lastFixDictionary = fixDictionary;
-        lastLogonTime(time);
+        lastLogonTimeInNs(timeInNs);
         // increment if we're going to reset the sequence number or if it's persistent
         // sequence numbers and it's the first time we're logging on.
         if (resetSeqNum || sequenceIndex == SessionContext.UNKNOWN_SEQUENCE_INDEX)
         {
-            onSequenceReset(time);
+            onSequenceReset(timeInNs);
         }
         else
         {
@@ -124,16 +140,19 @@ class SessionContext implements SessionInfo
         }
     }
 
+    @Override
     public int sequenceIndex()
     {
         return sequenceIndex;
     }
 
+    @Override
     public long sessionId()
     {
         return sessionId;
     }
 
+    @Override
     public CompositeKey sessionKey()
     {
         return compositeKey;
@@ -144,9 +163,9 @@ class SessionContext implements SessionInfo
         return lastSequenceResetTimeInNs;
     }
 
-    public long lastLogonTime()
+    public long lastLogonTimeInNs()
     {
-        return lastLogonTime;
+        return lastLogonTimeInNs;
     }
 
     public FixDictionary lastFixDictionary()
@@ -154,6 +173,7 @@ class SessionContext implements SessionInfo
         return lastFixDictionary;
     }
 
+    @Override
     public boolean equals(final Object o)
     {
         if (this == o)
@@ -171,17 +191,21 @@ class SessionContext implements SessionInfo
         return sessionId == that.sessionId;
     }
 
+    @Override
     public int hashCode()
     {
         return (int)(sessionId ^ (sessionId >>> 32));
     }
 
+    @Override
     public String toString()
     {
         return "SessionContext{" +
             "sessionId=" + sessionId +
             ", sequenceIndex=" + sequenceIndex +
             ", compositeKey=" + compositeKey +
+            ", lastLogonTime=" + lastLogonTimeInNs +
+            ", lastSequenceResetTimeInNs=" + lastSequenceResetTimeInNs +
             '}';
     }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,10 +24,14 @@ import uk.co.real_logic.artio.dictionary.FixDictionary;
 import uk.co.real_logic.artio.library.OnMessageInfo;
 import uk.co.real_logic.artio.messages.CancelOnDisconnectOption;
 import uk.co.real_logic.artio.messages.ConnectionType;
+import uk.co.real_logic.artio.messages.DisconnectReason;
 import uk.co.real_logic.artio.messages.SessionState;
 import uk.co.real_logic.artio.protocol.GatewayPublication;
+import uk.co.real_logic.artio.util.CharFormatter;
 import uk.co.real_logic.artio.util.EpochFractionClock;
 import uk.co.real_logic.artio.util.MutableAsciiBuffer;
+
+import java.lang.ref.WeakReference;
 
 /**
  * Exposes Session methods to internal APIs that we don't want to expose to the outside world
@@ -41,11 +45,18 @@ public class InternalSession extends Session implements AutoCloseable
     public static final int INITIAL_END_OF_RESEND_REQUEST_RANGE = 0;
     public static final boolean INITIAL_AWAITING_HEARTBEAT = false;
 
+    public static class Formatters
+    {
+        final CharFormatter replayComplete = new CharFormatter(
+            "Sess.replayComplete: replaysInFlight=%s,conn=%s,corr=%s");
+    }
+
     public InternalSession(
         final int heartbeatIntervalInS,
         final long connectionId,
         final EpochNanoClock clock,
         final SessionState state,
+        final boolean initiatorResetSeqNum,
         final SessionProxy proxy,
         final GatewayPublication inboundPublication,
         final GatewayPublication outboundPublication,
@@ -62,13 +73,19 @@ public class InternalSession extends Session implements AutoCloseable
         final SessionCustomisationStrategy customisationStrategy,
         final OnMessageInfo messageInfo,
         final EpochFractionClock epochFractionClock,
-        final ConnectionType connectionType)
+        final ConnectionType connectionType,
+        final ResendRequestController resendRequestController,
+        final int forcedHeartbeatIntervalInS,
+        final boolean disableHeartbeatRepliesToTestRequests,
+        final boolean disconnectOnFirstMessageNotLogon,
+        final Formatters formatters)
     {
         super(
             heartbeatIntervalInS,
             connectionId,
             clock,
             state,
+            initiatorResetSeqNum,
             proxy,
             inboundPublication,
             outboundPublication,
@@ -85,27 +102,36 @@ public class InternalSession extends Session implements AutoCloseable
             customisationStrategy,
             messageInfo,
             epochFractionClock,
-            connectionType);
+            connectionType,
+            resendRequestController,
+            forcedHeartbeatIntervalInS,
+            disableHeartbeatRepliesToTestRequests,
+            disconnectOnFirstMessageNotLogon,
+            formatters);
     }
 
+    @Override
     public int poll(final long timeInNs)
     {
         return super.poll(timeInNs);
     }
 
+    @Override
     public void disable()
     {
         super.disable();
     }
 
+    @Override
     public void libraryConnected(final boolean libraryConnected)
     {
         super.libraryConnected(libraryConnected);
     }
 
-    public void sessionProcessHandler(final SessionProcessHandler sessionProcessHandler)
+    @Override
+    public void sessionProcessHandler(final FixSessionOwner fixSessionOwner)
     {
-        super.sessionProcessHandler(sessionProcessHandler);
+        super.sessionProcessHandler(fixSessionOwner);
     }
 
     public void address(final String address)
@@ -114,56 +140,67 @@ public class InternalSession extends Session implements AutoCloseable
         address(parsed.host(), parsed.port());
     }
 
+    @Override
     public void address(final String host, final int port)
     {
         super.address(host, port);
     }
 
+    @Override
     public void username(final String username)
     {
         super.username(username);
     }
 
+    @Override
     public void password(final String password)
     {
         super.password(password);
     }
 
+    @Override
     public void lastLogonTimeInNs(final long logonTimeInNs)
     {
         super.lastLogonTimeInNs(logonTimeInNs);
     }
 
+    @Override
     public void awaitingResend(final boolean awaitingResend)
     {
         super.awaitingResend(awaitingResend);
     }
 
+    @Override
     public void closedResendInterval(final boolean closedResendInterval)
     {
         super.closedResendInterval(closedResendInterval);
     }
 
+    @Override
     public void resendRequestChunkSize(final int resendRequestChunkSize)
     {
         super.resendRequestChunkSize(resendRequestChunkSize);
     }
 
+    @Override
     public void sendRedundantResendRequests(final boolean sendRedundantResendRequests)
     {
         super.sendRedundantResendRequests(sendRedundantResendRequests);
     }
 
+    @Override
     public void updateLastMessageProcessed()
     {
         super.updateLastMessageProcessed();
     }
 
+    @Override
     public void initialLastReceivedMsgSeqNum(final int lastReceivedMsgSeqNum)
     {
         super.initialLastReceivedMsgSeqNum(lastReceivedMsgSeqNum);
     }
 
+    @Override
     public ControlledFragmentHandler.Action onInvalidMessage(
         final int refSeqNum,
         final int refTagId,
@@ -174,56 +211,85 @@ public class InternalSession extends Session implements AutoCloseable
         return super.onInvalidMessage(refSeqNum, refTagId, refMsgType, refMsgTypeLength, rejectReason, position);
     }
 
+    @Override
     public void lastResentMsgSeqNo(final int lastResentMsgSeqNo)
     {
         super.lastResentMsgSeqNo(lastResentMsgSeqNo);
     }
 
+    @Override
     public void lastResendChunkMsgSeqNum(final int lastResendChunkMsgSeqNum)
     {
         super.lastResendChunkMsgSeqNum(lastResendChunkMsgSeqNum);
     }
 
+    @Override
     public void lastSequenceResetTimeInNs(final long lastSequenceResetTimeInNs)
     {
         super.lastSequenceResetTimeInNs(lastSequenceResetTimeInNs);
     }
 
+    @Override
     public void endOfResendRequestRange(final int endOfResendRequestRange)
     {
         super.endOfResendRequestRange(endOfResendRequestRange);
     }
 
+    @Override
     public void awaitingHeartbeat(final boolean awaitingHeartbeat)
     {
         super.awaitingHeartbeat(awaitingHeartbeat);
     }
 
+    @Override
     public int lastResendChunkMsgSeqNum()
     {
         return super.lastResendChunkMsgSeqNum();
     }
 
+    @Override
     public int endOfResendRequestRange()
     {
         return super.endOfResendRequestRange();
     }
 
+    @Override
     public int lastResentMsgSeqNo()
     {
         return super.lastResentMsgSeqNo();
     }
 
+    @Override
     public void fixDictionary(final FixDictionary fixDictionary)
     {
         super.fixDictionary(fixDictionary);
     }
 
-    public void setupSession(final long sessionId, final CompositeKey sessionKey)
+    @Override
+    public void setupSession(
+        final long sessionId,
+        final CompositeKey sessionKey,
+        final WeakReference<SessionWriter> sessionWriterRef)
     {
-        super.setupSession(sessionId, sessionKey);
+        super.setupSession(sessionId, sessionKey, sessionWriterRef);
     }
 
+    public void linkTo(final SessionWriter sessionWriter)
+    {
+        sessionWriter.linkTo(this);
+    }
+
+    public static void disconnectWriter(final SessionWriter writer)
+    {
+        writer.onDisconnect();
+    }
+
+    public static void closeWriter(final SessionWriter writer)
+    {
+        writer.close();
+    }
+
+    @Override
     public void close()
     {
         super.close();
@@ -237,44 +303,46 @@ public class InternalSession extends Session implements AutoCloseable
         final boolean enableLastMsgSeqNumProcessed,
         final FixDictionary fixDictionary,
         final String address,
-        final FixCounters counters)
+        final FixCounters counters,
+        final ConnectionType connectionType)
     {
         connectionId(connectionId);
         state(sessionState);
         heartbeatIntervalInS(heartbeatIntervalInS);
-        sequenceIndex(sequenceIndex);
+        setCorrectedSequenceIndex(sessionState, sequenceIndex);
         enableLastMsgSeqNumProcessed(enableLastMsgSeqNumProcessed);
         fixDictionary(fixDictionary);
         address(address);
         refreshSequenceNumberCounters(counters);
+        awaitingLogonReply(false);
+        this.connectionType = connectionType;
     }
 
+    @Override
     public void lastReceivedMsgSeqNumOnly(final int value)
     {
         super.lastReceivedMsgSeqNumOnly(value);
     }
 
-    protected void finalize() throws Throwable
-    {
-        close();
-        super.finalize();
-    }
-
+    @Override
     public OnMessageInfo messageInfo()
     {
         return super.messageInfo();
     }
 
+    @Override
     public boolean areCountersClosed()
     {
         return super.areCountersClosed();
     }
 
+    @Override
     public void cancelOnDisconnectOption(final CancelOnDisconnectOption cancelOnDisconnectOption)
     {
-        this.cancelOnDisconnectOption = cancelOnDisconnectOption;
+        super.cancelOnDisconnectOption(cancelOnDisconnectOption);
     }
 
+    @Override
     public void cancelOnDisconnectTimeoutWindowInNs(final long cancelOnDisconnectTimeoutWindowInNs)
     {
         super.cancelOnDisconnectTimeoutWindowInNs(cancelOnDisconnectTimeoutWindowInNs);
@@ -314,4 +382,52 @@ public class InternalSession extends Session implements AutoCloseable
 
         return false;
     }
+
+    @Override
+    public void isSlowConsumer(final boolean hasBecomeSlow)
+    {
+        super.isSlowConsumer(hasBecomeSlow);
+    }
+
+    @Override
+    public long logoutAndDisconnect(final DisconnectReason reason)
+    {
+        return super.logoutAndDisconnect(reason);
+    }
+
+    @Override
+    public long requestDisconnect(final DisconnectReason reason)
+    {
+        return super.requestDisconnect(reason);
+    }
+
+    @Override
+    public void initiatorResetSeqNum(final boolean initiatorResetSeqNum)
+    {
+        super.initiatorResetSeqNum(initiatorResetSeqNum);
+    }
+
+    @Override
+    public void onReplayComplete(final long correlationId)
+    {
+        super.onReplayComplete(correlationId);
+    }
+
+    @Override
+    public void onSessionWriterLogout()
+    {
+        super.onSessionWriterLogout();
+    }
+
+    public ConnectionType connectionType()
+    {
+        return connectionType;
+    }
+
+    @Override
+    public void disconnectOnFirstMessageNotLogon(final boolean disconnectOnFirstMessageNotLogon)
+    {
+        super.disconnectOnFirstMessageNotLogon(disconnectOnFirstMessageNotLogon);
+    }
+
 }

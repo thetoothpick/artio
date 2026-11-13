@@ -46,6 +46,7 @@
             <field name="CumQty" required="Y"/>
             <field name="AvgPx" required="Y"/>
             <field name="OpenCloseSettlFlag" required="N"/>
+            <anyFields name="TrailingAnyFields"/>
         </message>
         <message name="News" msgtype="B" msgcat="app">
             <group name="LinesOfText" required="Y">
@@ -89,6 +90,7 @@
         </field>
         <field number="110" name="MinQty" type="QTY"/>
         <field number="386" name="NoTradingSessions" type="INT"/>
+        <field number="387" name="ExampleLongField" type="LONG"/>
         <field number="336" name="TradingSessionID" type="STRING"/>
         <field number="81" name="ProcessCode" type="CHAR">
             <value enum="0" description="REGULAR"/>

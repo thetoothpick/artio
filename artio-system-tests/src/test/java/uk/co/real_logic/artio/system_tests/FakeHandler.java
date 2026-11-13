@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,15 +30,18 @@ import uk.co.real_logic.artio.session.Session;
 import uk.co.real_logic.artio.util.MutableAsciiBuffer;
 
 import java.util.*;
+import java.util.function.BiConsumer;
 
 import static io.aeron.logbuffer.ControlledFragmentHandler.Action.CONTINUE;
-import static org.junit.Assert.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static uk.co.real_logic.artio.engine.FixEngine.ENGINE_LIBRARY_ID;
 import static uk.co.real_logic.artio.library.FixLibrary.NO_MESSAGE_REPLAY;
 
 public class FakeHandler
     implements SessionHandler, SessionAcquireHandler, SessionExistsHandler
 {
+    public static final String SESSION_START_ERROR = "Unexpected Error";
+
     private final OtfParser parser;
     private final FakeOtfAcceptor acceptor;
 
@@ -55,6 +58,10 @@ public class FakeHandler
     private final ExpandableArrayBuffer lastMessageBuffer = new ExpandableArrayBuffer();
     private final MutableAsciiBuffer lastMessage = new MutableAsciiBuffer();
     private final HeartbeatEncoder heartbeatEncoder = new HeartbeatEncoder();
+
+    private boolean throwInOnSessionStart = false;
+    private boolean onSessionStartCalled = false;
+
     {
         heartbeatEncoder.testReqID("abc");
     }
@@ -65,6 +72,8 @@ public class FakeHandler
     private int timedOutLibraryId;
     private Session timedOutSession;
     private boolean spamLogonMessages = false;
+    private BiConsumer<Session, DisconnectReason> onDisconnectCallback;
+    private BiConsumer<Session, FixMessage> onMessageCallback;
 
     public FakeHandler(final FakeOtfAcceptor acceptor)
     {
@@ -94,8 +103,19 @@ public class FakeHandler
         spamLogonMessages = true;
     }
 
+    public void onDisconnectCallback(final BiConsumer<Session, DisconnectReason> onDisconnectCallback)
+    {
+        this.onDisconnectCallback = onDisconnectCallback;
+    }
+
+    public void onMessageCallback(final BiConsumer<Session, FixMessage> onMessageCallback)
+    {
+        this.onMessageCallback = onMessageCallback;
+    }
+
     // ----------- EVENTS -----------
 
+    @Override
     public Action onMessage(
         final DirectBuffer buffer,
         final int offset,
@@ -111,6 +131,7 @@ public class FakeHandler
         parser.onMessage(buffer, offset, length);
         final FixMessage parsedMessage = acceptor.lastReceivedMessage();
         parsedMessage.sequenceIndex(sequenceIndex);
+        parsedMessage.messageType(messageType);
         parsedMessage.status(messageInfo.status());
         parsedMessage.isValid(messageInfo.isValid());
         acceptor.forSession(session);
@@ -122,9 +143,15 @@ public class FakeHandler
             lastMessageLength = length;
         }
 
+        if (onMessageCallback != null)
+        {
+            onMessageCallback.accept(session, parsedMessage);
+        }
+
         return CONTINUE;
     }
 
+    @Override
     public void onTimeout(final int libraryId, final Session session)
     {
         hasTimedOut = true;
@@ -154,6 +181,7 @@ public class FakeHandler
         timedOutSession = null;
     }
 
+    @Override
     public void onSlowStatus(final int libraryId, final Session session, final boolean hasBecomeSlow)
     {
         if (hasBecomeSlow)
@@ -166,17 +194,30 @@ public class FakeHandler
         }
     }
 
+    @Override
     public Action onDisconnect(final int libraryId, final Session session, final DisconnectReason reason)
     {
         sessions.remove(session);
         hasDisconnected = true;
+        if (onDisconnectCallback != null)
+        {
+            onDisconnectCallback.accept(session, reason);
+        }
         return CONTINUE;
     }
 
+    @Override
     public void onSessionStart(final Session session)
     {
+        onSessionStartCalled = true;
+
+        if (throwInOnSessionStart)
+        {
+            throw new RuntimeException(SESSION_START_ERROR);
+        }
     }
 
+    @Override
     public SessionHandler onSessionAcquired(final Session session, final SessionAcquiredInfo acquiredInfo)
     {
         if (spamLogonMessages && session.isActive())
@@ -202,6 +243,7 @@ public class FakeHandler
         return this;
     }
 
+    @Override
     public void onSessionExists(
         final FixLibrary library,
         final long sessionId,
@@ -219,8 +261,7 @@ public class FakeHandler
             library.requestSession(sessionId, NO_MESSAGE_REPLAY, NO_MESSAGE_REPLAY, 10_000);
         }
 
-        sessionExistsInfos.add(
-            new SessionExistsInfo(
+        sessionExistsInfos.add(new SessionExistsInfo(
             localCompId, remoteCompId, sessionId, logonReceivedSequenceNumber, logonSequenceIndex));
     }
 
@@ -267,6 +308,11 @@ public class FakeHandler
     public void clearSessionExistsInfos()
     {
         sessionExistsInfos.clear();
+    }
+
+    public SessionExistsInfo lastSessionExists()
+    {
+        return sessionExistsInfos.pollFirst();
     }
 
     long awaitSessionIdFor(
@@ -338,5 +384,15 @@ public class FakeHandler
     public MetaDataStatus lastSessionMetaDataStatus()
     {
         return lastSessionMetaDataStatus;
+    }
+
+    public void shouldThrowInOnSessionStart(final boolean throwInOnSessionStart)
+    {
+        this.throwInOnSessionStart = throwInOnSessionStart;
+    }
+
+    public boolean onSessionStartCalled()
+    {
+        return onSessionStartCalled;
     }
 }

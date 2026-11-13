@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,8 +27,13 @@ public final class Field implements Element
 {
     private final int number;
     private final String name;
+    private boolean isInParent;
     private Type type;
     private final List<Value> values;
+
+    // true iff you've got a shared dictionary and this field represents a type which is sometimes an enum and
+    // sometimes not.
+    private boolean hasSharedSometimesEnumClash;
 
     private Field associatedLengthField;
 
@@ -72,6 +77,7 @@ public final class Field implements Element
         this.type = type;
     }
 
+    @Override
     public String name()
     {
         return name;
@@ -98,14 +104,43 @@ public final class Field implements Element
         return !values.isEmpty();
     }
 
+    @Override
+    public boolean isCharOrBooleanBasedField()
+    {
+        return type.isCharBased || type.isBooleanBased;
+    }
+
+    public boolean hasSharedSometimesEnumClash()
+    {
+        return hasSharedSometimesEnumClash;
+    }
+
+    public void hasSharedSometimesEnumClash(final boolean hasSharedSometimesEnumClash)
+    {
+        this.hasSharedSometimesEnumClash = hasSharedSometimesEnumClash;
+    }
+
+    @Override
     public String toString()
     {
-        return "EnumField{" +
+        return "Field{" +
             "number=" + number +
             ", name='" + name + '\'' +
             ", type=" + type +
+            ", hasSharedSometimesEnumClash=" + hasSharedSometimesEnumClash +
+            ", associatedLengthField=" + associatedLengthField +
             ", values=" + values +
             '}';
+    }
+
+    public boolean isInParent()
+    {
+        return isInParent;
+    }
+
+    public void isInParent(final boolean isInParent)
+    {
+        this.isInParent = isInParent;
     }
 
     public enum Type
@@ -117,13 +152,20 @@ public final class Field implements Element
         NUMINGROUP(false, true, false, false, false),
         DAYOFMONTH(false, true, false, false, false),
 
+        // Custom LONG integer type. Not supported elsewhere by FIX AFAIK
+        LONG(false, true, false, false, false),
+
         // float types
         FLOAT(false, false, true, false, false),
         PRICE(false, false, true, false, false),
         PRICEOFFSET(false, false, true, false, false),
         QTY(false, false, true, false, false),
-        PERCENTAGE(false, false, true, false, false), // Percentage represented as a float
-        AMT(false, false, true, false, false), // Float amount, not to be confused with boolean Y/N AMT
+        // Not standard FIX but was observed in the wild in an IB's FIX 4.2 dictonary
+        QUANTITY(false, false, true, false, false),
+        // Percentage represented as a float
+        PERCENTAGE(false, false, true, false, false),
+        // Float amount, not to be confused with boolean Y/N AMT
+        AMT(false, false, true, false, false),
 
         CHAR(false, false, false, false, true),
 
@@ -146,7 +188,7 @@ public final class Field implements Element
         XMLDATA(false, false, false, false, false),
 
         // Boolean types
-        BOOLEAN(false, false, false, false, false),
+        BOOLEAN(false, false, false, false, false, true),
 
         UTCTIMESTAMP(true, false, false, false, false), // YYYYMMDD-HH:MM:SS or YYYYMMDD-HH:MM:SS.sss
         UTCTIMEONLY(true, false, false, false, false), // HH:MM:SS or HH:MM:SS.sss
@@ -161,6 +203,24 @@ public final class Field implements Element
         private final boolean isFloatBased;
         private final boolean isMultiValue;
         private final boolean isCharBased;
+        private final boolean isBooleanBased;
+
+        Type(
+            final boolean isStringBased,
+            final boolean isIntBased,
+            final boolean isFloatBased,
+            final boolean isMultiValue,
+            final boolean isCharBased,
+            final boolean isBooleanBased
+        )
+        {
+            this.isStringBased = isStringBased;
+            this.isIntBased = isIntBased;
+            this.isFloatBased = isFloatBased;
+            this.isMultiValue = isMultiValue;
+            this.isCharBased = isCharBased;
+            this.isBooleanBased = isBooleanBased;
+        }
 
         Type(
             final boolean isStringBased,
@@ -170,11 +230,7 @@ public final class Field implements Element
             final boolean isCharBased
         )
         {
-            this.isStringBased = isStringBased;
-            this.isIntBased = isIntBased;
-            this.isFloatBased = isFloatBased;
-            this.isMultiValue = isMultiValue;
-            this.isCharBased = isCharBased;
+            this(isStringBased, isIntBased, isFloatBased, isMultiValue, isCharBased, false);
         }
 
         public boolean isStringBased()
@@ -195,6 +251,11 @@ public final class Field implements Element
         public boolean isCharBased()
         {
             return isCharBased;
+        }
+
+        public boolean isCharOrBooleanBased()
+        {
+            return isCharBased || isBooleanBased;
         }
 
         public boolean isDataBased()
@@ -227,19 +288,32 @@ public final class Field implements Element
                 return UTCDATEONLY;
             }
 
-            return valueOf(name);
+            // Fix typo in bad dictionary
+            if ("STIRNG".equals(name))
+            {
+                return STRING;
+            }
+
+            // Standardise naming from bad dictionaries
+            if ("MONTH-YEAR".equals(name))
+            {
+                return MONTHYEAR;
+            }
+            if ("RATE".equals(name))
+            {
+                return PRICE;
+            }
+
+            return valueOf(name.trim());
         }
     }
-
-    // TODO: provide lookup table support for:
-    // CURRENCY
-    // EXCHANGE
-    // COUNTRY
 
     public static class Value
     {
         private final String representation;
         private final String description;
+
+        private List<String> alternativeNames;
 
         public Value(final String representation, final String description)
         {
@@ -257,6 +331,7 @@ public final class Field implements Element
             return description;
         }
 
+        @Override
         public boolean equals(final Object o)
         {
             if (o == null || getClass() != o.getClass())
@@ -269,6 +344,7 @@ public final class Field implements Element
                 Objects.equals(description, value.description);
         }
 
+        @Override
         public int hashCode()
         {
             int result = representation.hashCode();
@@ -276,11 +352,23 @@ public final class Field implements Element
             return result;
         }
 
+        public List<String> alternativeNames()
+        {
+            return alternativeNames;
+        }
+
+        public void alternativeNames(final List<String> alternativeNames)
+        {
+            this.alternativeNames = alternativeNames;
+        }
+
+        @Override
         public String toString()
         {
             return "Value{" +
                 "representation=" + representation +
                 ", description='" + description + '\'' +
+                ", alternativeNames='" + alternativeNames + '\'' +
                 '}';
         }
     }

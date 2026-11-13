@@ -17,15 +17,13 @@ package uk.co.real_logic.artio.binary_entrypoint;
 
 import b3.entrypoint.fixp.sbe.*;
 import io.aeron.ExclusivePublication;
+import io.aeron.logbuffer.BufferClaim;
 import org.agrona.MutableDirectBuffer;
 import org.agrona.concurrent.EpochNanoClock;
 import org.agrona.concurrent.UnsafeBuffer;
 import org.agrona.sbe.MessageEncoderFlyweight;
 import uk.co.real_logic.artio.DebugLogger;
-import uk.co.real_logic.artio.fixp.AbstractFixPProxy;
-import uk.co.real_logic.artio.fixp.FixPFirstMessageResponse;
-import uk.co.real_logic.artio.fixp.FixPContext;
-import uk.co.real_logic.artio.fixp.SimpleOpenFramingHeader;
+import uk.co.real_logic.artio.fixp.*;
 
 import java.nio.ByteBuffer;
 import java.util.function.Consumer;
@@ -38,14 +36,29 @@ public class BinaryEntryPointProxy extends AbstractFixPProxy
 {
     public static final int BINARY_ENTRYPOINT_HEADER_LENGTH = SOFH_LENGTH + MessageHeaderEncoder.ENCODED_LENGTH;
     private static final int BINARY_ENTRYPOINT_MESSAGE_HEADER = ARTIO_HEADER_LENGTH + BINARY_ENTRYPOINT_HEADER_LENGTH;
+
+    private static final int RETRANSMISSION_LEN = BINARY_ENTRYPOINT_HEADER_LENGTH +
+        RetransmissionEncoder.BLOCK_LENGTH;
+    private static final int SEQUENCE_LEN = BINARY_ENTRYPOINT_HEADER_LENGTH +
+        SequenceEncoder.BLOCK_LENGTH;
+    private static final int RETRANSMISSION_AND_SEQUENCE_LEN = ARTIO_HEADER_LENGTH + RETRANSMISSION_LEN + SEQUENCE_LEN;
+
     private static final int NEGOTIATE_REJECT_LENGTH = BINARY_ENTRYPOINT_HEADER_LENGTH +
         NegotiateRejectEncoder.BLOCK_LENGTH;
     private static final int ESTABLISH_REJECT_LENGTH = BINARY_ENTRYPOINT_HEADER_LENGTH +
         EstablishRejectEncoder.BLOCK_LENGTH;
+    private static final int NEGOTIATE_LENGTH = BINARY_ENTRYPOINT_HEADER_LENGTH +
+        NegotiateEncoder.BLOCK_LENGTH;
+    private static final int ESTABLISH_LENGTH = BINARY_ENTRYPOINT_HEADER_LENGTH +
+        EstablishEncoder.BLOCK_LENGTH;
+    private static final int BUSINESS_REJECT_LENGTH = BusinessMessageRejectEncoder.BLOCK_LENGTH +
+        BusinessMessageRejectEncoder.memoHeaderLength() + BusinessMessageRejectEncoder.textHeaderLength();
 
     private final MessageHeaderEncoder beMessageHeader = new MessageHeaderEncoder();
+    private final NegotiateEncoder negotiate = new NegotiateEncoder();
     private final NegotiateResponseEncoder negotiateResponse = new NegotiateResponseEncoder();
     private final NegotiateRejectEncoder negotiateReject = new NegotiateRejectEncoder();
+    private final EstablishEncoder establish = new EstablishEncoder();
     private final EstablishAckEncoder establishAck = new EstablishAckEncoder();
     private final EstablishRejectEncoder establishReject = new EstablishRejectEncoder();
     private final SequenceEncoder sequence = new SequenceEncoder();
@@ -55,6 +68,7 @@ public class BinaryEntryPointProxy extends AbstractFixPProxy
     private final NotAppliedEncoder notApplied = new NotAppliedEncoder();
     private final RetransmissionEncoder retransmission = new RetransmissionEncoder();
     private final RetransmitRejectEncoder retransmitReject = new RetransmitRejectEncoder();
+    private final BusinessMessageRejectEncoder businessMessageReject = new BusinessMessageRejectEncoder();
 
     private final Consumer<StringBuilder> negotiateResponseAppendTo = negotiateResponse::appendTo;
     private final Consumer<StringBuilder> negotiateRejectAppendTo = negotiateReject::appendTo;
@@ -67,19 +81,23 @@ public class BinaryEntryPointProxy extends AbstractFixPProxy
     private final Consumer<StringBuilder> notAppliedAppendTo = notApplied::appendTo;
     private final Consumer<StringBuilder> retransmissionAppendTo = retransmission::appendTo;
     private final Consumer<StringBuilder> retransmitRejectAppendTo = retransmitReject::appendTo;
+    private final Consumer<StringBuilder> businessMessageRejectAppendTo = businessMessageReject::appendTo;
 
     private final UnsafeBuffer buffer = new UnsafeBuffer();
     private final EpochNanoClock clock;
 
     public BinaryEntryPointProxy(
+        final BinaryEntryPointProtocol protocol,
+        final FixPMessageDissector dissector,
         final long connectionId,
         final ExclusivePublication publication,
         final EpochNanoClock clock)
     {
-        super(connectionId, publication);
+        super(protocol, dissector, connectionId, publication);
         this.clock = clock;
     }
 
+    @Override
     public long sendSequence(final long sessionId, final long nextSentSeqNo)
     {
         final SequenceEncoder sequence = this.sequence;
@@ -151,6 +169,36 @@ public class BinaryEntryPointProxy extends AbstractFixPProxy
             .lastIncomingSeqNo(lastIncomingSeqNo);
 
         DebugLogger.logSbeDecoder(FIXP_SESSION, "< ", establishAckAppendTo);
+
+        commit();
+
+        return position;
+    }
+
+    public long sendNegotiateReject(
+        final long sessionID,
+        final long sessionVerID,
+        final long requestTimestamp,
+        final long enteringFirm,
+        final NegotiationRejectCode negotiateRejectEncoder)
+    {
+        final NegotiateRejectEncoder negotiateReject = this.negotiateReject;
+
+        final long position = claimMessage(NegotiateRejectEncoder.BLOCK_LENGTH, negotiateReject, requestTimestamp);
+        if (position < 0)
+        {
+            return position;
+        }
+
+        negotiateReject
+            .sessionID(sessionID)
+            .sessionVerID(sessionVerID)
+            .requestTimestamp().time(requestTimestamp);
+        negotiateReject
+            .enteringFirm(enteringFirm)
+            .negotiationRejectCode(negotiateRejectEncoder);
+
+        DebugLogger.logSbeDecoder(FIXP_SESSION, "< ", establishRejectAppendTo);
 
         commit();
 
@@ -275,25 +323,59 @@ public class BinaryEntryPointProxy extends AbstractFixPProxy
         return position;
     }
 
-    public long sendRetransmission(
-        final long nextSeqNo, final long count, final long internalTimestampInNs, final long requestTimestampInNs)
+    public long sendRetransmissionWithSequence(
+        final long nextSeqNo,
+        final long count,
+        final long internalTimestampInNs,
+        final long requestTimestampInNs,
+        final long nextSentSeqNo)
     {
         final RetransmissionEncoder retransmission = this.retransmission;
+        final SequenceEncoder sequence = this.sequence;
+        final BufferClaim bufferClaim = this.bufferClaim;
 
-        final long position = claimMessage(RetransmissionEncoder.BLOCK_LENGTH, retransmission, internalTimestampInNs);
+        final long position = publication.tryClaim(RETRANSMISSION_AND_SEQUENCE_LEN, bufferClaim);
         if (position < 0)
         {
             return position;
         }
 
+        final MutableDirectBuffer buffer = bufferClaim.buffer();
+        int offset = bufferClaim.offset();
+
+        fixPMessage
+            .wrapAndApplyHeader(buffer, offset, messageHeader)
+            .connection(connectionId)
+            .sessionId(sessionId)
+            .enqueueTime(internalTimestampInNs);
+
+        offset += ARTIO_HEADER_LENGTH;
+
+        SimpleOpenFramingHeader.writeSofh(buffer, offset, RETRANSMISSION_LEN, BINARY_ENTRYPOINT_TYPE);
+        offset += SOFH_LENGTH;
+
+        offset = applyHeader(retransmission, buffer, offset);
+
         retransmission
+            .wrap(buffer, offset)
             .sessionID(sessionId)
             .requestTimestamp().time(requestTimestampInNs);
         retransmission
             .nextSeqNo(nextSeqNo)
             .count(count);
 
+        offset += RetransmissionEncoder.BLOCK_LENGTH;
+
+        SimpleOpenFramingHeader.writeSofh(buffer, offset, SEQUENCE_LEN, BINARY_ENTRYPOINT_TYPE);
+        offset += SOFH_LENGTH;
+        offset = applyHeader(sequence, buffer, offset);
+
+        sequence
+            .wrap(buffer, offset)
+            .nextSeqNo(nextSentSeqNo);
+
         DebugLogger.logSbeDecoder(FIXP_SESSION, "< ", retransmissionAppendTo);
+        DebugLogger.logSbeDecoder(FIXP_SESSION, "< ", sequenceAppendTo);
 
         commit();
 
@@ -323,6 +405,32 @@ public class BinaryEntryPointProxy extends AbstractFixPProxy
         return position;
     }
 
+    public long sendBusinessReject(
+        final long refSeqNum, final MessageType refMsgType, final long rejectRefID, final long businessRejectReason)
+    {
+        final BusinessMessageRejectEncoder businessMessageReject = this.businessMessageReject;
+
+        final long position = claimMessage(
+            BUSINESS_REJECT_LENGTH, businessMessageReject, clock.nanoTime());
+        if (position < 0)
+        {
+            return position;
+        }
+
+        businessMessageReject
+            .refSeqNum(refSeqNum)
+            .refMsgType(refMsgType)
+            .businessRejectRefID(rejectRefID)
+            .businessRejectReason(businessRejectReason);
+
+        DebugLogger.logSbeDecoder(FIXP_SESSION, "< ", businessMessageRejectAppendTo);
+
+        commit();
+
+        return position;
+    }
+
+    @Override
     public long claimMessage(
         final int messageLength,
         final MessageEncoderFlyweight message,
@@ -337,6 +445,7 @@ public class BinaryEntryPointProxy extends AbstractFixPProxy
             BINARY_ENTRYPOINT_TYPE);
     }
 
+    @Override
     protected int applyHeader(
         final MessageEncoderFlyweight message, final MutableDirectBuffer buffer, final int offset)
     {
@@ -350,8 +459,9 @@ public class BinaryEntryPointProxy extends AbstractFixPProxy
         return offset + beMessageHeader.encodedLength();
     }
 
+    @Override
     public ByteBuffer encodeReject(
-        final FixPContext fixPContext, final FixPFirstMessageResponse rejectReason)
+        final FixPContext fixPContext, final FixPFirstMessageResponse rejectReason, final Enum<?> rejectCode)
     {
         final BinaryEntryPointContext identification = (BinaryEntryPointContext)fixPContext;
 
@@ -362,13 +472,27 @@ public class BinaryEntryPointProxy extends AbstractFixPProxy
         {
             case CREDENTIALS:
                 isNegotiate = identification.fromNegotiate();
-                negotiationRejectCode = NegotiationRejectCode.CREDENTIALS;
-                establishRejectCode = EstablishRejectCode.CREDENTIALS;
+                if (rejectCode == null)
+                {
+                    negotiationRejectCode = NegotiationRejectCode.CREDENTIALS;
+                    establishRejectCode = EstablishRejectCode.CREDENTIALS;
+                }
+                else if (isNegotiate)
+                {
+                    negotiationRejectCode = (NegotiationRejectCode)rejectCode;
+                    establishRejectCode = null;
+                }
+                else
+                {
+                    establishRejectCode = (EstablishRejectCode)rejectCode;
+                    negotiationRejectCode = null;
+                }
                 break;
 
+            case NEGOTIATE_DUPLICATE_ID_BAD_VER:
             case NEGOTIATE_DUPLICATE_ID:
                 isNegotiate = true;
-                negotiationRejectCode = NegotiationRejectCode.DUPLICATE_ID;
+                negotiationRejectCode = NegotiationRejectCode.ALREADY_NEGOTIATED;
                 establishRejectCode = null;
                 break;
 
@@ -379,8 +503,15 @@ public class BinaryEntryPointProxy extends AbstractFixPProxy
                 break;
 
             case ESTABLISH_UNNEGOTIATED:
+            case ESTABLISH_DUPLICATE_ID:
                 isNegotiate = false;
                 negotiationRejectCode = null;
+                establishRejectCode = EstablishRejectCode.UNNEGOTIATED;
+                break;
+
+            case VER_ID_ENDED:
+                isNegotiate = identification.fromNegotiate();
+                negotiationRejectCode = NegotiationRejectCode.NEGOTIATE_NOT_ALLOWED;
                 establishRejectCode = EstablishRejectCode.UNNEGOTIATED;
                 break;
 
@@ -424,5 +555,50 @@ public class BinaryEntryPointProxy extends AbstractFixPProxy
         }
 
         return byteBuffer;
+    }
+
+    @Override
+    public byte[] encodeFirstMessage(final FixPContext fixPContext)
+    {
+        final BinaryEntryPointContext context = (BinaryEntryPointContext)fixPContext;
+        final byte[] bytes;
+        if (context.fromNegotiate())
+        {
+            bytes = initBytes(NEGOTIATE_LENGTH);
+
+            negotiate
+                .wrapAndApplyHeader(buffer, SOFH_LENGTH, beMessageHeader)
+                .sessionID(context.sessionID())
+                .sessionVerID(context.sessionVerID())
+                .timestamp().time(context.requestTimestampInNs());
+            negotiate.enteringFirm(context.enteringFirm());
+            negotiate.onbehalfFirm(NegotiateEncoder.onbehalfFirmNullValue());
+        }
+        else
+        {
+            bytes = initBytes(ESTABLISH_LENGTH);
+
+            establish
+                .wrapAndApplyHeader(buffer, SOFH_LENGTH, beMessageHeader)
+                .sessionID(context.sessionID())
+                .sessionVerID(context.sessionVerID())
+                .timestamp().time(context.requestTimestampInNs());
+            establish.keepAliveInterval().time(0);
+            establish
+                .nextSeqNo(EstablishEncoder.nextSeqNoNullValue())
+                .cancelOnDisconnectType(CancelOnDisconnectType.DO_NOT_CANCEL_ON_DISCONNECT_OR_TERMINATE)
+                .codTimeoutWindow().time(0);
+        }
+
+        return bytes;
+    }
+
+    private byte[] initBytes(final int length)
+    {
+        final byte[] bytes;
+        bytes = new byte[length];
+        buffer.wrap(bytes);
+        SimpleOpenFramingHeader.writeSofh(buffer, 0, NEGOTIATE_LENGTH, BINARY_ENTRYPOINT_TYPE);
+        return bytes;
     }
 }

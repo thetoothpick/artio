@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,6 +22,8 @@ import uk.co.real_logic.artio.engine.logger.LoggerUtil;
 
 import java.io.File;
 import java.nio.MappedByteBuffer;
+
+import static uk.co.real_logic.artio.AtomicBuffers.checkAligned;
 
 /**
  * A memory mapped file that stores the error buffer.
@@ -58,7 +60,7 @@ public final class MonitoringFile implements AutoCloseable
         }
 
         final AtomicBuffer mappedFile = new UnsafeBuffer(mappedByteBuffer);
-        errorBuffer = new UnsafeBuffer(mappedFile, 0, length);
+        errorBuffer = checkAligned(new UnsafeBuffer(mappedFile, 0, length));
     }
 
     public AtomicBuffer errorBuffer()
@@ -66,6 +68,7 @@ public final class MonitoringFile implements AutoCloseable
         return errorBuffer;
     }
 
+    @Override
     public void close()
     {
         IoUtil.unmap(mappedByteBuffer);

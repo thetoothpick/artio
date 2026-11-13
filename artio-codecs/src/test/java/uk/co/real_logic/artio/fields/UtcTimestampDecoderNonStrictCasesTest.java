@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,10 +15,11 @@
  */
 package uk.co.real_logic.artio.fields;
 
-import org.junit.Test;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
-import org.junit.runners.Parameterized.Parameters;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
+
+import java.util.stream.Stream;
 import uk.co.real_logic.artio.util.MutableAsciiBuffer;
 
 import java.time.LocalDateTime;
@@ -26,18 +27,16 @@ import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeFormatterBuilder;
-import java.util.Arrays;
-import java.util.Collection;
 
 import static java.nio.charset.StandardCharsets.US_ASCII;
 import static java.time.temporal.ChronoField.MICRO_OF_SECOND;
 import static java.time.temporal.ChronoField.MILLI_OF_SECOND;
 import static java.time.temporal.ChronoField.NANO_OF_SECOND;
 import static java.util.concurrent.TimeUnit.SECONDS;
-import static org.junit.Assert.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.params.provider.Arguments.of;
 import static uk.co.real_logic.artio.fields.UtcTimestampDecoder.LENGTH_WITH_NANOSECONDS;
 
-@RunWith(Parameterized.class)
 public class UtcTimestampDecoderNonStrictCasesTest
 {
     private static final DateTimeFormatter FORMATTER = new DateTimeFormatterBuilder()
@@ -66,32 +65,29 @@ public class UtcTimestampDecoderNonStrictCasesTest
         return SECONDS.toNanos(utc.toEpochSecond()) + utc.getLong(NANO_OF_SECOND);
     }
 
-    private final int length;
-    private final long expectedEpochMillis;
-    private final long expectedEpochMicros;
-    private final long expectedEpochNanos;
-    private final MutableAsciiBuffer buffer;
-    private final String timestamp;
+    private int length;
+    private long expectedEpochMillis;
+    private long expectedEpochMicros;
+    private long expectedEpochNanos;
+    private MutableAsciiBuffer buffer;
 
-    @Parameters(name = "{0}")
-    public static Collection<Object[]> data()
+    public static Stream<Arguments> data()
     {
-        return Arrays.asList(
-            new Object[] {"20150225-17:51:32"},
-            new Object[] {"20150225-17:51:32.1"},
-            new Object[] {"20600225-17:51:32.123"},
-            new Object[] {"20600225-17:51:32.1234"},
-            new Object[] {"20600225-17:51:32.12345"},
-            new Object[] {"20600225-17:51:32.123456"},
-            new Object[] {"20600225-17:51:32.1234567"},
-            new Object[] {"20600225-17:51:32.12345678"},
-            new Object[] {"20600225-17:51:32.123456789"}
+        return Stream.of(
+            of("20150225-17:51:32"),
+            of("20150225-17:51:32.1"),
+            of("20600225-17:51:32.123"),
+            of("20600225-17:51:32.1234"),
+            of("20600225-17:51:32.12345"),
+            of("20600225-17:51:32.123456"),
+            of("20600225-17:51:32.1234567"),
+            of("20600225-17:51:32.12345678"),
+            of("20600225-17:51:32.123456789")
         );
     }
 
-    public UtcTimestampDecoderNonStrictCasesTest(final String timestamp)
+    private void prepareTimestamp(final String timestamp)
     {
-        this.timestamp = timestamp;
         this.length = timestamp.length();
 
         expectedEpochMillis = toEpochMillis(timestamp);
@@ -103,25 +99,32 @@ public class UtcTimestampDecoderNonStrictCasesTest
         buffer.putBytes(1, bytes);
     }
 
-    @Test
-    public void shouldParseTimestampMillis()
+    @ParameterizedTest
+    @MethodSource(value = "data")
+    public void shouldParseTimestampMillis(final String timestamp)
     {
+        prepareTimestamp(timestamp);
         final long epochMillis = UtcTimestampDecoder.decode(buffer, 1, length, false);
-        assertEquals("Failed Millis testcase for: " + timestamp, expectedEpochMillis, epochMillis);
+        assertEquals(expectedEpochMillis, epochMillis, "Failed Millis testcase for: " + timestamp);
     }
 
-    @Test
-    public void shouldParseTimestampMicros()
+    @ParameterizedTest
+    @MethodSource(value = "data")
+    public void shouldParseTimestampMicros(final String timestamp)
     {
+        prepareTimestamp(timestamp);
         final long epochMicros = UtcTimestampDecoder.decodeMicros(buffer, 1, length, false);
-        assertEquals("Failed Micros testcase for: " + buffer.getAscii(1, length),
-            expectedEpochMicros, epochMicros);
+        assertEquals(expectedEpochMicros, epochMicros,
+            "Failed Micros testcase for: " + buffer.getAscii(1, length));
     }
 
-    @Test
-    public void shouldParseTimestampNanos()
+    @ParameterizedTest
+    @MethodSource(value = "data")
+    public void shouldParseTimestampNanos(final String timestamp)
     {
+        prepareTimestamp(timestamp);
         final long epochNanos = UtcTimestampDecoder.decodeNanos(buffer, 1, length, false);
-        assertEquals("Failed Nanos testcase for: " + timestamp, expectedEpochNanos, epochNanos);
+        assertEquals(expectedEpochNanos, epochNanos,
+            "Failed Nanos testcase for: " + timestamp);
     }
 }

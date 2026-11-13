@@ -15,7 +15,17 @@
  */
 package uk.co.real_logic.artio.library;
 
+import uk.co.real_logic.artio.Reply;
+import uk.co.real_logic.artio.messages.ThrottleConfigurationStatus;
+
+import java.util.function.BooleanSupplier;
+
 public interface FixPSessionOwner
 {
+    void enqueueTask(BooleanSupplier task);
+
     void remove(InternalFixPConnection connection);
+
+    Reply<ThrottleConfigurationStatus> messageThrottle(
+        long sessionId, int throttleWindowInMs, int throttleLimitOfMessages);
 }

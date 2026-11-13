@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,12 +15,16 @@
  */
 package uk.co.real_logic.artio.engine;
 
-import io.aeron.*;
+import io.aeron.ChannelUriStringBuilder;
+import io.aeron.ExclusivePublication;
+import io.aeron.Image;
+import io.aeron.Subscription;
 import io.aeron.archive.client.AeronArchive;
 import org.agrona.collections.Long2LongHashMap;
 import org.agrona.concurrent.AgentInvoker;
 import org.agrona.concurrent.status.ReadablePosition;
 import uk.co.real_logic.artio.*;
+import uk.co.real_logic.artio.engine.framer.EngineStreamInfo;
 import uk.co.real_logic.artio.engine.framer.FramerContext;
 import uk.co.real_logic.artio.engine.framer.LibraryInfo;
 import uk.co.real_logic.artio.timing.EngineTimers;
@@ -35,7 +39,7 @@ import static uk.co.real_logic.artio.dictionary.generation.Exceptions.suppressin
 /**
  * A FIX Engine is a process in the gateway that accepts or initiates FIX connections and
  * hands them off to different FixLibrary instances. The engine can replicate and/or durably
- * store streams2 of FIX messages for replay, archival, administrative or analytics purposes.
+ * store streams of FIX messages for replay, archival, administrative or analytics purposes.
  * <p>
  * Each engine can have one or more associated libraries that manage sessions and perform business
  * logic. These may run in the same JVM process or a different JVM process.
@@ -44,7 +48,7 @@ import static uk.co.real_logic.artio.dictionary.generation.Exceptions.suppressin
  */
 public final class FixEngine extends GatewayProcess
 {
-    private static final Object CLOSE_MUTEX = new Object();
+    private final Object closeMutex = new Object();
 
     public static final int ENGINE_LIBRARY_ID = 0;
 
@@ -72,12 +76,7 @@ public final class FixEngine extends GatewayProcess
      */
     public static FixEngine launch(final EngineConfiguration configuration)
     {
-        synchronized (CLOSE_MUTEX)
-        {
-            configuration.conclude();
-
-            return new FixEngine(configuration).launch();
-        }
+        return new FixEngine(configuration);
     }
 
     /**
@@ -107,19 +106,27 @@ public final class FixEngine extends GatewayProcess
     }
 
     /**
-     * Unbinds the acceptor socket, and disconnects currently connected TCP connections if requested.
+     * Unbinds the acceptor socket, and optionally starts an end of day
+     * operation if requested. The end of day operation performs the following
+     * steps:
+     *
+     * <ol>
+     *     <li>Sends a logout message to every FIX counter-party</li>
+     *     <li>Disconnects each FIX connection after it receives either a logout reply
+     *     or the heartbeat timeout elapses.</li>
+     *     <li>Disconnects the libraries from the engine</li>
+     * </ol>
      *
      * If the reply is <code>null</code> then the query hasn't been enqueued and the operation
      * should be retried on a duty cycle.
      *
-     * @param disconnect if currently connected connections need to be disconnected
+     * @param endOfDay if currently connected connections need to be logged out and disconnected
      * @return the reply object, or null if the request hasn't been successfully enqueued.
      */
-    public Reply<?> unbind(final boolean disconnect)
+    public Reply<?> unbind(final boolean endOfDay)
     {
-        return framerContext.unbind(disconnect);
+        return framerContext.unbind(endOfDay);
     }
-
 
     /**
      * Binds the acceptor socket to the configured address. This only needs to be called if you had called
@@ -171,15 +178,15 @@ public final class FixEngine extends GatewayProcess
     }
 
     /**
-     * This method resets the state of the of the FixEngine that also performs usual end of day processing
-     * operations. It must can only be called when the FixEngine object has been closed. These are:
+     * This method resets the state of the FixEngine that also performs usual end of day processing
+     * operations. These are:
      *
      * <ol>
-     *     <li>Reset and optionally back up all Artio state (including session ids and sequence numbers</li>
+     *     <li>Reset and optionally back up all Artio state (including session ids and sequence numbers).</li>
      *     <li>Truncate any recordings associated with this engine instance.</li>
      * </ol>
      *
-     * Blocks until the operation is complete.
+     * It must only be called when the FixEngine object has been closed. Blocks until the operation is complete.
      *
      * @param backupLocation the directory that you wish to copy Artio's session state over to for later inspection.
      *                       If this is null no backup of data will be performed. If the directory exists it will be
@@ -275,53 +282,59 @@ public final class FixEngine extends GatewayProcess
 
     private FixEngine(final EngineConfiguration configuration)
     {
-        try
         {
-            this.configuration = configuration;
-
-            duplicateEngineChecker = new DuplicateEngineChecker(
-                configuration.duplicateEngineTimeoutInMs(),
-                configuration.logFileDir(),
-                configuration.errorIfDuplicateEngineDetected());
-            duplicateEngineChecker.check();
-
-            scheduler = configuration.scheduler();
-            scheduler.configure(configuration.aeronContext());
-            init(configuration);
-            timers = new EngineTimers(configuration.epochNanoClock(), fixCounters.negativeTimestamps());
-            final AeronArchive.Context archiveContext = configuration.aeronArchiveContext();
-            final AeronArchive aeronArchive =
-                configuration.logAnyMessages() ? AeronArchive.connect(archiveContext.aeron(aeron)) : null;
-            recordingCoordinator = new RecordingCoordinator(
-                aeron,
-                aeronArchive,
-                configuration,
-                configuration.archiverIdleStrategy(),
-                errorHandler);
-
-            final ExclusivePublication replayPublication = replayPublication();
-            engineContext = new EngineContext(
-                configuration,
-                errorHandler,
-                replayPublication,
-                fixCounters,
-                aeron,
-                aeronArchive,
-                recordingCoordinator);
-            engineContext.catchupIndices();
-            initFramer(configuration, fixCounters, replayPublication.sessionId());
-            initMonitoringAgent(timers.all(), configuration, aeronArchive, duplicateEngineChecker);
-        }
-        catch (final Exception e)
-        {
-            if (engineContext != null)
+            try
             {
-                engineContext.completeDuringStartup();
+                configuration.conclude();
+                this.configuration = configuration;
+                duplicateEngineChecker = new DuplicateEngineChecker(
+                    configuration.duplicateEngineTimeoutInMs(),
+                    configuration.logFileDir(),
+                    configuration.errorIfDuplicateEngineDetected());
+                duplicateEngineChecker.check();
+
+                scheduler = configuration.scheduler();
+                scheduler.configure(configuration.aeronContext());
+                init(configuration, ENGINE_LIBRARY_ID);
+                timers = new EngineTimers(configuration.epochNanoClock(), fixCounters.negativeTimestamps());
+                final AeronArchive.Context archiveContext = configuration.aeronArchiveContext();
+                final AeronArchive aeronArchive =
+                    configuration.logAnyMessages() ? AeronArchive.connect(archiveContext.aeron(aeron)) : null;
+                recordingCoordinator = new RecordingCoordinator(
+                    aeron,
+                    aeronArchive,
+                    configuration,
+                    configuration.archiverIdleStrategy(),
+                    errorHandler);
+
+                final ExclusivePublication replayPublication = replayPublication();
+                engineContext = new EngineContext(
+                    configuration,
+                    errorHandler,
+                    replayPublication,
+                    fixCounters,
+                    aeron,
+                    aeronArchive,
+                    recordingCoordinator);
+                engineContext.catchupIndices();
+                initFramer(configuration, fixCounters, replayPublication.sessionId());
+                initMonitoringAgent(timers.all(), configuration, aeronArchive, duplicateEngineChecker);
+
+                recordingCoordinator.monitoringAgent(monitoringAgent);
+
+                launch();
             }
+            catch (final Exception e)
+            {
+                if (engineContext != null)
+                {
+                    engineContext.completeDuringStartup();
+                }
 
-            suppressingClose(this, e);
+                suppressingClose(this, e);
 
-            throw e;
+                throw e;
+            }
         }
     }
 
@@ -342,7 +355,6 @@ public final class FixEngine extends GatewayProcess
             engineContext,
             errorHandler,
             replayImage("replay", replaySessionId),
-            replayImage("slow-replay", replaySessionId),
             timers,
             aeron.conductorAgentInvoker(),
             recordingCoordinator,
@@ -353,8 +365,11 @@ public final class FixEngine extends GatewayProcess
 
     private Image replayImage(final String name, final int replaySessionId)
     {
+        final String channel = new ChannelUriStringBuilder(IPC_CHANNEL)
+            .alias(name)
+            .build();
         final Subscription subscription = aeron.addSubscription(
-            IPC_CHANNEL, configuration.outboundReplayStream());
+            channel, configuration.outboundReplayStream());
         StreamInformation.print(name, subscription, configuration);
 
         // Await replay publication
@@ -389,7 +404,7 @@ public final class FixEngine extends GatewayProcess
             errorHandler,
             framerContext.framer(),
             engineContext.indexingAgent(),
-            monitoringAgent,
+            monitoringCompositeAgent,
             conductorAgent(),
             recordingCoordinator);
 
@@ -411,9 +426,10 @@ public final class FixEngine extends GatewayProcess
      *
      * This does not remove files associated with the engine, that are persistent over multiple runs of the engine.
      */
+    @Override
     public void close()
     {
-        synchronized (CLOSE_MUTEX)
+        synchronized (closeMutex)
         {
             if (!isClosed)
             {
@@ -457,6 +473,12 @@ public final class FixEngine extends GatewayProcess
      * details. This means that if there are less than a segment's worth of messages that can be
      * freed up then no space is pruned.
      *
+     * The recordingIdToMinimumPrunePositions parameter can be useful for users who are doing a Streaming backup of the
+     * Aeron Archiver log. If you are streaming off the recorded streams from Artio to an external location, eg: a cloud
+     * backup location, then this parameter allows you to stop Artio from accidentally pruning away parts of the
+     * recorded Stream that this streaming backup is processing by providing the position that this streaming
+     * recording is at.
+     *
      * @param recordingIdToMinimumPrunePositions the minimum positions to prune or <code>null</code> otherwise.
      *                                           If you're archiving segments of the
      *                                           Aeron archive log then this parameter can be used in order to stop
@@ -487,8 +509,37 @@ public final class FixEngine extends GatewayProcess
     }
 
     // Exceptions here are always on internal FixEngine threads and should not cause those threads to terminate.
+    @Override
     protected boolean shouldRethrowExceptionInErrorHandler()
     {
         return false;
+    }
+
+    /**
+     * Start a reproduction. In order for this operation to be used then
+     * {@link EngineConfiguration#reproduceInbound(long, long)} must be enabled.
+     *
+     * @return the reply for the operation. This reply completes when the reproduction completes or results in an error
+     * if there is an error running the reproduction operation.
+     */
+    public Reply<?> startReproduction()
+    {
+        if (configuration.reproductionConfiguration() == null)
+        {
+            throw new IllegalStateException(
+                "Engine must be configured to support reproduction");
+        }
+
+        return framerContext.startReproduction();
+    }
+
+    /**
+     * Returns information about engine streams. Internal API for testing.
+     *
+     * @return a reply that should eventually contain information about engine streams or {@code null} if back-pressured
+     */
+    Reply<EngineStreamInfo> engineStreamInfo()
+    {
+        return framerContext.engineStreamInfo();
     }
 }

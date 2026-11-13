@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited., Monotonic Ltd.
+ * Copyright 2015-2025 Real Logic Limited., Monotonic Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,10 +20,12 @@ import org.agrona.AsciiSequenceView;
 import org.agrona.DirectBuffer;
 import org.agrona.concurrent.UnsafeBuffer;
 import uk.co.real_logic.artio.AbstractDebugAppender.ThreadLocalAppender;
+import uk.co.real_logic.artio.engine.ByteBufferUtil;
 import uk.co.real_logic.artio.messages.*;
 import uk.co.real_logic.artio.util.CharFormatter;
 
 import java.nio.ByteBuffer;
+import java.util.Arrays;
 import java.util.Iterator;
 import java.util.ServiceLoader;
 import java.util.function.Consumer;
@@ -39,6 +41,9 @@ public final class DebugLogger
     private static final AbstractDebugAppender APPENDER;
     private static final ThreadLocal<ThreadLocalLogger> THREAD_LOCAL = ThreadLocal.withInitial(ThreadLocalLogger::new);
 
+    public static final boolean IS_REPLAY_LOG_TAG_ENABLED = isEnabled(LogTag.REPLAY);
+    public static final boolean IS_REPLAY_ATTEMPT_ENABLED = isEnabled(LogTag.REPLAY_ATTEMPT);
+
     static
     {
         final ServiceLoader<AbstractDebugAppender> loader = ServiceLoader.load(AbstractDebugAppender.class);
@@ -46,6 +51,12 @@ public final class DebugLogger
         if (it.hasNext())
         {
             APPENDER = it.next();
+            if (DEBUG_FILE != null)
+            {
+                System.err.println("Warning: -D" + DEBUG_FILE_PROPERTY + " has been set, despite a custom " +
+                    "AbstractDebugAppender (" + APPENDER.getClass() + ") being configured via the service loader. " +
+                    "The file property will be ignored by Artio and your customer appender used instead.");
+            }
         }
         else
         {
@@ -72,6 +83,22 @@ public final class DebugLogger
         final int length)
     {
         if (isEnabled(tag))
+        {
+            formatter.clear().with(value);
+            THREAD_LOCAL.get().log(tag, formatter, buffer, offset, length);
+        }
+    }
+
+    public static void logFixMessage(
+        final LogTag tag,
+        final long messageType,
+        final CharFormatter formatter,
+        final int value,
+        final DirectBuffer buffer,
+        final int offset,
+        final int length)
+    {
+        if (isEnabled(tag) && isEnabled(messageType))
         {
             formatter.clear().with(value);
             THREAD_LOCAL.get().log(tag, formatter, buffer, offset, length);
@@ -110,6 +137,26 @@ public final class DebugLogger
     public static void logSbeMessage(
         final LogTag tag,
         final RedactSequenceUpdateEncoder encoder)
+    {
+        if (isEnabled(tag))
+        {
+            THREAD_LOCAL.get().logSbeMessage(tag, encoder);
+        }
+    }
+
+    public static void logSbeMessage(
+        final LogTag tag,
+        final ReplayCompleteEncoder encoder)
+    {
+        if (isEnabled(tag))
+        {
+            THREAD_LOCAL.get().logSbeMessage(tag, encoder);
+        }
+    }
+
+    public static void logSbeMessage(
+        final LogTag tag,
+        final SeqIndexSyncEncoder encoder)
     {
         if (isEnabled(tag))
         {
@@ -239,11 +286,12 @@ public final class DebugLogger
 
     public static void logSbeMessage(
         final LogTag tag,
-        final ApplicationHeartbeatEncoder encoder)
+        final ApplicationHeartbeatEncoder encoder,
+        final int streamId)
     {
         if (isEnabled(tag))
         {
-            THREAD_LOCAL.get().logSbeMessage(tag, encoder);
+            THREAD_LOCAL.get().logSbeMessage(tag, encoder, streamId);
         }
     }
 
@@ -464,7 +512,7 @@ public final class DebugLogger
 
     public static void logSbeMessage(
         final LogTag tag,
-        final ThrottleNotificationEncoder encoder)
+        final StartReplayEncoder encoder)
     {
         if (isEnabled(tag))
         {
@@ -474,9 +522,21 @@ public final class DebugLogger
 
     public static void logSbeMessage(
         final LogTag tag,
+        final long messageType,
+        final ThrottleNotificationEncoder encoder)
+    {
+        if (isEnabled(tag) && isEnabled(messageType))
+        {
+            THREAD_LOCAL.get().logSbeMessage(tag, encoder);
+        }
+    }
+
+    public static void logSbeMessage(
+        final LogTag tag,
+        final long messageType,
         final ThrottleRejectEncoder encoder)
     {
-        if (isEnabled(tag))
+        if (isEnabled(tag) && isEnabled(messageType))
         {
             THREAD_LOCAL.get().logSbeMessage(tag, encoder);
         }
@@ -490,6 +550,20 @@ public final class DebugLogger
         final int length)
     {
         if (isEnabled(tag))
+        {
+            THREAD_LOCAL.get().log(tag, prefixString, buffer, offset, length);
+        }
+    }
+
+    public static void logFixMessage(
+        final LogTag tag,
+        final long messageType,
+        final String prefixString,
+        final DirectBuffer buffer,
+        final int offset,
+        final int length)
+    {
+        if (isEnabled(tag) && isEnabled(messageType))
         {
             THREAD_LOCAL.get().log(tag, prefixString, buffer, offset, length);
         }
@@ -664,6 +738,17 @@ public final class DebugLogger
         }
     }
 
+    public static void log(
+        final LogTag tag,
+        final String formatString,
+        final Object[] first)
+    {
+        if (isEnabled(tag))
+        {
+            THREAD_LOCAL.get().log(tag, String.format(formatString, Arrays.toString(first)));
+        }
+    }
+
     static String threadName()
     {
         return Thread.currentThread().getName();
@@ -694,6 +779,21 @@ public final class DebugLogger
         return DEBUG_PRINT_MESSAGES && DEBUG_TAGS.contains(tag);
     }
 
+    private static boolean isEnabled(final long messageType)
+    {
+        return DEBUG_PRINT_MESSAGE_TYPES == null || DEBUG_PRINT_MESSAGE_TYPES.contains(messageType);
+    }
+
+    public static boolean inboundFixMessage(final int templateId)
+    {
+        return FixMessageDecoder.TEMPLATE_ID == templateId || ThrottleNotificationDecoder.TEMPLATE_ID == templateId;
+    }
+
+    public static boolean outboundFixMessage(final int templateId)
+    {
+        return FixMessageDecoder.TEMPLATE_ID == templateId || ThrottleRejectDecoder.TEMPLATE_ID == templateId;
+    }
+
     static class ThreadLocalLogger
     {
         // Library -> Engine
@@ -716,6 +816,7 @@ public final class DebugLogger
         private final ThrottleConfigurationDecoder throttleConfiguration = new ThrottleConfigurationDecoder();
         private final ThrottleConfigurationReplyDecoder throttleConfigurationReply =
             new ThrottleConfigurationReplyDecoder();
+        private final SeqIndexSyncDecoder seqIndexSync = new SeqIndexSyncDecoder();
 
         // Engine -> Library
         private final ErrorDecoder error = new ErrorDecoder();
@@ -743,6 +844,10 @@ public final class DebugLogger
         private final DisconnectDecoder disconnect = new DisconnectDecoder();
         private final RedactSequenceUpdateDecoder redactSequenceUpdate = new RedactSequenceUpdateDecoder();
 
+        // Replayer
+        private final StartReplayDecoder startReplay = new StartReplayDecoder();
+        private final ReplayCompleteDecoder replayComplete = new ReplayCompleteDecoder();
+
         private final StringBuilder builder = new StringBuilder();
 
         private byte[] bytes = new byte[0];
@@ -759,15 +864,51 @@ public final class DebugLogger
             appender = APPENDER.makeLocalAppender();
         }
 
+        public void logSbeMessage(final LogTag tag, final StartReplayEncoder encoder)
+        {
+            appendStart();
+            startReplay.wrap(
+                encoder.buffer(),
+                encoder.offset(),
+                RedactSequenceUpdateEncoder.BLOCK_LENGTH,
+                RedactSequenceUpdateEncoder.SCHEMA_VERSION);
+            startReplay.appendTo(builder);
+            finish(tag);
+        }
+
+        public void logSbeMessage(final LogTag tag, final ReplayCompleteEncoder encoder)
+        {
+            appendStart();
+            replayComplete.wrap(
+                encoder.buffer(),
+                encoder.offset(),
+                RedactSequenceUpdateEncoder.BLOCK_LENGTH,
+                RedactSequenceUpdateEncoder.SCHEMA_VERSION);
+            replayComplete.appendTo(builder);
+            finish(tag);
+        }
+
         public void logSbeMessage(final LogTag tag, final RedactSequenceUpdateEncoder encoder)
         {
             appendStart();
             redactSequenceUpdate.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 RedactSequenceUpdateEncoder.BLOCK_LENGTH,
                 RedactSequenceUpdateEncoder.SCHEMA_VERSION);
             redactSequenceUpdate.appendTo(builder);
+            finish(tag);
+        }
+
+        public void logSbeMessage(final LogTag tag, final SeqIndexSyncEncoder encoder)
+        {
+            appendStart();
+            seqIndexSync.wrap(
+                encoder.buffer(),
+                encoder.offset(),
+                SeqIndexSyncEncoder.BLOCK_LENGTH,
+                SeqIndexSyncEncoder.SCHEMA_VERSION);
+            seqIndexSync.appendTo(builder);
             finish(tag);
         }
 
@@ -776,7 +917,7 @@ public final class DebugLogger
             appendStart();
             throttleConfiguration.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 ThrottleConfigurationEncoder.BLOCK_LENGTH,
                 ThrottleConfigurationEncoder.SCHEMA_VERSION);
             throttleConfiguration.appendTo(builder);
@@ -788,7 +929,7 @@ public final class DebugLogger
             appendStart();
             throttleConfigurationReply.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 ThrottleConfigurationReplyEncoder.BLOCK_LENGTH,
                 ThrottleConfigurationReplyEncoder.SCHEMA_VERSION);
             throttleConfigurationReply.appendTo(builder);
@@ -800,7 +941,7 @@ public final class DebugLogger
             appendStart();
             manageSession.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 ManageSessionEncoder.BLOCK_LENGTH,
                 ManageSessionEncoder.SCHEMA_VERSION);
             manageSession.appendTo(builder);
@@ -814,7 +955,7 @@ public final class DebugLogger
             appendStart();
             disconnect.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 DisconnectEncoder.BLOCK_LENGTH,
                 DisconnectEncoder.SCHEMA_VERSION);
             disconnect.appendTo(builder);
@@ -828,7 +969,7 @@ public final class DebugLogger
             appendStart();
             connect.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 ConnectEncoder.BLOCK_LENGTH,
                 ConnectEncoder.SCHEMA_VERSION);
             connect.appendTo(builder);
@@ -842,7 +983,7 @@ public final class DebugLogger
             appendStart();
             resetSessionIds.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 ResetSessionIdsEncoder.BLOCK_LENGTH,
                 ResetSessionIdsEncoder.SCHEMA_VERSION);
             resetSessionIds.appendTo(builder);
@@ -856,7 +997,7 @@ public final class DebugLogger
             appendStart();
             resetSequenceNumber.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 ResetSequenceNumberEncoder.BLOCK_LENGTH,
                 ResetSequenceNumberEncoder.SCHEMA_VERSION);
             resetSequenceNumber.appendTo(builder);
@@ -870,7 +1011,7 @@ public final class DebugLogger
             appendStart();
             resetLibrarySequenceNumber.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 ResetLibrarySequenceNumberEncoder.BLOCK_LENGTH,
                 ResetLibrarySequenceNumberEncoder.SCHEMA_VERSION);
             resetLibrarySequenceNumber.appendTo(builder);
@@ -884,7 +1025,7 @@ public final class DebugLogger
             appendStart();
             requestDisconnect.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 RequestDisconnectEncoder.BLOCK_LENGTH,
                 RequestDisconnectEncoder.SCHEMA_VERSION);
             requestDisconnect.appendTo(builder);
@@ -898,7 +1039,7 @@ public final class DebugLogger
             appendStart();
             midConnectionDisconnect.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 MidConnectionDisconnectEncoder.BLOCK_LENGTH,
                 MidConnectionDisconnectEncoder.SCHEMA_VERSION);
             midConnectionDisconnect.appendTo(builder);
@@ -912,7 +1053,7 @@ public final class DebugLogger
             appendStart();
             initiateConnection.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 InitiateConnectionEncoder.BLOCK_LENGTH,
                 InitiateConnectionEncoder.SCHEMA_VERSION);
             initiateConnection.appendTo(builder);
@@ -926,7 +1067,7 @@ public final class DebugLogger
             appendStart();
             error.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 ErrorEncoder.BLOCK_LENGTH,
                 ErrorEncoder.SCHEMA_VERSION);
             error.appendTo(builder);
@@ -935,12 +1076,16 @@ public final class DebugLogger
 
         public void logSbeMessage(
             final LogTag tag,
-            final ApplicationHeartbeatEncoder encoder)
+            final ApplicationHeartbeatEncoder encoder,
+            final int streamId)
         {
+            final StringBuilder builder = this.builder;
             appendStart();
+            builder.append("streamId=");
+            builder.append(streamId);
             applicationHeartbeat.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 ApplicationHeartbeatEncoder.BLOCK_LENGTH,
                 ApplicationHeartbeatEncoder.SCHEMA_VERSION);
             applicationHeartbeat.appendTo(builder);
@@ -954,7 +1099,7 @@ public final class DebugLogger
             appendStart();
             libraryConnect.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 LibraryConnectEncoder.BLOCK_LENGTH,
                 LibraryConnectEncoder.SCHEMA_VERSION);
             libraryConnect.appendTo(builder);
@@ -968,7 +1113,7 @@ public final class DebugLogger
             appendStart();
             releaseSession.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 ReleaseSessionEncoder.BLOCK_LENGTH,
                 ReleaseSessionEncoder.SCHEMA_VERSION);
             releaseSession.appendTo(builder);
@@ -982,7 +1127,7 @@ public final class DebugLogger
             appendStart();
             releaseSessionReply.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 ReleaseSessionReplyEncoder.BLOCK_LENGTH,
                 ReleaseSessionReplyEncoder.SCHEMA_VERSION);
             releaseSessionReply.appendTo(builder);
@@ -996,7 +1141,7 @@ public final class DebugLogger
             appendStart();
             requestSession.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 RequestSessionEncoder.BLOCK_LENGTH,
                 RequestSessionEncoder.SCHEMA_VERSION);
             requestSession.appendTo(builder);
@@ -1010,7 +1155,7 @@ public final class DebugLogger
             appendStart();
             requestSessionReply.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 RequestSessionReplyEncoder.BLOCK_LENGTH,
                 RequestSessionReplyEncoder.SCHEMA_VERSION);
             requestSessionReply.appendTo(builder);
@@ -1024,7 +1169,7 @@ public final class DebugLogger
             appendStart();
             libraryTimeout.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 LibraryTimeoutEncoder.BLOCK_LENGTH,
                 LibraryTimeoutEncoder.SCHEMA_VERSION);
             libraryTimeout.appendTo(builder);
@@ -1038,7 +1183,7 @@ public final class DebugLogger
             appendStart();
             controlNotification.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 ControlNotificationEncoder.BLOCK_LENGTH,
                 ControlNotificationEncoder.SCHEMA_VERSION);
             controlNotification.appendTo(builder);
@@ -1052,7 +1197,7 @@ public final class DebugLogger
             appendStart();
             slowStatusNotification.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 SlowStatusNotificationEncoder.BLOCK_LENGTH,
                 SlowStatusNotificationEncoder.SCHEMA_VERSION);
             slowStatusNotification.appendTo(builder);
@@ -1066,7 +1211,7 @@ public final class DebugLogger
             appendStart();
             followerSessionRequest.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 FollowerSessionRequestEncoder.BLOCK_LENGTH,
                 FollowerSessionRequestEncoder.SCHEMA_VERSION);
             followerSessionRequest.appendTo(builder);
@@ -1080,7 +1225,7 @@ public final class DebugLogger
             appendStart();
             followerSessionReply.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 FollowerSessionReplyEncoder.BLOCK_LENGTH,
                 FollowerSessionReplyEncoder.SCHEMA_VERSION);
             followerSessionReply.appendTo(builder);
@@ -1094,7 +1239,7 @@ public final class DebugLogger
             appendStart();
             endOfDay.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 EndOfDayEncoder.BLOCK_LENGTH,
                 EndOfDayEncoder.SCHEMA_VERSION);
             endOfDay.appendTo(builder);
@@ -1108,7 +1253,7 @@ public final class DebugLogger
             appendStart();
             writeMetaData.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 WriteMetaDataEncoder.BLOCK_LENGTH,
                 WriteMetaDataEncoder.SCHEMA_VERSION);
             writeMetaData.appendTo(builder);
@@ -1122,7 +1267,7 @@ public final class DebugLogger
             appendStart();
             writeMetaDataReply.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 WriteMetaDataReplyEncoder.BLOCK_LENGTH,
                 WriteMetaDataReplyEncoder.SCHEMA_VERSION);
             writeMetaDataReply.appendTo(builder);
@@ -1136,7 +1281,7 @@ public final class DebugLogger
             appendStart();
             readMetaData.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 ReadMetaDataEncoder.BLOCK_LENGTH,
                 ReadMetaDataEncoder.SCHEMA_VERSION);
             readMetaData.appendTo(builder);
@@ -1150,7 +1295,7 @@ public final class DebugLogger
             appendStart();
             readMetaDataReply.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 ReadMetaDataReplyEncoder.BLOCK_LENGTH,
                 ReadMetaDataReplyEncoder.SCHEMA_VERSION);
             readMetaDataReply.appendTo(builder);
@@ -1164,7 +1309,7 @@ public final class DebugLogger
             appendStart();
             replayMessages.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 ReplayMessagesEncoder.BLOCK_LENGTH,
                 ReplayMessagesEncoder.SCHEMA_VERSION);
             replayMessages.appendTo(builder);
@@ -1178,7 +1323,7 @@ public final class DebugLogger
             appendStart();
             replayMessagesReply.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 ReplayMessagesReplyEncoder.BLOCK_LENGTH,
                 ReplayMessagesReplyEncoder.SCHEMA_VERSION);
             replayMessagesReply.appendTo(builder);
@@ -1192,7 +1337,7 @@ public final class DebugLogger
             appendStart();
             validResendRequest.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 ValidResendRequestEncoder.BLOCK_LENGTH,
                 ValidResendRequestEncoder.SCHEMA_VERSION);
             validResendRequest.appendTo(builder);
@@ -1206,7 +1351,7 @@ public final class DebugLogger
             appendStart();
             libraryExtendPosition.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 LibraryExtendPositionEncoder.BLOCK_LENGTH,
                 LibraryExtendPositionEncoder.SCHEMA_VERSION);
             libraryExtendPosition.appendTo(builder);
@@ -1218,7 +1363,7 @@ public final class DebugLogger
             appendStart();
             initiateILinkConnection.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 InitiateILinkConnectionEncoder.BLOCK_LENGTH,
                 InitiateILinkConnectionEncoder.SCHEMA_VERSION);
             initiateILinkConnection.appendTo(builder);
@@ -1230,7 +1375,7 @@ public final class DebugLogger
             appendStart();
             iLinkConnect.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 ILinkConnectEncoder.BLOCK_LENGTH,
                 ILinkConnectEncoder.SCHEMA_VERSION);
             iLinkConnect.appendTo(builder);
@@ -1242,7 +1387,7 @@ public final class DebugLogger
             appendStart();
             throttleReject.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 ThrottleRejectEncoder.BLOCK_LENGTH,
                 ThrottleRejectEncoder.SCHEMA_VERSION);
             throttleReject.appendTo(builder);
@@ -1254,7 +1399,7 @@ public final class DebugLogger
             appendStart();
             throttleNotification.wrap(
                 encoder.buffer(),
-                encoder.initialOffset(),
+                encoder.offset(),
                 ThrottleNotificationEncoder.BLOCK_LENGTH,
                 ThrottleNotificationEncoder.SCHEMA_VERSION);
             throttleNotification.appendTo(builder);
@@ -1307,6 +1452,9 @@ public final class DebugLogger
             }
             else
             {
+                final int origLimit = byteBuffer.limit();
+                ByteBufferUtil.limit(byteBuffer, offset + length);
+
                 builder.append('{');
                 for (int i = 0; i < length; i++)
                 {
@@ -1320,6 +1468,7 @@ public final class DebugLogger
                         builder.append(", ");
                     }
                 }
+                byteBuffer.limit(origLimit);
             }
             finish(tag);
         }

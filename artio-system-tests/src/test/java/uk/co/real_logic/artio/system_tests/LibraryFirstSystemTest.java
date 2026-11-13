@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,8 +15,10 @@
  */
 package uk.co.real_logic.artio.system_tests;
 
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+
 import uk.co.real_logic.artio.library.FixLibrary;
 
 import java.util.concurrent.ExecutionException;
@@ -31,7 +33,7 @@ public class LibraryFirstSystemTest extends AbstractGatewayToGatewaySystemTest
 {
     private final ExecutorService threadPool = Executors.newFixedThreadPool(2);
 
-    @Before
+    @BeforeEach
     public void launch() throws ExecutionException, InterruptedException
     {
         mediaDriver = launchMediaDriver();
@@ -52,7 +54,8 @@ public class LibraryFirstSystemTest extends AbstractGatewayToGatewaySystemTest
         connectSessions();
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void engineAndLibraryPairsShouldBeRestartableOutOfOrder()
         throws ExecutionException, InterruptedException
     {

@@ -17,13 +17,16 @@ package uk.co.real_logic.artio.engine.framer;
 
 import org.agrona.ErrorHandler;
 import org.agrona.concurrent.EpochNanoClock;
+import uk.co.real_logic.artio.fixp.FixPProtocol;
+import uk.co.real_logic.artio.fixp.FixPRejectRefIdExtractor;
+import uk.co.real_logic.artio.messages.DisconnectReason;
 import uk.co.real_logic.artio.protocol.GatewayPublication;
 import uk.co.real_logic.artio.util.MutableAsciiBuffer;
 
-public class AcceptorFixPReceiverEndPoint extends FixPReceiverEndPoint
+class AcceptorFixPReceiverEndPoint extends FixPReceiverEndPoint
 {
-    private static final int FINISHED_SENDING_TEMPLATE_ID = 10;
-    private static final int FINISHED_RECEIVING_TEMPLATE_ID = 11;
+    private final int finishedSendingTemplateId;
+    private final int finishedReceivingTemplateId;
 
     private boolean requiresAuthentication = true;
 
@@ -37,7 +40,10 @@ public class AcceptorFixPReceiverEndPoint extends FixPReceiverEndPoint
         final int libraryId,
         final EpochNanoClock epochNanoClock,
         final long correlationId,
-        final short encodingType)
+        final FixPProtocol protocol,
+        final int throttleWindowInMs,
+        final int throttleLimitOfMessages,
+        final FixPRejectRefIdExtractor fixPRejectRefIdExtractor)
     {
         super(
             connectionId,
@@ -49,23 +55,42 @@ public class AcceptorFixPReceiverEndPoint extends FixPReceiverEndPoint
             libraryId,
             epochNanoClock,
             correlationId,
-            encodingType);
+            protocol.encodingType(),
+            throttleWindowInMs,
+            throttleLimitOfMessages,
+            fixPRejectRefIdExtractor);
+        finishedSendingTemplateId = protocol.finishedSendingTemplateId();
+        finishedReceivingTemplateId = protocol.finishedReceivingTemplateId();
     }
 
+    @Override
     void checkMessage(final MutableAsciiBuffer buffer, final int offset, final int messageSize)
     {
         if (requiresAuthentication && pendingAcceptorLogon == null)
         {
-            pendingAcceptorLogon = fixPGatewaySession.onLogon(buffer, offset, messageSize, channel, framer);
+            try
+            {
+                pendingAcceptorLogon = fixPGatewaySession.onLogon(buffer, offset, messageSize, channel, framer);
+            }
+            catch (final IllegalArgumentException e)
+            {
+                completeDisconnect(DisconnectReason.FIRST_MESSAGE_NOT_LOGON);
+            }
         }
 
-        final int templateId = readTemplateId(buffer, offset);
-        if (templateId == FINISHED_SENDING_TEMPLATE_ID || templateId == FINISHED_RECEIVING_TEMPLATE_ID)
+        final int finishedSendingTemplateId = this.finishedSendingTemplateId;
+        if (finishedSendingTemplateId != FixPProtocol.DOES_NOT_SUPPORT_SEQUENCE_FINISHING_TEMPLATE_ID)
         {
-            fixPGatewaySession.onEndSequence();
+            final int templateId = readTemplateId(buffer, offset);
+
+            if (templateId == finishedSendingTemplateId || templateId == finishedReceivingTemplateId)
+            {
+                fixPGatewaySession.onEndSequence();
+            }
         }
     }
 
+    @Override
     boolean requiresAuthentication()
     {
         return requiresAuthentication;
@@ -74,8 +99,10 @@ public class AcceptorFixPReceiverEndPoint extends FixPReceiverEndPoint
     void authenticated()
     {
         requiresAuthentication = false;
+        framer.receiverEndPointPollingOptional(connectionId);
     }
 
+    @Override
     void trackDisconnect()
     {
     }

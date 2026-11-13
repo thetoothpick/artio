@@ -15,9 +15,9 @@
  */
 package uk.co.real_logic.artio.dictionary.generation;
 
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
-import static org.junit.Assert.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static uk.co.real_logic.artio.dictionary.generation.GenerationUtil.constantName;
 
 public class GenerationUtilTest
@@ -26,11 +26,5 @@ public class GenerationUtilTest
     public void shouldReplaceIDWithIdInConstantName()
     {
         assertEquals("DEFAULT_APPL_VER_ID", constantName("DefaultApplVerID"));
-    }
-
-    @Test
-    public void shouldDropGroupCounterForNumberOfElementsInReaptingGroupConstant()
-    {
-        assertEquals("NO_MSG_TYPES", constantName("NoMsgTypesGroupCounter"));
     }
 }

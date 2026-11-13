@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,6 +19,8 @@ import org.agrona.concurrent.IdleStrategy;
 import org.agrona.concurrent.NoOpIdleStrategy;
 import org.agrona.concurrent.YieldingIdleStrategy;
 
+import java.util.concurrent.TimeUnit;
+
 import static io.aeron.CommonContext.IPC_CHANNEL;
 import static uk.co.real_logic.artio.CommonConfiguration.backoffIdleStrategy;
 
@@ -33,10 +35,15 @@ public final class BenchmarkConfiguration
     public static final boolean LOG_OUTBOUND_MESSAGES = Boolean.getBoolean("fix.benchmark.log_out");
     public static final int WARMUP_MESSAGES = Integer.getInteger("fix.benchmark.warmup", 10_000);
     public static final int MESSAGES_EXCHANGED = Integer.getInteger("fix.benchmark.messages", 50_000);
-    public static final boolean REJECT_LOGON = Boolean.getBoolean("fix.benchmark.reject_logon");
+    public static final boolean BAD_LOGON = Boolean.getBoolean("fix.benchmark.bad_logon");
+    public static final boolean BAD_LOGON_NO_LINGER = Boolean.getBoolean("fix.benchmark.bad_logon_no_linger");
     public static final int MAX_MESSAGES_IN_FLIGHT = Integer.getInteger("fix.benchmark.max_messages_in_flight", 20);
     public static final int SEND_RATE_PER_SECOND = Integer.getInteger("fix.benchmark.send_rate_sec", 1_000);
-    public static final int NUMBER_OF_SESSIONS = Integer.getInteger("fix.benchmark.num_sessions", 1);
+    public static final int NUMBER_OF_SESSIONS = Integer.getInteger("fix.benchmark.num_sessions", 25);
+    public static final long LOGOUT_LINGER_TIMEOUT_IN_MS = Long.getLong(
+        "fix.benchmark.logout_linger_timeout", TimeUnit.SECONDS.toMillis(2));
+    public static final String VALID_PASSWORD = "password";
+    public static final char[] VALID_PASSWORD_CHARS = VALID_PASSWORD.toCharArray();
 
     static IdleStrategy idleStrategy()
     {

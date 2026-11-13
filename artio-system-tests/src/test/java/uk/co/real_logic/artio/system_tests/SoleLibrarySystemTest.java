@@ -15,72 +15,106 @@
  */
 package uk.co.real_logic.artio.system_tests;
 
-import org.junit.Before;
-import org.junit.Test;
-import uk.co.real_logic.artio.engine.ConnectedSessionInfo;
-import uk.co.real_logic.artio.engine.EngineConfiguration;
-import uk.co.real_logic.artio.engine.FixEngine;
-import uk.co.real_logic.artio.engine.SessionInfo;
+import uk.co.real_logic.artio.Reply;
+import uk.co.real_logic.artio.engine.*;
 import uk.co.real_logic.artio.engine.framer.LibraryInfo;
+import uk.co.real_logic.artio.library.FixLibrary;
 import uk.co.real_logic.artio.library.LibraryConfiguration;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
 import java.util.List;
 
 import static org.hamcrest.MatcherAssert.assertThat;
-import static org.hamcrest.Matchers.*;
-import static org.junit.Assert.*;
+import static org.hamcrest.Matchers.allOf;
+import static org.hamcrest.Matchers.contains;
+import static org.hamcrest.Matchers.hasItem;
+import static org.junit.jupiter.api.Assertions.*;
 import static uk.co.real_logic.artio.FixMatchers.hasConnectionId;
 import static uk.co.real_logic.artio.FixMatchers.hasSessionId;
 import static uk.co.real_logic.artio.TestFixtures.launchMediaDriver;
+import static uk.co.real_logic.artio.Timing.DEFAULT_TIMEOUT_IN_MS;
+import static uk.co.real_logic.artio.Timing.assertEventuallyTrue;
 import static uk.co.real_logic.artio.messages.InitialAcceptedSessionOwner.SOLE_LIBRARY;
 import static uk.co.real_logic.artio.messages.SessionState.ACTIVE;
 import static uk.co.real_logic.artio.system_tests.SystemTestUtil.*;
 
 public class SoleLibrarySystemTest extends AbstractGatewayToGatewaySystemTest
 {
+    private LockStepFramerEngineScheduler scheduler;
 
-    @Before
-    public void launch()
+    private void launch()
+    {
+        launch(true, false);
+    }
+
+    private void launch(final boolean logMessages, final boolean useScheduler)
     {
         mediaDriver = launchMediaDriver();
+
 
         final EngineConfiguration acceptingConfig = acceptingConfig(port, ACCEPTOR_ID, INITIATOR_ID, nanoClock)
             .deleteLogFileDirOnStart(true)
             .initialAcceptedSessionOwner(SOLE_LIBRARY);
+
+        if (useScheduler)
+        {
+            scheduler = new LockStepFramerEngineScheduler();
+            acceptingConfig.scheduler(scheduler);
+        }
+
         acceptingEngine = FixEngine.launch(acceptingConfig);
 
-        final EngineConfiguration initiatingConfig = initiatingConfig(libraryAeronPort, nanoClock);
-        initiatingConfig.deleteLogFileDirOnStart(true);
-        initiatingConfig.initialAcceptedSessionOwner(SOLE_LIBRARY);
+        final EngineConfiguration initiatingConfig =
+            initiatingConfig(libraryAeronPort, nanoClock).deleteLogFileDirOnStart(true)
+            .initialAcceptedSessionOwner(SOLE_LIBRARY)
+            .logInboundMessages(logMessages)
+            .logOutboundMessages(logMessages);
         initiatingEngine = FixEngine.launch(initiatingConfig);
 
         final LibraryConfiguration acceptingLibraryConfig = acceptingLibraryConfig(acceptingHandler, nanoClock);
-        acceptingLibrary = connect(acceptingLibraryConfig);
+        acceptingLibrary = FixLibrary.connect(acceptingLibraryConfig);
+        assertEventuallyTrue(
+            () -> "Unable to connect to engine",
+            () ->
+            {
+                if (useScheduler)
+                {
+                    scheduler.invokeFramer();
+                }
+                acceptingLibrary.poll(LIBRARY_LIMIT);
+
+                return acceptingLibrary.isConnected();
+            },
+            DEFAULT_TIMEOUT_IN_MS,
+            acceptingLibrary::close);
         initiatingLibrary = connect(initiatingLibraryConfig(libraryAeronPort, initiatingHandler, nanoClock));
-        testSystem = new TestSystem(acceptingLibrary, initiatingLibrary);
+        testSystem = new TestSystem(scheduler, acceptingLibrary, initiatingLibrary);
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void shouldOnlyHandOffSessionToApplicationWhenConnected()
     {
-        connectSessions();
+        launch();
 
-        acceptingSession = acceptingHandler.lastSession();
-        assertNotNull("should automatically receive the session upon logon In SOLE_LIBRARY mode",
-            acceptingSession);
+        connectAndAcquire();
+        assertNotNull(acceptingSession, "should automatically receive the session upon logon In SOLE_LIBRARY mode");
         assertEquals(ACTIVE, acceptingSession.state());
 
-        assertFalse("should not receive session exists callback in sole library mode",
-            acceptingHandler.hasSeenSession());
+        assertFalse(acceptingHandler.hasSeenSession(),
+            "should not receive session exists callback in sole library mode");
 
         assertSequenceResetTimeAtLatestLogon(acceptingSession);
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void shouldSupportUnreleasedOfflineSessionsInSoleLibraryMode()
     {
-        connectSessions();
-        acceptingSession = acceptingHandler.lastSession();
+        launch();
+
+        connectAndAcquire();
         disconnectSessions();
         assertThat(acceptingLibrary.sessions(), hasItem(acceptingSession));
         final long sessionId = acceptingSession.id();
@@ -97,19 +131,130 @@ public class SoleLibrarySystemTest extends AbstractGatewayToGatewaySystemTest
 
         connectSessions();
         assertEquals(ACTIVE, acceptingSession.state());
+        assertEquals(1, acceptingSession.lastSentMsgSeqNum());
     }
 
-    // Replicates a bug reported in issue #361 where reconnecting initiators can't reconnect.
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
-    public void shouldNotAffectUseAsInitiator()
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
+    public void shouldSupportManySessionReconnections()
+    {
+        launch(false, true);
+
+        // 300 > number in groupSizeEncoding
+        for (int i = 0; i < 300; i++)
+        {
+            connectAndAcquire();
+            messagesCanBeExchanged();
+            disconnectSessions();
+        }
+
+        assertThat(acceptingLibrary.sessions(), hasItem(acceptingSession));
+        final long sessionId = acceptingSession.id();
+        assertCountersClosed(false, acceptingSession);
+
+        assertOfflineSession(sessionId, acceptingSession);
+        assertCountersClosed(false, acceptingSession);
+
+        final long testDeadlineMs = System.currentTimeMillis() + 10_000;
+
+        // trigger library timeout
+        while (acceptingLibrary.isConnected())
+        {
+            acceptingLibrary.poll(10);
+            initiatingLibrary.poll(10);
+
+            if (System.currentTimeMillis() > testDeadlineMs)
+            {
+                fail("Failed to disconnect library");
+            }
+        }
+
+        // library reconnect
+        while (!acceptingLibrary.isConnected())
+        {
+            testSystem.poll();
+
+            if (System.currentTimeMillis() > testDeadlineMs)
+            {
+                fail("Failed to reconnect library");
+            }
+        }
+
+        connectAndAcquire();
+        assertEquals(ACTIVE, acceptingSession.state());
+        messagesCanBeExchanged();
+    }
+
+    private void connectAndAcquire()
     {
         connectSessions();
         acceptingSession = acceptingHandler.lastSession();
+    }
+
+    // Replicates a bug reported in issue #361 where reconnecting initiators can't reconnect.
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
+    public void shouldAllowReconnectingInitiatorsToReconnect()
+    {
+        launch();
+
+        connectAndAcquire();
         messagesCanBeExchanged();
         disconnectSessions();
 
         connectSessions();
         messagesCanBeExchanged();
         disconnectSessions();
+    }
+
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
+    public void shouldInitiatingLibraryDisconnectSessionOnLibraryTimeout()
+    {
+        // Equivalent invariant tested in Engine mode in NoLoggingGatewayToGatewaySystemTest
+        launch(false, false);
+
+        connectAndAcquire();
+        acceptingMessagesCanBeExchanged();
+
+        // timeout initiatingLibrary
+        testSystem.remove(initiatingLibrary);
+        awaitLibraryDisconnect(initiatingEngine, testSystem);
+
+        assertSessionDisconnected(acceptingSession);
+        assertDisconnectedLibraryAndConnection("Initiating Engine did not disconnect session", initiatingEngine);
+    }
+
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
+    public void shouldAcceptingLibraryDisconnectSessionOnLibraryTimeout()
+    {
+        // Equivalent invariant tested in Engine mode in NoLoggingGatewayToGatewaySystemTest
+        launch(false, false);
+
+        connectAndAcquire();
+        acceptingMessagesCanBeExchanged();
+
+        // timeout acceptingLibrary
+        testSystem.remove(acceptingLibrary);
+        awaitLibraryDisconnect(acceptingEngine, testSystem);
+
+        assertSessionDisconnected(initiatingSession);
+        assertDisconnectedLibraryAndConnection("Accepting Engine did not disconnect session", acceptingEngine);
+    }
+
+    private static void assertDisconnectedLibraryAndConnection(final String message, final FixEngine fixEngine)
+    {
+        assertEventuallyTrue(message,
+            () ->
+            {
+                final Reply<List<LibraryInfo>> libraryInfoReply = fixEngine.libraries();
+                assertTrue(libraryInfoReply.hasCompleted());
+                final List<LibraryInfo> libraryInfo = libraryInfoReply.resultIfPresent();
+                assertEquals(1, libraryInfo.size());
+                final LibraryInfo libInfo = libraryInfo.get(0);
+                assertEquals(0, libInfo.sessions().size());
+            }
+        );
     }
 }

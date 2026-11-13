@@ -35,9 +35,11 @@ import uk.co.real_logic.artio.decoder.AbstractTestRequestDecoder;
 import uk.co.real_logic.artio.decoder.AbstractUserRequestDecoder;
 import uk.co.real_logic.artio.decoder.SessionHeaderDecoder;
 import uk.co.real_logic.artio.dictionary.FixDictionary;
+import uk.co.real_logic.artio.dictionary.Generated;
 import uk.co.real_logic.artio.dictionary.ir.Aggregate;
 import uk.co.real_logic.artio.dictionary.ir.Dictionary;
 
+import static uk.co.real_logic.artio.dictionary.generation.GenerationUtil.GENERATED_ANNOTATION;
 import static uk.co.real_logic.artio.dictionary.generation.GenerationUtil.fileHeader;
 import static uk.co.real_logic.artio.dictionary.generation.GenerationUtil.importFor;
 
@@ -54,6 +56,11 @@ class FixDictionaryGenerator
         "    public SessionHeaderDecoder makeHeaderDecoder()\n" +
         "    {\n" +
         "        return new HeaderDecoder();\n" +
+        "    }\n" +
+        "\n" +
+        "    public SessionHeaderEncoder makeHeaderEncoder()\n" +
+        "    {\n" +
+        "        return new HeaderEncoder();\n" +
         "    }\n" +
         "\n";
 
@@ -87,6 +94,11 @@ class FixDictionaryGenerator
 
     public void generate()
     {
+        if (dictionary.shared())
+        {
+            return;
+        }
+
         final Set<String> allMessageNames = dictionary.messages()
             .stream().map(Aggregate::name).collect(Collectors.toSet());
 
@@ -116,6 +128,9 @@ class FixDictionaryGenerator
                 out.append(importFor(AbstractBusinessMessageRejectEncoder.class));
                 addEncoderImport(out, encoderPackage, "BusinessMessageReject", allMessageNames, sb);
 
+                out.append(importFor(SessionHeaderEncoder.class));
+                out.append(importFor(encoderPackage + ".HeaderEncoder"));
+
                 out.append(importFor(AbstractLogonDecoder.class));
                 addDecoderImport(out, decoderPackage, "Logon", allMessageNames, sb);
                 out.append(importFor(AbstractLogoutDecoder.class));
@@ -136,7 +151,9 @@ class FixDictionaryGenerator
 
                 out.append(importFor(SessionHeaderDecoder.class));
                 out.append(importFor(decoderPackage + ".HeaderDecoder"));
+                out.append(importFor(Generated.class));
 
+                out.append("\n" + GENERATED_ANNOTATION);
                 out.append(sb.toString());
             }
             catch (final IOException e)

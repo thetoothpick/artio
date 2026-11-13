@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,24 +17,36 @@ package uk.co.real_logic.artio.system_tests;
 
 import org.agrona.CloseHelper;
 import org.agrona.collections.IntHashSet;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+
+import uk.co.real_logic.artio.decoder.SessionHeaderDecoder;
+import uk.co.real_logic.artio.dictionary.FixDictionary;
 import uk.co.real_logic.artio.engine.EngineConfiguration;
+import uk.co.real_logic.artio.engine.logger.FixMessageConsumer;
+import uk.co.real_logic.artio.engine.logger.FixMessagePredicate;
+import uk.co.real_logic.artio.engine.logger.FixMessagePredicates;
 import uk.co.real_logic.artio.library.LibraryConfiguration;
 
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.locks.LockSupport;
+import java.util.function.Predicate;
 
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.*;
 import static uk.co.real_logic.artio.TestFixtures.largeTestReqId;
 import static uk.co.real_logic.artio.TestFixtures.launchMediaDriver;
+import static uk.co.real_logic.artio.engine.logger.FixMessageConsumerValidator.validateFixMessageConsumer;
+import static uk.co.real_logic.artio.engine.logger.FixMessagePredicates.*;
 import static uk.co.real_logic.artio.system_tests.SystemTestUtil.*;
 
 public class ArchiveScannerIntegrationTest extends AbstractGatewayToGatewaySystemTest
 {
     private final FakeConnectHandler fakeConnectHandler = new FakeConnectHandler();
 
-    @Before
+    @BeforeEach
     public void launch()
     {
         delete(ACCEPTOR_LOGS);
@@ -53,7 +65,8 @@ public class ArchiveScannerIntegrationTest extends AbstractGatewayToGatewaySyste
         connectSessions();
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void canScanArchiveWhilstGatewayRunningOneStream()
     {
         setupAndExchangeMessages();
@@ -61,7 +74,8 @@ public class ArchiveScannerIntegrationTest extends AbstractGatewayToGatewaySyste
         assertOutboundArchiveContainsMessages("hi");
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void canScanArchiveWhilstGatewayRunningBothStreams()
     {
         setupAndExchangeMessages();
@@ -69,14 +83,15 @@ public class ArchiveScannerIntegrationTest extends AbstractGatewayToGatewaySyste
         assertArchiveContainsBothMessages("hi");
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void canScanArchiveForLargeMessages()
     {
         acquireAcceptingSession();
 
         final String testReqID = largeTestReqId();
 
-        sendTestRequest(acceptingSession, testReqID);
+        sendTestRequest(testSystem, acceptingSession, testReqID);
 
         assertReceivedSingleHeartbeat(testSystem, acceptingOtfAcceptor, testReqID);
 
@@ -85,7 +100,8 @@ public class ArchiveScannerIntegrationTest extends AbstractGatewayToGatewaySyste
         assertOutboundArchiveContainsMessages(largeTestReqId());
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void canScanArchiveWhenGatewayStoppedOneStream()
     {
         setupAndExchangeMessages();
@@ -95,7 +111,8 @@ public class ArchiveScannerIntegrationTest extends AbstractGatewayToGatewaySyste
         assertOutboundArchiveContainsMessages("hi");
     }
 
-    @Test(timeout = TEST_TIMEOUT_IN_MS)
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
     public void canScanArchiveWhenGatewayStoppedBothStreams()
     {
         setupAndExchangeMessages();
@@ -103,6 +120,65 @@ public class ArchiveScannerIntegrationTest extends AbstractGatewayToGatewaySyste
         closeLibrariesAndEngines();
 
         assertArchiveContainsBothMessages("hi");
+    }
+
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
+    public void canIndexScanArchiveClosed()
+    {
+        canIndexScanArchive(true);
+    }
+
+    @Test
+    @Timeout(TEST_TIMEOUT_IN_MS)
+    public void canIndexScanArchiveNotClosed()
+    {
+        canIndexScanArchive(false);
+    }
+
+    private void canIndexScanArchive(final boolean close)
+    {
+        messagesCanBeExchanged(initiatingSession, initiatingOtfAcceptor, testReqId());
+
+        LockSupport.parkNanos(1);
+
+        final long start = nanoClock.nanoTime();
+
+        final String testReqID = testReqId();
+        messagesCanBeExchanged(initiatingSession, initiatingOtfAcceptor, testReqID);
+
+        final long end = nanoClock.nanoTime();
+
+        LockSupport.parkNanos(2);
+
+        messagesCanBeExchanged(initiatingSession, initiatingOtfAcceptor, testReqId());
+
+        if (close)
+        {
+            closeLibrariesAndEngines();
+        }
+
+        final EngineConfiguration configuration = acceptingEngine.configuration();
+        final IntHashSet queryStreamIds = new IntHashSet();
+        queryStreamIds.add(configuration.outboundLibraryStream());
+
+        final List<String> messages = new ArrayList<>();
+        final FixMessageConsumer fixMessageConsumer =
+            (message, buffer, offset, length, header) ->
+            messages.add(validateFixMessageConsumer(message, buffer, offset, length));
+
+        final FixDictionary fixDictionary = FixDictionary.of(FixDictionary.findDefault());
+        final FixMessagePredicate timeFilter = FixMessagePredicates.between(start, end + 1);
+        final Predicate<SessionHeaderDecoder> sessionFilter = targetCompIdOf(INITIATOR_ID)
+            .or(senderCompIdOf(ACCEPTOR_ID));
+        final FixMessagePredicate predicate = whereHeader(fixDictionary, sessionFilter)
+            .and(timeFilter);
+
+        SystemTestUtil.getMessagesFromArchive(configuration, queryStreamIds,
+            FixMessagePredicates.filterBy(fixMessageConsumer, predicate),
+            null, false);
+
+        assertThat(messages, hasSize(1));
     }
 
     private void closeLibrariesAndEngines()

@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited.
+ * Copyright 2015-2025 Real Logic Limited.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
  */
 package uk.co.real_logic.artio;
 
+import org.agrona.concurrent.EpochNanoClock;
 import uk.co.real_logic.artio.protocol.GatewayPublication;
 import uk.co.real_logic.artio.protocol.NotConnectedException;
 import uk.co.real_logic.artio.util.CharFormatter;
@@ -38,6 +39,7 @@ public final class LivenessDetector
 
     private final GatewayPublication publication;
     private final Runnable onDisconnect;
+    private final EpochNanoClock clock;
     private final int libraryId;
     private final long replyTimeoutInMs;
     private final long sendIntervalInMs;
@@ -49,13 +51,14 @@ public final class LivenessDetector
     private int state;
 
     public static LivenessDetector forEngine(
-        final GatewayPublication publication,
+        final GatewayPublication inboundPublication,
         final int libraryId,
         final long replyTimeoutInMs,
-        final long timeInMs)
+        final long timeInMs,
+        final EpochNanoClock clock)
     {
         final LivenessDetector detector = new LivenessDetector(
-            publication, libraryId, replyTimeoutInMs, CONNECTED, NONE);
+            inboundPublication, libraryId, replyTimeoutInMs, CONNECTED, NONE, clock);
         detector.latestNextReceiveTimeInMs = timeInMs + replyTimeoutInMs;
         detector.heartbeat(timeInMs);
         return detector;
@@ -65,10 +68,11 @@ public final class LivenessDetector
         final GatewayPublication publication,
         final int libraryId,
         final long replyTimeoutInMs,
-        final Runnable onDisconnect)
+        final Runnable onDisconnect,
+        final EpochNanoClock clock)
     {
         return new LivenessDetector(
-            publication, libraryId, replyTimeoutInMs, AWAITING_CONNECT, onDisconnect);
+            publication, libraryId, replyTimeoutInMs, AWAITING_CONNECT, onDisconnect, clock);
     }
 
     private LivenessDetector(
@@ -76,7 +80,8 @@ public final class LivenessDetector
         final int libraryId,
         final long replyTimeoutInMs,
         final int state,
-        final Runnable onDisconnect)
+        final Runnable onDisconnect,
+        final EpochNanoClock clock)
     {
         this.publication = publication;
         this.libraryId = libraryId;
@@ -84,6 +89,7 @@ public final class LivenessDetector
         this.state = state;
         this.sendIntervalInMs = replyTimeoutInMs / SEND_INTERVAL_FRACTION;
         this.onDisconnect = onDisconnect;
+        this.clock = clock;
     }
 
     public boolean isConnected()
@@ -139,14 +145,13 @@ public final class LivenessDetector
         latestNextReceiveTimeInMs = timeInMs + replyTimeoutInMs;
     }
 
-    private boolean heartbeat(final long timeInMs)
+    private void heartbeat(final long timeInMs)
     {
         try
         {
-            if (publication.saveApplicationHeartbeat(libraryId) >= 0)
+            if (publication.saveApplicationHeartbeat(libraryId, clock.nanoTime()) >= 0)
             {
                 nextSendTimeInMs = timeInMs + sendIntervalInMs;
-                return true;
             }
         }
         catch (final NotConnectedException ex)
@@ -157,17 +162,6 @@ public final class LivenessDetector
             }
 
             disconnect();
-        }
-
-        return false;
-    }
-
-    public void onReconnect(final long timeInMs)
-    {
-        onHeartbeat(timeInMs);
-        if (!heartbeat(timeInMs))
-        {
-            nextSendTimeInMs = 0;
         }
     }
 }

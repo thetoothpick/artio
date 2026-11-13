@@ -1,9 +1,15 @@
 <?xml version="1.0"?>
-<!DOCTYPE module PUBLIC "-//Puppy Crawl//DTD Check Configuration 1.2//EN"
+<!DOCTYPE module PUBLIC "-//Puppy Crawl//DTD Check Configuration 1.3//EN"
         "https://checkstyle.org/dtds/configuration_1_3.dtd">
 <module name="Checker">
     <module name="SuppressionFilter">
         <property name="file" value="${config_loc}/suppressions.xml"/>
+    </module>
+
+    <module name="SuppressWithPlainTextCommentFilter">
+        <property name="offCommentFormat" value="CHECKSTYLE\:OFF\:(\w+)"/>
+        <property name="onCommentFormat" value="CHECKSTYLE\:ON\:(\w+)"/>
+        <property name="checkFormat" value="$1"/>
     </module>
 
     <module name="SuppressWarningsFilter"/>
@@ -19,8 +25,15 @@
 
     <module name="LineLength">
         <property name="max" value="120"/>
-        <property name="ignorePattern" value="^[ \t]*\*.*@.*$"/>
+        <property name="ignorePattern" value="^([ \t]*\*.*@.*|package .*|import .*)$"/>
     </module>
+
+    <module name="RegexpHeader">
+        <property name="header" value="/*\n * Copyright \d{4}(-\d{4})? (Real Logic|Adaptive Financial Consulting|Monotonic) (Limited.|Ltd.)"/>
+        <property name="fileExtensions" value="java"/>
+    </module>
+
+    <module name="NewlineAtEndOfFile"/>
 
     <module name="TreeWalker">
         <property name="tabWidth" value="4"/>
@@ -28,9 +41,9 @@
 
         <module name="SuppressWarningsHolder"/>
 
-        <module name="Indentation">
-            <property name="forceStrictCondition" value="true"/>
-        </module>
+        <module name="MissingOverride"/>
+
+        <module name="Indentation"/>
 
         <module name="ConstantName"/>
 
@@ -58,7 +71,9 @@
 
         <module name="StaticVariableName"/>
 
-        <module name="TypeName"/>
+        <module name="TypeName">
+            <property name="format" value="^[A-Z][a-zA-Z0-9_]*$"/>
+        </module>
 
         <module name="RedundantImport"/>
 
@@ -171,6 +186,9 @@
             <property name="message" value="Trailing whitespace"/>
         </module>
 
-        <module name="JavadocMethod"/>
+        <module name="RegexpSinglelineJava">
+            <property name="format" value="^\s*\*\s*\*/$"/>
+            <property name="message" value="Invalid JavaDoc end delimiter"/>
+        </module>
     </module>
 </module>

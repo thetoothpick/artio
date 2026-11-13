@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited, Adaptive Financial Consulting Ltd.
+ * Copyright 2015-2025 Real Logic Limited, Adaptive Financial Consulting Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ package uk.co.real_logic.artio.engine.logger;
 
 import io.aeron.archive.Archive;
 import io.aeron.archive.ArchivingMediaDriver;
+import io.aeron.archive.client.AeronArchive;
 import io.aeron.driver.MediaDriver;
 import org.agrona.CloseHelper;
 import org.agrona.DirectBuffer;
@@ -26,13 +27,18 @@ import uk.co.real_logic.artio.CommonConfiguration;
 import uk.co.real_logic.artio.decoder.SessionHeaderDecoder;
 import uk.co.real_logic.artio.dictionary.FixDictionary;
 import uk.co.real_logic.artio.messages.FixMessageDecoder;
+import uk.co.real_logic.artio.messages.FixPProtocolType;
+import uk.co.real_logic.artio.messages.MessageStatus;
 
+import java.io.PrintStream;
 import java.util.function.Predicate;
 
 import static java.lang.Long.parseLong;
 import static uk.co.real_logic.artio.CommonConfiguration.DEFAULT_INBOUND_LIBRARY_STREAM;
 import static uk.co.real_logic.artio.CommonConfiguration.DEFAULT_OUTBOUND_LIBRARY_STREAM;
 import static uk.co.real_logic.artio.engine.EngineConfiguration.DEFAULT_ARCHIVE_SCANNER_STREAM;
+import static uk.co.real_logic.artio.engine.logger.FixMessageLogger.Configuration.DEFAULT_COMPACTION_SIZE;
+import static uk.co.real_logic.artio.engine.logger.FixMessageLogger.Configuration.DEFAULT_MAXIMUM_BUFFER_SIZE;
 import static uk.co.real_logic.artio.engine.logger.FixMessagePredicates.*;
 
 /**
@@ -47,9 +53,12 @@ public final class FixArchivePrinter
 {
     public static void main(final String[] args)
     {
-        new FixArchivePrinter().scan(args);
+        new FixArchivePrinter(System.out, System.err).scan(args);
     }
 
+    private static final char SOH = '\u0001';
+    private FixPProtocolType fixPProtocolType = FixPProtocolType.ILINK_3;
+    private String logFileDir = null;
     private final IntHashSet queryStreamIds = new IntHashSet();
     private String aeronDirectoryName = null;
     private String aeronChannel = null;
@@ -57,11 +66,22 @@ public final class FixArchivePrinter
     private int archiveScannerStreamId = DEFAULT_ARCHIVE_SCANNER_STREAM;
     private FixMessagePredicate predicate = FixMessagePredicates.alwaysTrue();
     private boolean follow = false;
-    private boolean ilink = false;
+    private boolean fixp = false;
+    private char delimiter = SOH;
     private Class<? extends FixDictionary> fixDictionaryType = null;
     private Predicate<SessionHeaderDecoder> headerPredicate = null;
+    private int compactionSize = DEFAULT_COMPACTION_SIZE;
+    public int maximumBufferSize = DEFAULT_MAXIMUM_BUFFER_SIZE;
+    private final PrintStream out;
+    private final PrintStream err;
 
-    private void scan(final String[] args)
+    public FixArchivePrinter(final PrintStream out, final PrintStream err)
+    {
+        this.out = out;
+        this.err = err;
+    }
+
+    public void scan(final String[] args)
     {
         parseArgs(args);
         validateArgs();
@@ -70,7 +90,8 @@ public final class FixArchivePrinter
         try
         {
             scanArchive(aeronDirectoryName, aeronChannel, queryStreamIds, predicate, follow, headerPredicate,
-                archiveScannerStreamId, fixDictionaryType);
+                archiveScannerStreamId, fixDictionaryType, fixPProtocolType, logFileDir,
+                compactionSize, maximumBufferSize);
         }
         finally
         {
@@ -85,9 +106,22 @@ public final class FixArchivePrinter
             return null;
         }
 
+        final Archive.Context archiveCtx = new Archive.Context().archiveDirectoryName(offlineArchiveDirectoryName);
+        if (archiveCtx.controlChannel() == null)
+        {
+            final AeronArchive.Context archiveClientCtx = new AeronArchive.Context()
+                .controlResponseChannel("aeron:udp?endpoint=localhost:0");
+            archiveCtx.controlChannelEnabled(false)
+                .archiveClientContext(archiveClientCtx);
+        }
+        if (archiveCtx.replicationChannel() == null)
+        {
+            archiveCtx.replicationChannel("aeron:udp?endpoint=localhost:0");
+        }
+
         return ArchivingMediaDriver.launch(
             new MediaDriver.Context().aeronDirectoryName(aeronDirectoryName),
-            new Archive.Context().archiveDirectoryName(offlineArchiveDirectoryName));
+            archiveCtx);
     }
 
     private void parseArgs(final String[] args)
@@ -109,8 +143,9 @@ public final class FixArchivePrinter
                     follow = true;
                     break;
 
+                case "fixp":
                 case "ilink":
-                    ilink = true;
+                    fixp = true;
                     break;
 
                 default:
@@ -124,62 +159,63 @@ public final class FixArchivePrinter
                 case "from":
                     predicate = from(parseLong(optionValue)).and(predicate);
                     break;
-
                 case "to":
                     predicate = to(parseLong(optionValue)).and(predicate);
                     break;
-
                 case "message-types":
                     final String[] messageTypes = optionValue.split(",");
                     predicate = messageTypeOf(messageTypes).and(predicate);
                     break;
-
                 case "sender-comp-id":
                     headerPredicate = safeAnd(headerPredicate, senderCompIdOf(optionValue));
                     break;
-
                 case "target-comp-id":
                     headerPredicate = safeAnd(headerPredicate, targetCompIdOf(optionValue));
                     break;
-
                 case "sender-sub-id":
                     headerPredicate = safeAnd(headerPredicate, senderSubIdOf(optionValue));
                     break;
-
                 case "target-sub-id":
                     headerPredicate = safeAnd(headerPredicate, targetSubIdOf(optionValue));
                     break;
-
                 case "sender-location-id":
                     headerPredicate = safeAnd(headerPredicate, senderLocationIdOf(optionValue));
                     break;
-
                 case "target-location-id":
                     headerPredicate = safeAnd(headerPredicate, targetLocationIdOf(optionValue));
                     break;
-
                 case "query-stream-id":
                     queryStreamIds.add(Integer.parseInt(optionValue));
                     break;
-
                 case "archive-scanner-stream-id":
                     archiveScannerStreamId = Integer.parseInt(optionValue);
                     break;
-
                 case "aeron-dir-name":
                     aeronDirectoryName = optionValue;
                     break;
-
                 case "aeron-channel":
                     aeronChannel = optionValue;
                     break;
-
                 case "offline-archive-dir":
                     offlineArchiveDirectoryName = optionValue;
                     break;
-
                 case "fix-dictionary":
                     fixDictionaryType = FixDictionary.find(optionValue);
+                    break;
+                case "fixp-protocol":
+                    fixPProtocolType = FixPProtocolType.valueOf(optionValue.toUpperCase());
+                    break;
+                case "log-file-dir":
+                    logFileDir = optionValue;
+                    break;
+                case "delimiter":
+                    delimiter = optionValue.charAt(0);
+                    break;
+                case "compaction-size":
+                    compactionSize = Integer.parseInt(optionValue);
+                    break;
+                case "maximum-buffer-size":
+                    maximumBufferSize = Integer.parseInt(optionValue);
                     break;
             }
         }
@@ -187,7 +223,7 @@ public final class FixArchivePrinter
 
     private void validateArgs()
     {
-        if (fixDictionaryType == null && !ilink)
+        if (fixDictionaryType == null && !fixp)
         {
             fixDictionaryType = FixDictionary.findDefault();
         }
@@ -201,17 +237,17 @@ public final class FixArchivePrinter
         requiredArgument(aeronChannel, "aeron-channel");
     }
 
-    private static void requiredArgument(final int eqIndex)
+    private void requiredArgument(final int eqIndex)
     {
         if (eqIndex == -1)
         {
-            System.err.println("--ilink, --help and --follow are the only options that don't take a value");
+            err.println("--ilink, --help and --follow are the only options that don't take a value");
             printHelp();
             System.exit(-1);
         }
     }
 
-    private static void scanArchive(
+    private void scanArchive(
         final String aeronDirectoryName,
         final String aeronChannel,
         final IntHashSet queryStreamIds,
@@ -219,7 +255,11 @@ public final class FixArchivePrinter
         final boolean follow,
         final Predicate<SessionHeaderDecoder> headerPredicate,
         final int archiveScannerStreamId,
-        final Class<? extends FixDictionary> fixDictionaryType)
+        final Class<? extends FixDictionary> fixDictionaryType,
+        final FixPProtocolType fixPProtocolType,
+        final String logFileDir,
+        final int compactionSize,
+        final int maximumBufferSize)
     {
         final FixDictionary fixDictionary = fixDictionaryType == null ? null : FixDictionary.of(fixDictionaryType);
         FixMessagePredicate predicate = otherPredicate;
@@ -230,43 +270,51 @@ public final class FixArchivePrinter
 
         final FixArchiveScanner.Configuration configuration = new FixArchiveScanner.Configuration()
             .aeronDirectoryName(aeronDirectoryName)
-            .idleStrategy(CommonConfiguration.backoffIdleStrategy());
+            .idleStrategy(CommonConfiguration.backoffIdleStrategy())
+            .compactionSize(compactionSize)
+            .maximumBufferSize(maximumBufferSize);
+
+        if (logFileDir != null)
+        {
+            configuration.logFileDir(logFileDir);
+        }
 
         try (FixArchiveScanner scanner = new FixArchiveScanner(configuration))
         {
+            out.println("Starting Scan ... ");
             scanner.scan(
                 aeronChannel,
                 queryStreamIds,
-                filterBy(FixArchivePrinter::print, predicate),
-                new LazyILinkMessagePrinter(DEFAULT_INBOUND_LIBRARY_STREAM),
+                filterBy(this::print, predicate),
+                new LazyFixPMessagePrinter(DEFAULT_INBOUND_LIBRARY_STREAM, fixPProtocolType),
                 follow,
                 archiveScannerStreamId);
         }
     }
 
-    private static void requiredArgument(final String argument, final String description)
+    private void requiredArgument(final String argument, final String description)
     {
         if (argument == null)
         {
-            System.err.printf("Missing required --%s argument%n", description);
+            err.printf("Missing required --%s argument%n", description);
             printHelp();
             System.exit(-1);
         }
     }
 
-    private static void printHelp()
+    @SuppressWarnings("checkstyle:methodLength")
+    private void printHelp()
     {
-        System.out.println("FixArchivePrinter Options");
-        System.out.println("All options are specified in the form: --optionName=optionValue");
+        out.println("FixArchivePrinter Options");
+        out.println("All options are specified in the form: --optionName=optionValue");
 
         printOption(
             "aeron-dir-name",
-            "Specifies the directory to use for archiving, should be the same as your " +
-            "aeronContext.aeronDirectoryName()",
+            "Specifies the media driver directory, should be the same as your aeronContext.aeronDirectoryName()",
             true);
         printOption(
             "aeron-channel",
-            "Specifies the aeron channel that was used to by the engine",
+            "Specifies the aeron channel that was used by the engine",
             true);
 
         printOption(
@@ -277,12 +325,20 @@ public final class FixArchivePrinter
             false);
         printOption(
             "fix-dictionary",
-            "The class name of the Fix Dictionary to use, default is used if this is not provided",
+            "The class name of the FIX dictionary to use, default is used if this is not provided",
             false);
         printOption(
             "ilink",
-            "Suppresses the need to provide a fix dictionary on the classpath - used for situations where" +
-            " only ilink3 messages will be printed out",
+            "Deprecated: use --fixp.",
+            false);
+        printOption(
+            "fixp",
+            "Suppresses the need to provide a FIX dictionary on the classpath - used for situations where" +
+            " only FIXP messages will be printed out",
+            false);
+        printOption(
+            "fixp-protocol",
+            "Specifies the FIXP protocol type to be used to interpret protocol messages, defaults to iLink3",
             false);
         printOption(
             "from",
@@ -302,43 +358,65 @@ public final class FixArchivePrinter
             false);
         printOption(
             "target-comp-id",
-            "Only print messages where the header's sender comp id field matches this",
+            "Only print messages where the header's target comp id field matches this",
             false);
         printOption(
             "sender-sub-id",
-            "Only print messages where the header's sender comp id field matches this",
+            "Only print messages where the header's sender sub id field matches this",
             false);
         printOption(
             "target-sub-id",
-            "Only print messages where the header's sender comp id field matches this",
+            "Only print messages where the header's target sub id field matches this",
             false);
         printOption(
             "sender-location-id",
-            "Only print messages where the header's sender comp id field matches this",
+            "Only print messages where the header's sender location id field matches this",
             false);
         printOption(
             "target-location-id",
-            "Only print messages where the header's sender comp id field matches this",
+            "Only print messages where the header's target location id field matches this",
             false);
         printOption(
             "query-stream-id",
             "Only print messages where the query-stream-id matches this." +
-            " This should be your configuration.inboundLibraryStream() or configuration.outboundLibraryStream().  " +
+            " This should be your configuration.inboundLibraryStream() or configuration.outboundLibraryStream(). " +
             "Defaults to outbound. Can be used twice in order to print both inbound and outbound streams.",
             false);
         printOption(
             "follow",
-            "Continue to print out archive messages for a recording that is still in flight. defaults to off",
+            "Continue to print out archive messages for a recording that is still in flight. Defaults to off.",
             false);
         printOption(
             "help",
             "Only prints this help message.",
             false);
+        printOption(
+            "log-file-dir",
+            "Specifies a logFileDir option, this should be the same as provided to your EngineConfiguration." +
+            " This can be used to optimize scans that are time based",
+            false);
+        printOption(
+            "delimiter",
+            "Specifies the character which will replace the field delimiter (SOH) in printed messages",
+            false);
+        printOption(
+            "compaction-size",
+            "Provide the compaction size to within the reorder buffer. The FixArchivePrinter re-orders " +
+            "its messages internally in order to hand them off the consumer in timestamp order. A larger " +
+            "compaction size allows it's internal reorder buffer to grow larger before compaction is " +
+            "attempted. A larger compaction size results in less compaction and thus less CPU usage at the " +
+            "cost of more memory being consumed.",
+            false);
+        printOption(
+            "maximum-buffer-size",
+            "Sets the maximum size that the internal reorder buffer can grow to. If this is exceeded then " +
+            "all the messages within the reorder buffer are simply dumped out in their current order.",
+            false);
     }
 
-    private static void printOption(final String name, final String description, final boolean required)
+    private void printOption(final String name, final String description, final boolean required)
     {
-        System.out.printf("  --%-20s [%s] - %s%n", name, required ? "required" : "optional", description);
+        out.printf("  --%-20s [%s] - %s%n", name, required ? "required" : "optional", description);
     }
 
     private static <T> Predicate<T> safeAnd(final Predicate<T> left, final Predicate<T> right)
@@ -346,14 +424,16 @@ public final class FixArchivePrinter
         return left == null ? right : left.and(right);
     }
 
-    private static void print(
+    private void print(
         final FixMessageDecoder message,
         final DirectBuffer buffer,
         final int offset,
         final int length,
         final ArtioLogHeader header)
     {
-        System.out.println(message.body());
+        final MessageStatus status = message.status();
+        final long timestamp = message.timestamp();
+        final String body = message.body().replace(SOH, delimiter);
+        out.printf("%1$20s: %2$s (%3$s)%n", timestamp, body, status);
     }
-
 }

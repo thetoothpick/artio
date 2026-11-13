@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2021 Real Logic Limited., Monotonic Ltd.
+ * Copyright 2015-2025 Real Logic Limited., Monotonic Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,9 +24,11 @@ import uk.co.real_logic.artio.dictionary.CharArraySet;
 import uk.co.real_logic.artio.dictionary.CharArrayWrapper;
 import uk.co.real_logic.artio.dictionary.SessionConstants;
 import uk.co.real_logic.artio.dictionary.ir.*;
+import uk.co.real_logic.artio.dictionary.ir.Dictionary;
 import uk.co.real_logic.artio.dictionary.ir.Entry.Element;
 import uk.co.real_logic.artio.fields.DecimalFloat;
 import uk.co.real_logic.artio.fields.LocalMktDateEncoder;
+import uk.co.real_logic.artio.fields.ReadOnlyDecimalFloat;
 import uk.co.real_logic.artio.fields.UtcTimestampEncoder;
 import uk.co.real_logic.artio.util.AsciiBuffer;
 import uk.co.real_logic.artio.util.MutableAsciiBuffer;
@@ -34,9 +36,7 @@ import uk.co.real_logic.artio.util.MutableAsciiBuffer;
 import java.io.IOException;
 import java.io.Writer;
 import java.nio.charset.StandardCharsets;
-import java.util.Arrays;
-import java.util.List;
-import java.util.Set;
+import java.util.*;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.regex.Pattern;
@@ -96,6 +96,11 @@ public abstract class Generator
     private final Class<?> rejectUnknownEnumValueClass;
     protected final boolean flyweightsEnabled;
     protected final String codecRejectUnknownEnumValueEnabled;
+    protected final String scope;
+    protected final String decimalFloatOverflowHandler;
+    protected final boolean fixTagsInJavadoc;
+
+    protected final Deque<Aggregate> aggregateStack = new ArrayDeque<>();
 
     protected Generator(
         final Dictionary dictionary,
@@ -106,7 +111,9 @@ public abstract class Generator
         final Class<?> rejectUnknownFieldClass,
         final Class<?> rejectUnknownEnumValueClass,
         final boolean flyweightsEnabled,
-        final String codecRejectUnknownEnumValueEnabled)
+        final String codecRejectUnknownEnumValueEnabled,
+        final boolean fixTagsInJavadoc,
+        final String decimalFloatOverflowHandler)
     {
         this.dictionary = dictionary;
         this.thisPackage = thisPackage;
@@ -117,6 +124,10 @@ public abstract class Generator
         this.rejectUnknownEnumValueClass = rejectUnknownEnumValueClass;
         this.flyweightsEnabled = flyweightsEnabled;
         this.codecRejectUnknownEnumValueEnabled = codecRejectUnknownEnumValueEnabled;
+        this.fixTagsInJavadoc = fixTagsInJavadoc;
+
+        scope = dictionary.shared() ? "protected" : "private";
+        this.decimalFloatOverflowHandler = decimalFloatOverflowHandler;
     }
 
     public void generate()
@@ -150,6 +161,7 @@ public abstract class Generator
         }
 
         out .append(type == MESSAGE ? String.format(COMMON_COMPOUND_IMPORTS, thisPackage, compoundSuffix) : "")
+            .append(importFor(ReadOnlyDecimalFloat.class))
             .append(importFor(DecimalFloat.class))
             .append(importFor(MutableAsciiBuffer.class))
             .append(importFor(AsciiBuffer.class))
@@ -177,12 +189,18 @@ public abstract class Generator
         {
             out.append(importFor(commonPackage + ".*"));
         }
+
+        if (hasParent())
+        {
+            out.append(importFor(parentDictCommonPackage() + ".*"));
+        }
     }
 
     protected String completeResetMethod(
         final boolean isMessage,
         final List<Entry> entries,
-        final String additionalReset)
+        final String additionalReset,
+        final boolean isInParent)
     {
         final StringBuilder methods = new StringBuilder();
 
@@ -190,35 +208,45 @@ public abstract class Generator
 
         if (isMessage)
         {
-            return String.format(
+            final String reset = isSharedParent() ? "" : String.format(
                 "    public void reset()\n" +
                 "    {\n" +
                 "        header.reset();\n" +
                 "        trailer.reset();\n" +
                 "        resetMessage();\n" +
-                "%2$s" +
-                "    }\n\n" +
+                "%1$s" +
+                "    }\n\n",
+                additionalReset);
+
+            final String resetParent = isInParent ? "        super.resetMessage();\n" : "";
+            return String.format(
+                "%1$s" +
                 "    public void resetMessage()\n" +
                 "    {\n" +
-                "%1$s" +
+                "%4$s" +
+                "%2$s" +
                 "    }\n\n" +
                 "%3$s",
+                reset,
                 resetEntries,
-                additionalReset,
-                methods);
+                methods,
+                resetParent);
         }
         else
         {
+            final String resetParent = isInParent ? "        super.reset();\n" : "";
             return String.format(
                 "    public void reset()\n" +
                 "    {\n" +
-                "%s" +
-                "%s" +
+                "%4$s" +
+                "%1$s" +
+                "%2$s" +
                 "    }\n\n" +
-                "%s",
+                "%3$s",
                 resetEntries,
-                additionalReset,
-                methods);
+                isSharedParent() ? "" : additionalReset,
+                methods,
+                resetParent);
         }
     }
 
@@ -226,7 +254,8 @@ public abstract class Generator
     {
         return resetFields(entries, methods) +
             resetComponents(entries, methods) +
-            resetGroups(entries, methods);
+            resetGroups(entries, methods) +
+            resetAnyFields(entries, methods);
     }
 
     private String resetFields(final List<Entry> entries, final StringBuilder methods)
@@ -234,7 +263,7 @@ public abstract class Generator
         return resetAllBy(
             entries,
             methods,
-            Entry::isField,
+            entry -> entry.isField() && !entry.isInParent(),
             (entry) -> resetField(entry.required(), (Field)entry.element()),
             this::callResetMethod);
     }
@@ -271,6 +300,8 @@ public abstract class Generator
 
     protected abstract String resetGroup(Entry entry);
 
+    protected abstract String resetAnyFields(List<Entry> entries, StringBuilder methods);
+
     private String resetField(final boolean isRequired, final Field field)
     {
         final String name = field.name();
@@ -294,10 +325,14 @@ public abstract class Generator
             case DAYOFMONTH:
                 return resetRequiredInt(field);
 
+            case LONG:
+                return resetRequiredLong(field);
+
             case FLOAT:
             case PRICE:
             case PRICEOFFSET:
             case QTY:
+            case QUANTITY:
             case PERCENTAGE:
             case AMT:
                 return resetRequiredFloat(name);
@@ -338,6 +373,8 @@ public abstract class Generator
 
     protected abstract String resetRequiredInt(Field field);
 
+    protected abstract String resetRequiredLong(Field field);
+
     protected abstract String optionalReset(Field field, String name);
 
     protected abstract String resetTemporalValue(String name);
@@ -359,15 +396,8 @@ public abstract class Generator
         }
 
         return String.format(
-            "        %1$s();\n",
+            "        this.%1$s();\n",
             nameOfResetMethod(entry.name()));
-    }
-
-    protected String callComponentReset(final Entry entry)
-    {
-        return String.format(
-            "        %1$s.reset();\n",
-            formatPropertyName(entry.name()));
     }
 
     protected String hasField(final Entry entry)
@@ -375,16 +405,7 @@ public abstract class Generator
         final String name = entry.name();
         return entry.required() ?
             "" :
-            String.format("    private boolean has%1$s;\n\n", name);
-    }
-
-    protected String resetNothing(final String name)
-    {
-        return String.format(
-            "    public void %1$s()\n" +
-            "    {\n" +
-            "    }\n\n",
-            nameOfResetMethod(name));
+            String.format("    %2$s boolean has%1$s;\n\n", name, scope);
     }
 
     private boolean isNotResettableField(final String name)
@@ -404,16 +425,7 @@ public abstract class Generator
 
     protected abstract String resetRequiredFloat(String name);
 
-    protected String resetLength(final String name)
-    {
-        return String.format(
-            "    public void %1$s()\n" +
-            "    {\n" +
-            "        %2$sLength = 0;\n" +
-            "    }\n\n",
-            nameOfResetMethod(name),
-            formatPropertyName(name));
-    }
+    protected abstract String resetLength(String name);
 
     protected String resetByFlag(final String name)
     {
@@ -452,7 +464,7 @@ public abstract class Generator
             .collect(joining("\n"));
 
         final String prefix;
-        if (hasCommonCompounds)
+        if (hasCommonCompounds && !isSharedParent())
         {
             prefix =
                 "        builder.append(\"  \\\"header\\\": \");\n" +
@@ -539,6 +551,10 @@ public abstract class Generator
         {
             return componentAppendTo((Component)element);
         }
+        else if (element instanceof AnyFields)
+        {
+            return anyFieldsAppendTo((AnyFields)element);
+        }
 
         return "";
     }
@@ -546,6 +562,8 @@ public abstract class Generator
     protected abstract boolean appendToChecksHasGetter(Entry entry, Field field);
 
     protected abstract String groupEntryAppendTo(Group element, String name);
+
+    protected abstract String anyFieldsAppendTo(AnyFields element);
 
     protected abstract boolean hasFlag(Entry entry, Field field);
 
@@ -590,11 +608,12 @@ public abstract class Generator
             case PRICE:
             case PRICEOFFSET:
             case QTY:
+            case QUANTITY:
             case PERCENTAGE:
             case AMT:
                 if (flyweightsEnabled)
                 {
-                    return String.format("%1$s().appendTo(builder)", fieldName);
+                    return String.format("this.%1$s().appendTo(builder)", fieldName);
                 }
 
                 return String.format("%1$s.appendTo(builder)", fieldName);
@@ -606,7 +625,7 @@ public abstract class Generator
             default:
                 if (flyweightsEnabled)
                 {
-                    return String.format("builder.append(%1$s())", fieldName);
+                    return String.format("builder.append(this.%1$s())", fieldName);
                 }
 
                 return String.format("builder.append(%1$s)", fieldName);
@@ -663,6 +682,31 @@ public abstract class Generator
         }
     }
 
+    boolean isSharedParent()
+    {
+        return dictionary.shared();
+    }
+
+    boolean hasParent()
+    {
+        return dictionary.hasSharedParent();
+    }
+
+    String parentDictPackage()
+    {
+        return toParentDictPackage(thisPackage);
+    }
+
+    String parentDictCommonPackage()
+    {
+        return toParentDictPackage(commonPackage);
+    }
+
+    private String toParentDictPackage(final String whichPackage)
+    {
+        return whichPackage.replace("." + dictionary.name(), "");
+    }
+
     protected abstract String stringAppendTo(String fieldName);
 
     protected String indent(final int times, final String suffix)
@@ -672,5 +716,51 @@ public abstract class Generator
         sb.append(suffix);
 
         return sb.toString();
+    }
+
+    boolean shouldGenerateClassEnumMethods(final Field field)
+    {
+        return EnumGenerator.hasEnumGenerated(field) && !field.type().isMultiValue() &&
+            !field.hasSharedSometimesEnumClash();
+    }
+
+    Aggregate currentAggregate()
+    {
+        return aggregateStack.peekLast();
+    }
+
+    Aggregate parentAggregate()
+    {
+        final Aggregate current = aggregateStack.removeLast();
+        final Aggregate parent = aggregateStack.peekLast();
+        push(current);
+        return parent;
+    }
+
+    void pop()
+    {
+        aggregateStack.removeLast();
+    }
+
+    void push(final Aggregate aggregate)
+    {
+        aggregateStack.addLast(aggregate);
+    }
+
+    String qualifiedAggregateStackNames(final Function<Aggregate, String> toName)
+    {
+        return aggregateStack.stream().map(toName).collect(joining("."));
+    }
+
+    protected String generateAccessorJavadoc(final Field field)
+    {
+        if (fixTagsInJavadoc)
+        {
+            return "/* " + field.name() + " = " + field.number() + " */\n    ";
+        }
+        else
+        {
+            return "";
+        }
     }
 }
